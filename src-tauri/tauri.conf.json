@@ -1,0 +1,32 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "productName": "Mjeku",
+  "version": "0.1.0",
+  "identifier": "com.mjeku.desktop",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../../mjeku-ui run dev",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm --prefix ../../mjeku-ui run build && node ../scripts/prepare_ui_seed.mjs",
+    "frontendDist": "../frontend-dist"
+  },
+  "app": {
+    "security": {
+      "csp": null,
+      "capabilities": ["./capabilities/default.json"]
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Mjeku",
+        "width": 1100,
+        "height": 720,
+        "resizable": true,
+        "url": "mjeku://localhost/index.html"
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "resources": ["resources/ui-seed.zip", "resources/ui-seed-version.txt"]
+  }
+}

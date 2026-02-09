@@ -1,0 +1,25 @@
+[package]
+name = "mjeku_desktop"
+version = "0.1.0"
+description = "Mjeku Desktop"
+authors = ["Mjeku"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2" }
+
+[dependencies]
+anyhow = "1.0.86"
+chrono = { version = "0.4.38", features = ["serde"] }
+hex = "0.4.3"
+mime_guess = "2.0.5"
+reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+sha2 = "0.10.8"
+tauri = { version = "2" }
+tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread", "time"] }
+urlencoding = "2.1.3"
+uuid = { version = "1.10.0", features = ["v4"] }
+zip = "0.6.6"

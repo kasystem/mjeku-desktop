@@ -1,0 +1,17 @@
+{
+  "name": "mjeku-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "cargo:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml",
+    "cargo:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings",
+    "cargo:test": "cargo test --manifest-path src-tauri/Cargo.toml"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
+

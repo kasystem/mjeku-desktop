@@ -1,0 +1,13 @@
+node_modules/
+target/
+dist/
+.DS_Store
+
+# Tauri build outputs
+src-tauri/target/
+
+# Local app data artifacts (dev)
+*.db
+*.sqlite
+*.sqlite3
+
