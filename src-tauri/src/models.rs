@@ -93,6 +93,181 @@ pub struct PaymentUpsertInput {
   pub notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Doctor {
+  pub id: String,
+  pub name: String,
+  pub phone: Option<String>,
+  pub email: Option<String>,
+  pub notes: Option<String>,
+  pub created_at: String,
+  pub updated_at: String,
+  pub deleted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorUpsertInput {
+  pub id: Option<String>,
+  pub name: String,
+  pub phone: Option<String>,
+  pub email: Option<String>,
+  pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Service {
+  pub id: String,
+  pub title: String,
+  pub default_price: f64,
+  pub notes: Option<String>,
+  pub created_at: String,
+  pub updated_at: String,
+  pub deleted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceUpsertInput {
+  pub id: Option<String>,
+  pub title: String,
+  pub default_price: f64,
+  pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Appointment {
+  pub id: String,
+  pub client_id: String,
+  pub doctor_id: Option<String>,
+  pub start_at: String, // RFC3339
+  pub end_at: Option<String>,
+  pub status: String, // scheduled | done | cancelled
+  pub notes: Option<String>,
+  pub created_at: String,
+  pub updated_at: String,
+  pub deleted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppointmentsListFilters {
+  pub client_id: Option<String>,
+  pub doctor_id: Option<String>,
+  pub start_from: Option<String>,
+  pub start_to: Option<String>,
+  pub status: Option<String>,
+  pub include_deleted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppointmentUpsertInput {
+  pub id: Option<String>,
+  pub client_id: String,
+  pub doctor_id: Option<String>,
+  pub start_at: String,
+  pub end_at: Option<String>,
+  pub status: String,
+  pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Visit {
+  pub id: String,
+  pub client_id: String,
+  pub doctor_id: Option<String>,
+  pub date: Option<String>, // YYYY-MM-DD
+  pub status: String,       // draft | final
+  pub notes: Option<String>,
+  pub created_at: String,
+  pub updated_at: String,
+  pub deleted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VisitsListFilters {
+  pub client_id: Option<String>,
+  pub doctor_id: Option<String>,
+  pub date_from: Option<String>,
+  pub date_to: Option<String>,
+  pub status: Option<String>,
+  pub include_deleted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisitUpsertInput {
+  pub id: Option<String>,
+  pub client_id: String,
+  pub doctor_id: Option<String>,
+  pub date: Option<String>,
+  pub status: String,
+  pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisitItem {
+  pub id: String,
+  pub visit_id: String,
+  pub client_id: String,
+  pub tooth: Option<String>, // e.g. "13"
+  pub title: String,
+  pub qty: f64,
+  pub unit_price: f64,
+  pub fiscal: i64, // 1/0
+  pub notes: Option<String>,
+  pub created_at: String,
+  pub updated_at: String,
+  pub deleted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VisitItemsListFilters {
+  pub visit_id: Option<String>,
+  pub client_id: Option<String>,
+  pub include_deleted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisitItemUpsertInput {
+  pub id: Option<String>,
+  pub visit_id: String,
+  pub client_id: String,
+  pub tooth: Option<String>,
+  pub title: String,
+  pub qty: f64,
+  pub unit_price: f64,
+  pub fiscal: Option<bool>,
+  pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CashEntry {
+  pub id: String,
+  pub r#type: String, // income | expense
+  pub date: Option<String>,
+  pub amount: f64,
+  pub category: Option<String>,
+  pub notes: Option<String>,
+  pub created_at: String,
+  pub updated_at: String,
+  pub deleted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CashListFilters {
+  pub r#type: Option<String>,
+  pub date_from: Option<String>,
+  pub date_to: Option<String>,
+  pub include_deleted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CashEntryUpsertInput {
+  pub id: Option<String>,
+  pub r#type: String,
+  pub date: Option<String>,
+  pub amount: f64,
+  pub category: Option<String>,
+  pub notes: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncQueueItem {
   pub id: String,
@@ -104,4 +279,3 @@ pub struct SyncQueueItem {
   pub status: String,
   pub last_error: Option<String>,
 }
-

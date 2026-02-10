@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::db::Db;
-use crate::models::{Client, Payment, Sale, SyncQueueItem};
+use crate::models::{Appointment, CashEntry, Client, Doctor, Payment, Sale, Service, SyncQueueItem, Visit, VisitItem};
 use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 
 const KEY_SUPABASE_URL: &str = "supabase_url";
@@ -140,6 +140,31 @@ impl SyncEngine {
 
   async fn pull_updates(&self, supabase_url: &str, api_key: &str, last_sync_time: &str) -> anyhow::Result<()> {
     let base = supabase_url.trim_end_matches('/');
+
+    let doctors: Vec<Doctor> = self
+      .fetch_table(base, api_key, "doctors", last_sync_time)
+      .await
+      .context("pull doctors")?;
+    for d in doctors {
+      self.apply_remote_row_doctors(&d)?;
+    }
+
+    let services: Vec<Service> = self
+      .fetch_table(base, api_key, "services", last_sync_time)
+      .await
+      .context("pull services")?;
+    for s in services {
+      self.apply_remote_row_services(&s)?;
+    }
+
+    let appointments: Vec<Appointment> = self
+      .fetch_table(base, api_key, "appointments", last_sync_time)
+      .await
+      .context("pull appointments")?;
+    for a in appointments {
+      self.apply_remote_row_appointments(&a)?;
+    }
+
     let clients: Vec<Client> = self
       .fetch_table(base, api_key, "clients", last_sync_time)
       .await
@@ -164,6 +189,66 @@ impl SyncEngine {
       self.apply_remote_row_payments(&p)?;
     }
 
+    let visits: Vec<Visit> = self
+      .fetch_table(base, api_key, "visits", last_sync_time)
+      .await
+      .context("pull visits")?;
+    for v in visits {
+      self.apply_remote_row_visits(&v)?;
+    }
+
+    let visit_items: Vec<VisitItem> = self
+      .fetch_table(base, api_key, "visit_items", last_sync_time)
+      .await
+      .context("pull visit_items")?;
+    for it in visit_items {
+      self.apply_remote_row_visit_items(&it)?;
+    }
+
+    let cash: Vec<CashEntry> = self
+      .fetch_table(base, api_key, "cash_ledger", last_sync_time)
+      .await
+      .context("pull cash_ledger")?;
+    for c in cash {
+      self.apply_remote_row_cash(&c)?;
+    }
+
+    Ok(())
+  }
+
+  fn apply_remote_row_doctors(&self, remote: &Doctor) -> anyhow::Result<()> {
+    let local = self.db.doctors_updated_at(&remote.id)?;
+    if let Some(local_ts) = local {
+      if newer_or_equal(&local_ts, &remote.updated_at)? {
+        return Ok(());
+      }
+    }
+    self.db.sync_queue_drop_pending_for_row("doctors", &remote.id)?;
+    self.db.apply_remote_doctor(remote)?;
+    Ok(())
+  }
+
+  fn apply_remote_row_services(&self, remote: &Service) -> anyhow::Result<()> {
+    let local = self.db.services_updated_at(&remote.id)?;
+    if let Some(local_ts) = local {
+      if newer_or_equal(&local_ts, &remote.updated_at)? {
+        return Ok(());
+      }
+    }
+    self.db.sync_queue_drop_pending_for_row("services", &remote.id)?;
+    self.db.apply_remote_service(remote)?;
+    Ok(())
+  }
+
+  fn apply_remote_row_appointments(&self, remote: &Appointment) -> anyhow::Result<()> {
+    let local = self.db.appointments_updated_at(&remote.id)?;
+    if let Some(local_ts) = local {
+      if newer_or_equal(&local_ts, &remote.updated_at)? {
+        return Ok(());
+      }
+    }
+    self.db.sync_queue_drop_pending_for_row("appointments", &remote.id)?;
+    self.db.apply_remote_appointment(remote)?;
     Ok(())
   }
 
@@ -201,6 +286,42 @@ impl SyncEngine {
     }
     self.db.sync_queue_drop_pending_for_row("payments", &remote.id)?;
     self.db.apply_remote_payment(remote)?;
+    Ok(())
+  }
+
+  fn apply_remote_row_visits(&self, remote: &Visit) -> anyhow::Result<()> {
+    let local = self.db.visits_updated_at(&remote.id)?;
+    if let Some(local_ts) = local {
+      if newer_or_equal(&local_ts, &remote.updated_at)? {
+        return Ok(());
+      }
+    }
+    self.db.sync_queue_drop_pending_for_row("visits", &remote.id)?;
+    self.db.apply_remote_visit(remote)?;
+    Ok(())
+  }
+
+  fn apply_remote_row_visit_items(&self, remote: &VisitItem) -> anyhow::Result<()> {
+    let local = self.db.visit_items_updated_at(&remote.id)?;
+    if let Some(local_ts) = local {
+      if newer_or_equal(&local_ts, &remote.updated_at)? {
+        return Ok(());
+      }
+    }
+    self.db.sync_queue_drop_pending_for_row("visit_items", &remote.id)?;
+    self.db.apply_remote_visit_item(remote)?;
+    Ok(())
+  }
+
+  fn apply_remote_row_cash(&self, remote: &CashEntry) -> anyhow::Result<()> {
+    let local = self.db.cash_updated_at(&remote.id)?;
+    if let Some(local_ts) = local {
+      if newer_or_equal(&local_ts, &remote.updated_at)? {
+        return Ok(());
+      }
+    }
+    self.db.sync_queue_drop_pending_for_row("cash_ledger", &remote.id)?;
+    self.db.apply_remote_cash_entry(remote)?;
     Ok(())
   }
 

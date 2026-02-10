@@ -9,8 +9,10 @@ use rusqlite::{params, Connection, OptionalExtension, OpenFlags};
 use uuid::Uuid;
 
 use crate::models::{
-  Client, ClientUpsertInput, Payment, PaymentUpsertInput, PaymentsListFilters, Sale, SaleUpsertInput,
-  SalesListFilters, SyncQueueItem,
+  Appointment, AppointmentUpsertInput, AppointmentsListFilters, CashEntry, CashEntryUpsertInput, CashListFilters,
+  Client, ClientUpsertInput, Doctor, DoctorUpsertInput, Payment, PaymentUpsertInput, PaymentsListFilters, Sale,
+  SaleUpsertInput, SalesListFilters, Service, ServiceUpsertInput, SyncQueueItem, Visit, VisitItem,
+  VisitItemUpsertInput, VisitItemsListFilters, VisitUpsertInput, VisitsListFilters,
 };
 use crate::util::now_iso;
 
@@ -70,6 +72,79 @@ CREATE TABLE IF NOT EXISTS app_settings (
   value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS doctors (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  phone TEXT,
+  email TEXT,
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  deleted INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS services (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  default_price REAL NOT NULL,
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  deleted INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS appointments (
+  id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  doctor_id TEXT,
+  start_at TEXT NOT NULL,
+  end_at TEXT,
+  status TEXT NOT NULL,
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  deleted INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS visits (
+  id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  doctor_id TEXT,
+  date TEXT,
+  status TEXT NOT NULL,
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  deleted INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS visit_items (
+  id TEXT PRIMARY KEY,
+  visit_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  tooth TEXT,
+  title TEXT NOT NULL,
+  qty REAL NOT NULL,
+  unit_price REAL NOT NULL,
+  fiscal INTEGER NOT NULL DEFAULT 1,
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  deleted INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS cash_ledger (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  date TEXT,
+  amount REAL NOT NULL,
+  category TEXT,
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  deleted INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_clients_updated_at ON clients(updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_sales_client_id ON sales(client_id);
@@ -84,6 +159,30 @@ CREATE INDEX IF NOT EXISTS idx_payments_updated_at ON payments(updated_at);
 CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON sync_queue(status);
 CREATE INDEX IF NOT EXISTS idx_sync_queue_created_at ON sync_queue(created_at);
 CREATE INDEX IF NOT EXISTS idx_sync_queue_table_row ON sync_queue(table_name, row_id);
+
+CREATE INDEX IF NOT EXISTS idx_doctors_updated_at ON doctors(updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_services_updated_at ON services(updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_appointments_client_id ON appointments(client_id);
+CREATE INDEX IF NOT EXISTS idx_appointments_doctor_id ON appointments(doctor_id);
+CREATE INDEX IF NOT EXISTS idx_appointments_start_at ON appointments(start_at);
+CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
+CREATE INDEX IF NOT EXISTS idx_appointments_updated_at ON appointments(updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_visits_client_id ON visits(client_id);
+CREATE INDEX IF NOT EXISTS idx_visits_doctor_id ON visits(doctor_id);
+CREATE INDEX IF NOT EXISTS idx_visits_date ON visits(date);
+CREATE INDEX IF NOT EXISTS idx_visits_status ON visits(status);
+CREATE INDEX IF NOT EXISTS idx_visits_updated_at ON visits(updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_visit_items_visit_id ON visit_items(visit_id);
+CREATE INDEX IF NOT EXISTS idx_visit_items_client_id ON visit_items(client_id);
+CREATE INDEX IF NOT EXISTS idx_visit_items_updated_at ON visit_items(updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_cash_ledger_type ON cash_ledger(type);
+CREATE INDEX IF NOT EXISTS idx_cash_ledger_date ON cash_ledger(date);
+CREATE INDEX IF NOT EXISTS idx_cash_ledger_updated_at ON cash_ledger(updated_at);
 "#;
 
 pub struct Db {
@@ -728,6 +827,878 @@ impl Db {
     Ok(())
   }
 
+  pub fn doctors_list(&self, search: Option<String>) -> anyhow::Result<Vec<Doctor>> {
+    let conn = self.conn()?;
+    let mut out = Vec::new();
+
+    if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
+      let like = format!("%{}%", s.trim());
+      let mut stmt = conn.prepare(
+        "SELECT id, name, phone, email, notes, created_at, updated_at, deleted
+         FROM doctors
+         WHERE deleted = 0 AND (name LIKE ?1 OR phone LIKE ?1 OR email LIKE ?1)
+         ORDER BY updated_at DESC
+         LIMIT 1000",
+      )?;
+      let rows = stmt.query_map(params![like], |row| {
+        Ok(Doctor {
+          id: row.get(0)?,
+          name: row.get(1)?,
+          phone: row.get(2)?,
+          email: row.get(3)?,
+          notes: row.get(4)?,
+          created_at: row.get(5)?,
+          updated_at: row.get(6)?,
+          deleted: row.get(7)?,
+        })
+      })?;
+      for r in rows {
+        out.push(r?);
+      }
+      return Ok(out);
+    }
+
+    let mut stmt = conn.prepare(
+      "SELECT id, name, phone, email, notes, created_at, updated_at, deleted
+       FROM doctors
+       WHERE deleted = 0
+       ORDER BY updated_at DESC
+       LIMIT 1000",
+    )?;
+    let rows = stmt.query_map([], |row| {
+      Ok(Doctor {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        phone: row.get(2)?,
+        email: row.get(3)?,
+        notes: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        deleted: row.get(7)?,
+      })
+    })?;
+    for r in rows {
+      out.push(r?);
+    }
+    Ok(out)
+  }
+
+  pub fn doctors_upsert(&self, input: DoctorUpsertInput) -> anyhow::Result<Doctor> {
+    let name = input.name.trim();
+    if name.is_empty() {
+      bail!("doctor name is required");
+    }
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let phone = input.phone;
+    let email = input.email;
+    let notes = input.notes;
+    let now = now_iso();
+
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    let existing_created_at: Option<String> = tx
+      .query_row("SELECT created_at FROM doctors WHERE id=?1", params![id], |row| row.get(0))
+      .optional()?;
+    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+
+    tx.execute(
+      "INSERT INTO doctors (id, name, phone, email, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+       ON CONFLICT(id) DO UPDATE SET
+         name=excluded.name,
+         phone=excluded.phone,
+         email=excluded.email,
+         notes=excluded.notes,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![id, name, &phone, &email, &notes, &created_at, &now],
+    )?;
+    let row = Doctor {
+      id: id.clone(),
+      name: name.to_string(),
+      phone,
+      email,
+      notes,
+      created_at: created_at.clone(),
+      updated_at: now.clone(),
+      deleted: 0,
+    };
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "doctors", &row.id, "upsert", &payload, &now)?;
+    tx.commit()?;
+    Ok(row)
+  }
+
+  pub fn doctors_delete(&self, id: &str) -> anyhow::Result<()> {
+    if id.trim().is_empty() {
+      bail!("doctor id is required");
+    }
+    let now = now_iso();
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE doctors SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+    let row = tx
+      .query_row(
+        "SELECT id, name, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
+        params![id],
+        |r| {
+          Ok(Doctor {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            phone: r.get(2)?,
+            email: r.get(3)?,
+            notes: r.get(4)?,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+            deleted: r.get(7)?,
+          })
+        },
+      )
+      .optional()?
+      .ok_or_else(|| anyhow!("doctor not found"))?;
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "doctors", &row.id, "delete", &payload, &now)?;
+    tx.commit()?;
+    Ok(())
+  }
+
+  pub fn services_list(&self, search: Option<String>) -> anyhow::Result<Vec<Service>> {
+    let conn = self.conn()?;
+    let mut out = Vec::new();
+
+    if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
+      let like = format!("%{}%", s.trim());
+      let mut stmt = conn.prepare(
+        "SELECT id, title, default_price, notes, created_at, updated_at, deleted
+         FROM services
+         WHERE deleted = 0 AND (title LIKE ?1 OR notes LIKE ?1)
+         ORDER BY updated_at DESC
+         LIMIT 2000",
+      )?;
+      let rows = stmt.query_map(params![like], |row| {
+        Ok(Service {
+          id: row.get(0)?,
+          title: row.get(1)?,
+          default_price: row.get(2)?,
+          notes: row.get(3)?,
+          created_at: row.get(4)?,
+          updated_at: row.get(5)?,
+          deleted: row.get(6)?,
+        })
+      })?;
+      for r in rows {
+        out.push(r?);
+      }
+      return Ok(out);
+    }
+
+    let mut stmt = conn.prepare(
+      "SELECT id, title, default_price, notes, created_at, updated_at, deleted
+       FROM services
+       WHERE deleted = 0
+       ORDER BY updated_at DESC
+       LIMIT 2000",
+    )?;
+    let rows = stmt.query_map([], |row| {
+      Ok(Service {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        default_price: row.get(2)?,
+        notes: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        deleted: row.get(6)?,
+      })
+    })?;
+    for r in rows {
+      out.push(r?);
+    }
+    Ok(out)
+  }
+
+  pub fn services_upsert(&self, input: ServiceUpsertInput) -> anyhow::Result<Service> {
+    let title = input.title.trim();
+    if title.is_empty() {
+      bail!("service title is required");
+    }
+    if !input.default_price.is_finite() || input.default_price < 0.0 {
+      bail!("default_price must be a finite number >= 0");
+    }
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let default_price = input.default_price;
+    let notes = input.notes;
+    let now = now_iso();
+
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    let existing_created_at: Option<String> = tx
+      .query_row("SELECT created_at FROM services WHERE id=?1", params![id], |row| row.get(0))
+      .optional()?;
+    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+
+    tx.execute(
+      "INSERT INTO services (id, title, default_price, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+       ON CONFLICT(id) DO UPDATE SET
+         title=excluded.title,
+         default_price=excluded.default_price,
+         notes=excluded.notes,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![id, title, default_price, &notes, &created_at, &now],
+    )?;
+    let row = Service {
+      id: id.clone(),
+      title: title.to_string(),
+      default_price,
+      notes,
+      created_at: created_at.clone(),
+      updated_at: now.clone(),
+      deleted: 0,
+    };
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "services", &row.id, "upsert", &payload, &now)?;
+    tx.commit()?;
+    Ok(row)
+  }
+
+  pub fn services_delete(&self, id: &str) -> anyhow::Result<()> {
+    if id.trim().is_empty() {
+      bail!("service id is required");
+    }
+    let now = now_iso();
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE services SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+    let row = tx
+      .query_row(
+        "SELECT id, title, default_price, notes, created_at, updated_at, deleted FROM services WHERE id=?1",
+        params![id],
+        |r| {
+          Ok(Service {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            default_price: r.get(2)?,
+            notes: r.get(3)?,
+            created_at: r.get(4)?,
+            updated_at: r.get(5)?,
+            deleted: r.get(6)?,
+          })
+        },
+      )
+      .optional()?
+      .ok_or_else(|| anyhow!("service not found"))?;
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "services", &row.id, "delete", &payload, &now)?;
+    tx.commit()?;
+    Ok(())
+  }
+
+  pub fn appointments_list(&self, filters: Option<AppointmentsListFilters>) -> anyhow::Result<Vec<Appointment>> {
+    let f = filters.unwrap_or_default();
+    let include_deleted = f.include_deleted.unwrap_or(false);
+
+    let mut sql = String::from(
+      "SELECT id, client_id, doctor_id, start_at, end_at, status, notes, created_at, updated_at, deleted
+       FROM appointments WHERE 1=1",
+    );
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+
+    if !include_deleted {
+      sql.push_str(" AND deleted = 0");
+    }
+    if let Some(cid) = f.client_id.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND client_id = ?{}", args.len() + 1));
+      args.push(cid.into());
+    }
+    if let Some(did) = f.doctor_id.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND doctor_id = ?{}", args.len() + 1));
+      args.push(did.into());
+    }
+    if let Some(s) = f.status.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND status = ?{}", args.len() + 1));
+      args.push(s.into());
+    }
+    if let Some(d) = f.start_from.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND start_at >= ?{}", args.len() + 1));
+      args.push(d.into());
+    }
+    if let Some(d) = f.start_to.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND start_at <= ?{}", args.len() + 1));
+      args.push(d.into());
+    }
+
+    sql.push_str(" ORDER BY start_at ASC, updated_at DESC LIMIT 5000");
+
+    let conn = self.conn()?;
+    let mut stmt = conn.prepare(&sql)?;
+    let mut out = Vec::new();
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+      Ok(Appointment {
+        id: row.get(0)?,
+        client_id: row.get(1)?,
+        doctor_id: row.get(2)?,
+        start_at: row.get(3)?,
+        end_at: row.get(4)?,
+        status: row.get(5)?,
+        notes: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        deleted: row.get(9)?,
+      })
+    })?;
+    for r in rows {
+      out.push(r?);
+    }
+    Ok(out)
+  }
+
+  pub fn appointments_upsert(&self, input: AppointmentUpsertInput) -> anyhow::Result<Appointment> {
+    if input.client_id.trim().is_empty() {
+      bail!("client_id is required");
+    }
+    if input.start_at.trim().is_empty() {
+      bail!("start_at is required");
+    }
+    let status = input.status.trim().to_lowercase();
+    if status != "scheduled" && status != "done" && status != "cancelled" {
+      bail!("status must be one of: scheduled, done, cancelled");
+    }
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let client_id = input.client_id;
+    let doctor_id = input.doctor_id;
+    let start_at = input.start_at;
+    let end_at = input.end_at;
+    let notes = input.notes;
+    let now = now_iso();
+
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    let existing_created_at: Option<String> = tx
+      .query_row("SELECT created_at FROM appointments WHERE id=?1", params![id], |row| row.get(0))
+      .optional()?;
+    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+
+    tx.execute(
+      "INSERT INTO appointments (id, client_id, doctor_id, start_at, end_at, status, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+       ON CONFLICT(id) DO UPDATE SET
+         client_id=excluded.client_id,
+         doctor_id=excluded.doctor_id,
+         start_at=excluded.start_at,
+         end_at=excluded.end_at,
+         status=excluded.status,
+         notes=excluded.notes,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![id, &client_id, &doctor_id, &start_at, &end_at, &status, &notes, &created_at, &now],
+    )?;
+    let row = Appointment {
+      id: id.clone(),
+      client_id,
+      doctor_id,
+      start_at,
+      end_at,
+      status,
+      notes,
+      created_at: created_at.clone(),
+      updated_at: now.clone(),
+      deleted: 0,
+    };
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "appointments", &row.id, "upsert", &payload, &now)?;
+    tx.commit()?;
+    Ok(row)
+  }
+
+  pub fn appointments_delete(&self, id: &str) -> anyhow::Result<()> {
+    if id.trim().is_empty() {
+      bail!("appointment id is required");
+    }
+    let now = now_iso();
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE appointments SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+    let row = tx
+      .query_row(
+        "SELECT id, client_id, doctor_id, start_at, end_at, status, notes, created_at, updated_at, deleted
+         FROM appointments WHERE id=?1",
+        params![id],
+        |r| {
+          Ok(Appointment {
+            id: r.get(0)?,
+            client_id: r.get(1)?,
+            doctor_id: r.get(2)?,
+            start_at: r.get(3)?,
+            end_at: r.get(4)?,
+            status: r.get(5)?,
+            notes: r.get(6)?,
+            created_at: r.get(7)?,
+            updated_at: r.get(8)?,
+            deleted: r.get(9)?,
+          })
+        },
+      )
+      .optional()?
+      .ok_or_else(|| anyhow!("appointment not found"))?;
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "appointments", &row.id, "delete", &payload, &now)?;
+    tx.commit()?;
+    Ok(())
+  }
+
+  pub fn visits_list(&self, filters: Option<VisitsListFilters>) -> anyhow::Result<Vec<Visit>> {
+    let f = filters.unwrap_or_default();
+    let include_deleted = f.include_deleted.unwrap_or(false);
+
+    let mut sql = String::from(
+      "SELECT id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted
+       FROM visits WHERE 1=1",
+    );
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+
+    if !include_deleted {
+      sql.push_str(" AND deleted = 0");
+    }
+    if let Some(cid) = f.client_id.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND client_id = ?{}", args.len() + 1));
+      args.push(cid.into());
+    }
+    if let Some(did) = f.doctor_id.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND doctor_id = ?{}", args.len() + 1));
+      args.push(did.into());
+    }
+    if let Some(s) = f.status.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND status = ?{}", args.len() + 1));
+      args.push(s.into());
+    }
+    if let Some(d) = f.date_from.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND date >= ?{}", args.len() + 1));
+      args.push(d.into());
+    }
+    if let Some(d) = f.date_to.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND date <= ?{}", args.len() + 1));
+      args.push(d.into());
+    }
+
+    sql.push_str(" ORDER BY date DESC, updated_at DESC LIMIT 2000");
+
+    let conn = self.conn()?;
+    let mut stmt = conn.prepare(&sql)?;
+    let mut out = Vec::new();
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+      Ok(Visit {
+        id: row.get(0)?,
+        client_id: row.get(1)?,
+        doctor_id: row.get(2)?,
+        date: row.get(3)?,
+        status: row.get(4)?,
+        notes: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        deleted: row.get(8)?,
+      })
+    })?;
+    for r in rows {
+      out.push(r?);
+    }
+    Ok(out)
+  }
+
+  pub fn visits_upsert(&self, input: VisitUpsertInput) -> anyhow::Result<Visit> {
+    if input.client_id.trim().is_empty() {
+      bail!("client_id is required");
+    }
+    let status = input.status.trim().to_lowercase();
+    if status != "draft" && status != "final" {
+      bail!("status must be one of: draft, final");
+    }
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let client_id = input.client_id;
+    let doctor_id = input.doctor_id;
+    let date = input.date;
+    let notes = input.notes;
+    let now = now_iso();
+
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    let existing_created_at: Option<String> = tx
+      .query_row("SELECT created_at FROM visits WHERE id=?1", params![id], |row| row.get(0))
+      .optional()?;
+    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+
+    tx.execute(
+      "INSERT INTO visits (id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+       ON CONFLICT(id) DO UPDATE SET
+         client_id=excluded.client_id,
+         doctor_id=excluded.doctor_id,
+         date=excluded.date,
+         status=excluded.status,
+         notes=excluded.notes,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![id, &client_id, &doctor_id, &date, &status, &notes, &created_at, &now],
+    )?;
+    let row = Visit {
+      id: id.clone(),
+      client_id,
+      doctor_id,
+      date,
+      status,
+      notes,
+      created_at: created_at.clone(),
+      updated_at: now.clone(),
+      deleted: 0,
+    };
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "visits", &row.id, "upsert", &payload, &now)?;
+    tx.commit()?;
+    Ok(row)
+  }
+
+  pub fn visits_delete(&self, id: &str) -> anyhow::Result<()> {
+    if id.trim().is_empty() {
+      bail!("visit id is required");
+    }
+    let now = now_iso();
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE visits SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+    let row = tx
+      .query_row(
+        "SELECT id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted FROM visits WHERE id=?1",
+        params![id],
+        |r| {
+          Ok(Visit {
+            id: r.get(0)?,
+            client_id: r.get(1)?,
+            doctor_id: r.get(2)?,
+            date: r.get(3)?,
+            status: r.get(4)?,
+            notes: r.get(5)?,
+            created_at: r.get(6)?,
+            updated_at: r.get(7)?,
+            deleted: r.get(8)?,
+          })
+        },
+      )
+      .optional()?
+      .ok_or_else(|| anyhow!("visit not found"))?;
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "visits", &row.id, "delete", &payload, &now)?;
+    tx.commit()?;
+    Ok(())
+  }
+
+  pub fn visit_items_list(&self, filters: Option<VisitItemsListFilters>) -> anyhow::Result<Vec<VisitItem>> {
+    let f = filters.unwrap_or_default();
+    let include_deleted = f.include_deleted.unwrap_or(false);
+
+    let mut sql = String::from(
+      "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted
+       FROM visit_items WHERE 1=1",
+    );
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+
+    if !include_deleted {
+      sql.push_str(" AND deleted = 0");
+    }
+    if let Some(vid) = f.visit_id.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND visit_id = ?{}", args.len() + 1));
+      args.push(vid.into());
+    }
+    if let Some(cid) = f.client_id.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND client_id = ?{}", args.len() + 1));
+      args.push(cid.into());
+    }
+
+    sql.push_str(" ORDER BY updated_at DESC LIMIT 5000");
+
+    let conn = self.conn()?;
+    let mut stmt = conn.prepare(&sql)?;
+    let mut out = Vec::new();
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+      Ok(VisitItem {
+        id: row.get(0)?,
+        visit_id: row.get(1)?,
+        client_id: row.get(2)?,
+        tooth: row.get(3)?,
+        title: row.get(4)?,
+        qty: row.get(5)?,
+        unit_price: row.get(6)?,
+        fiscal: row.get(7)?,
+        notes: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        deleted: row.get(11)?,
+      })
+    })?;
+    for r in rows {
+      out.push(r?);
+    }
+    Ok(out)
+  }
+
+  pub fn visit_items_upsert(&self, input: VisitItemUpsertInput) -> anyhow::Result<VisitItem> {
+    if input.visit_id.trim().is_empty() {
+      bail!("visit_id is required");
+    }
+    if input.client_id.trim().is_empty() {
+      bail!("client_id is required");
+    }
+    let title = input.title.trim();
+    if title.is_empty() {
+      bail!("title is required");
+    }
+    if !input.qty.is_finite() || input.qty <= 0.0 {
+      bail!("qty must be a finite number > 0");
+    }
+    if !input.unit_price.is_finite() || input.unit_price < 0.0 {
+      bail!("unit_price must be a finite number >= 0");
+    }
+
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let visit_id = input.visit_id;
+    let client_id = input.client_id;
+    let tooth = input.tooth;
+    let qty = input.qty;
+    let unit_price = input.unit_price;
+    let fiscal = if input.fiscal.unwrap_or(true) { 1 } else { 0 };
+    let notes = input.notes;
+    let now = now_iso();
+
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    let existing_created_at: Option<String> = tx
+      .query_row("SELECT created_at FROM visit_items WHERE id=?1", params![id], |row| row.get(0))
+      .optional()?;
+    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+
+    tx.execute(
+      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
+       ON CONFLICT(id) DO UPDATE SET
+         visit_id=excluded.visit_id,
+         client_id=excluded.client_id,
+         tooth=excluded.tooth,
+         title=excluded.title,
+         qty=excluded.qty,
+         unit_price=excluded.unit_price,
+         fiscal=excluded.fiscal,
+         notes=excluded.notes,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![
+        id,
+        &visit_id,
+        &client_id,
+        &tooth,
+        title,
+        qty,
+        unit_price,
+        fiscal,
+        &notes,
+        &created_at,
+        &now
+      ],
+    )?;
+    let row = VisitItem {
+      id: id.clone(),
+      visit_id,
+      client_id,
+      tooth,
+      title: title.to_string(),
+      qty,
+      unit_price,
+      fiscal,
+      notes,
+      created_at: created_at.clone(),
+      updated_at: now.clone(),
+      deleted: 0,
+    };
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "visit_items", &row.id, "upsert", &payload, &now)?;
+    tx.commit()?;
+    Ok(row)
+  }
+
+  pub fn visit_items_delete(&self, id: &str) -> anyhow::Result<()> {
+    if id.trim().is_empty() {
+      bail!("visit_item id is required");
+    }
+    let now = now_iso();
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE visit_items SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+    let row = tx
+      .query_row(
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted
+         FROM visit_items WHERE id=?1",
+        params![id],
+        |r| {
+          Ok(VisitItem {
+            id: r.get(0)?,
+            visit_id: r.get(1)?,
+            client_id: r.get(2)?,
+            tooth: r.get(3)?,
+            title: r.get(4)?,
+            qty: r.get(5)?,
+            unit_price: r.get(6)?,
+            fiscal: r.get(7)?,
+            notes: r.get(8)?,
+            created_at: r.get(9)?,
+            updated_at: r.get(10)?,
+            deleted: r.get(11)?,
+          })
+        },
+      )
+      .optional()?
+      .ok_or_else(|| anyhow!("visit_item not found"))?;
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "visit_items", &row.id, "delete", &payload, &now)?;
+    tx.commit()?;
+    Ok(())
+  }
+
+  pub fn cash_list(&self, filters: Option<CashListFilters>) -> anyhow::Result<Vec<CashEntry>> {
+    let f = filters.unwrap_or_default();
+    let include_deleted = f.include_deleted.unwrap_or(false);
+
+    let mut sql = String::from(
+      "SELECT id, type, date, amount, category, notes, created_at, updated_at, deleted
+       FROM cash_ledger WHERE 1=1",
+    );
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+
+    if !include_deleted {
+      sql.push_str(" AND deleted = 0");
+    }
+    if let Some(t) = f.r#type.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND type = ?{}", args.len() + 1));
+      args.push(t.into());
+    }
+    if let Some(d) = f.date_from.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND date >= ?{}", args.len() + 1));
+      args.push(d.into());
+    }
+    if let Some(d) = f.date_to.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND date <= ?{}", args.len() + 1));
+      args.push(d.into());
+    }
+
+    sql.push_str(" ORDER BY date DESC, updated_at DESC LIMIT 5000");
+
+    let conn = self.conn()?;
+    let mut stmt = conn.prepare(&sql)?;
+    let mut out = Vec::new();
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+      Ok(CashEntry {
+        id: row.get(0)?,
+        r#type: row.get(1)?,
+        date: row.get(2)?,
+        amount: row.get(3)?,
+        category: row.get(4)?,
+        notes: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        deleted: row.get(8)?,
+      })
+    })?;
+    for r in rows {
+      out.push(r?);
+    }
+    Ok(out)
+  }
+
+  pub fn cash_upsert(&self, input: CashEntryUpsertInput) -> anyhow::Result<CashEntry> {
+    let t = input.r#type.trim().to_lowercase();
+    if t != "income" && t != "expense" {
+      bail!("type must be one of: income, expense");
+    }
+    if !input.amount.is_finite() || input.amount < 0.0 {
+      bail!("amount must be a finite number >= 0");
+    }
+
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let date = input.date;
+    let amount = input.amount;
+    let category = input.category;
+    let notes = input.notes;
+    let now = now_iso();
+
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    let existing_created_at: Option<String> = tx
+      .query_row("SELECT created_at FROM cash_ledger WHERE id=?1", params![id], |row| row.get(0))
+      .optional()?;
+    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+
+    tx.execute(
+      "INSERT INTO cash_ledger (id, type, date, amount, category, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+       ON CONFLICT(id) DO UPDATE SET
+         type=excluded.type,
+         date=excluded.date,
+         amount=excluded.amount,
+         category=excluded.category,
+         notes=excluded.notes,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![id, &t, &date, amount, &category, &notes, &created_at, &now],
+    )?;
+    let row = CashEntry {
+      id: id.clone(),
+      r#type: t,
+      date,
+      amount,
+      category,
+      notes,
+      created_at: created_at.clone(),
+      updated_at: now.clone(),
+      deleted: 0,
+    };
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "cash_ledger", &row.id, "upsert", &payload, &now)?;
+    tx.commit()?;
+    Ok(row)
+  }
+
+  pub fn cash_delete(&self, id: &str) -> anyhow::Result<()> {
+    if id.trim().is_empty() {
+      bail!("cash entry id is required");
+    }
+    let now = now_iso();
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE cash_ledger SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+    let row = tx
+      .query_row(
+        "SELECT id, type, date, amount, category, notes, created_at, updated_at, deleted
+         FROM cash_ledger WHERE id=?1",
+        params![id],
+        |r| {
+          Ok(CashEntry {
+            id: r.get(0)?,
+            r#type: r.get(1)?,
+            date: r.get(2)?,
+            amount: r.get(3)?,
+            category: r.get(4)?,
+            notes: r.get(5)?,
+            created_at: r.get(6)?,
+            updated_at: r.get(7)?,
+            deleted: r.get(8)?,
+          })
+        },
+      )
+      .optional()?
+      .ok_or_else(|| anyhow!("cash entry not found"))?;
+    let payload = serde_json::to_string(&row)?;
+    Self::queue_replace_pending_tx(&tx, "cash_ledger", &row.id, "delete", &payload, &now)?;
+    tx.commit()?;
+    Ok(())
+  }
+
   pub fn get_last_sync_time(&self) -> anyhow::Result<Option<String>> {
     self.setting_get("last_sync_time")
   }
@@ -761,6 +1732,78 @@ impl Db {
     Ok(
       conn
         .query_row("SELECT updated_at FROM payments WHERE id=?1", params![id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten(),
+    )
+  }
+
+  pub fn doctors_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row("SELECT updated_at FROM doctors WHERE id=?1", params![id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten(),
+    )
+  }
+
+  pub fn services_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row("SELECT updated_at FROM services WHERE id=?1", params![id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten(),
+    )
+  }
+
+  pub fn appointments_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT updated_at FROM appointments WHERE id=?1",
+          params![id],
+          |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten(),
+    )
+  }
+
+  pub fn visits_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row("SELECT updated_at FROM visits WHERE id=?1", params![id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten(),
+    )
+  }
+
+  pub fn visit_items_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT updated_at FROM visit_items WHERE id=?1",
+          params![id],
+          |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten(),
+    )
+  }
+
+  pub fn cash_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT updated_at FROM cash_ledger WHERE id=?1",
+          params![id],
+          |row| row.get::<_, Option<String>>(0),
+        )
         .optional()?
         .flatten(),
     )
@@ -842,6 +1885,182 @@ impl Db {
         row.date,
         row.amount,
         row.method,
+        row.notes,
+        row.created_at,
+        row.updated_at,
+        row.deleted
+      ],
+    )?;
+    Ok(())
+  }
+
+  pub fn apply_remote_doctor(&self, row: &Doctor) -> anyhow::Result<()> {
+    let conn = self.conn()?;
+    conn.execute(
+      "INSERT INTO doctors (id, name, phone, email, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+       ON CONFLICT(id) DO UPDATE SET
+         name=excluded.name,
+         phone=excluded.phone,
+         email=excluded.email,
+         notes=excluded.notes,
+         created_at=excluded.created_at,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![
+        row.id,
+        row.name,
+        row.phone,
+        row.email,
+        row.notes,
+        row.created_at,
+        row.updated_at,
+        row.deleted
+      ],
+    )?;
+    Ok(())
+  }
+
+  pub fn apply_remote_service(&self, row: &Service) -> anyhow::Result<()> {
+    let conn = self.conn()?;
+    conn.execute(
+      "INSERT INTO services (id, title, default_price, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+       ON CONFLICT(id) DO UPDATE SET
+         title=excluded.title,
+         default_price=excluded.default_price,
+         notes=excluded.notes,
+         created_at=excluded.created_at,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![
+        row.id,
+        row.title,
+        row.default_price,
+        row.notes,
+        row.created_at,
+        row.updated_at,
+        row.deleted
+      ],
+    )?;
+    Ok(())
+  }
+
+  pub fn apply_remote_appointment(&self, row: &Appointment) -> anyhow::Result<()> {
+    let conn = self.conn()?;
+    conn.execute(
+      "INSERT INTO appointments (id, client_id, doctor_id, start_at, end_at, status, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+       ON CONFLICT(id) DO UPDATE SET
+         client_id=excluded.client_id,
+         doctor_id=excluded.doctor_id,
+         start_at=excluded.start_at,
+         end_at=excluded.end_at,
+         status=excluded.status,
+         notes=excluded.notes,
+         created_at=excluded.created_at,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![
+        row.id,
+        row.client_id,
+        row.doctor_id,
+        row.start_at,
+        row.end_at,
+        row.status,
+        row.notes,
+        row.created_at,
+        row.updated_at,
+        row.deleted
+      ],
+    )?;
+    Ok(())
+  }
+
+  pub fn apply_remote_visit(&self, row: &Visit) -> anyhow::Result<()> {
+    let conn = self.conn()?;
+    conn.execute(
+      "INSERT INTO visits (id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+       ON CONFLICT(id) DO UPDATE SET
+         client_id=excluded.client_id,
+         doctor_id=excluded.doctor_id,
+         date=excluded.date,
+         status=excluded.status,
+         notes=excluded.notes,
+         created_at=excluded.created_at,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![
+        row.id,
+        row.client_id,
+        row.doctor_id,
+        row.date,
+        row.status,
+        row.notes,
+        row.created_at,
+        row.updated_at,
+        row.deleted
+      ],
+    )?;
+    Ok(())
+  }
+
+  pub fn apply_remote_visit_item(&self, row: &VisitItem) -> anyhow::Result<()> {
+    let conn = self.conn()?;
+    conn.execute(
+      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+       ON CONFLICT(id) DO UPDATE SET
+         visit_id=excluded.visit_id,
+         client_id=excluded.client_id,
+         tooth=excluded.tooth,
+         title=excluded.title,
+         qty=excluded.qty,
+         unit_price=excluded.unit_price,
+         fiscal=excluded.fiscal,
+         notes=excluded.notes,
+         created_at=excluded.created_at,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![
+        row.id,
+        row.visit_id,
+        row.client_id,
+        row.tooth,
+        row.title,
+        row.qty,
+        row.unit_price,
+        row.fiscal,
+        row.notes,
+        row.created_at,
+        row.updated_at,
+        row.deleted
+      ],
+    )?;
+    Ok(())
+  }
+
+  pub fn apply_remote_cash_entry(&self, row: &CashEntry) -> anyhow::Result<()> {
+    let conn = self.conn()?;
+    conn.execute(
+      "INSERT INTO cash_ledger (id, type, date, amount, category, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+       ON CONFLICT(id) DO UPDATE SET
+         type=excluded.type,
+         date=excluded.date,
+         amount=excluded.amount,
+         category=excluded.category,
+         notes=excluded.notes,
+         created_at=excluded.created_at,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![
+        row.id,
+        row.r#type,
+        row.date,
+        row.amount,
+        row.category,
         row.notes,
         row.created_at,
         row.updated_at,
