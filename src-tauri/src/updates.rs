@@ -41,6 +41,29 @@ pub struct UpdatesEngine {
   lock: tokio::sync::Mutex<()>,
 }
 
+fn ui_bundle_has_clinic_name_key(dir: &Path) -> bool {
+  // Compatibility guard: older seed bundles used snake_case IPC args (clinic_name),
+  // while the current backend expects camelCase (clinicName). If we detect an old
+  // bundle, we can safely fall back to the packaged seed without needing the network.
+  let assets = dir.join("assets");
+  let rd = match fs::read_dir(&assets) {
+    Ok(r) => r,
+    Err(_) => return false,
+  };
+  for ent in rd.flatten() {
+    let p = ent.path();
+    if p.extension().and_then(|s| s.to_str()) != Some("js") {
+      continue;
+    }
+    if let Ok(bytes) = fs::read(&p) {
+      if bytes.windows(b"clinicName".len()).any(|w| w == b"clinicName") {
+        return true;
+      }
+    }
+  }
+  false
+}
+
 impl UpdatesEngine {
   pub fn new(db: std::sync::Arc<Db>) -> anyhow::Result<Self> {
     let client = reqwest::Client::builder()
@@ -166,11 +189,15 @@ impl UpdatesEngine {
   pub fn ensure_seed_installed(app: &tauri::AppHandle) -> anyhow::Result<()> {
     ensure_ui_dirs(app)?;
 
-    // If current exists and has index.html, we're good.
-    if let Ok(dir) = current_ui_dir(app) {
-      if dir.join("index.html").exists() {
-        return Ok(());
-      }
+    // If current exists and looks compatible, keep it.
+    // If it exists but looks incompatible (older seed), prefer the packaged seed.
+    let current_dir = current_ui_dir(app).ok();
+    let current_has_index = current_dir.as_ref().is_some_and(|d| d.join("index.html").exists());
+    let current_looks_compatible = current_dir
+      .as_ref()
+      .is_some_and(|d| ui_bundle_has_clinic_name_key(d));
+    if current_has_index && current_looks_compatible {
+      return Ok(());
     }
 
     // Install from packaged resources if present.
@@ -192,7 +219,13 @@ impl UpdatesEngine {
         Ok(())
       }
       Err(e) => {
-        // Fallback: create a tiny offline page so the app can still render.
+        // If we already have a current UI (even if it's incompatible), don't replace it with
+        // an error page. Keep the previous UI and allow an online update later.
+        if current_has_index {
+          return Ok(());
+        }
+
+        // Otherwise, fallback: create a tiny offline page so the app can still render.
         fs::create_dir_all(&seed_dir)?;
         fs::write(
           seed_dir.join("index.html"),
