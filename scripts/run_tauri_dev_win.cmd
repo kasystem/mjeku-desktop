@@ -21,6 +21,6 @@ echo [mjeku-desktop] Starting tauri dev...
 echo [mjeku-desktop] Using cargo:
 %CARGO_EXE% -V
 
-"%NODE20%" node_modules\@tauri-apps\cli\tauri.js dev --no-dev-server-wait --no-watch --verbose --runner %CARGO_EXE%
+"%NODE20%" node_modules\@tauri-apps\cli\tauri.js dev --no-dev-server-wait --verbose --runner %CARGO_EXE%
 
 endlocal
