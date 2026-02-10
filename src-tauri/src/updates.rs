@@ -41,6 +41,23 @@ pub struct UpdatesEngine {
   lock: tokio::sync::Mutex<()>,
 }
 
+fn find_resource_file(app: &tauri::AppHandle, name: &str) -> anyhow::Result<PathBuf> {
+  let dir = app.path().resource_dir()?;
+  let cand1 = dir.join(name);
+  let cand2 = dir.join("resources").join(name);
+  if cand1.exists() {
+    return Ok(cand1);
+  }
+  if cand2.exists() {
+    return Ok(cand2);
+  }
+  bail!(
+    "missing resource: {} (also tried {})",
+    cand1.display(),
+    cand2.display()
+  )
+}
+
 fn ui_bundle_has_clinic_name_key(dir: &Path) -> bool {
   // Compatibility guard: older seed bundles used snake_case IPC args (clinic_name),
   // while the current backend expects camelCase (clinicName). If we detect an old
@@ -329,18 +346,12 @@ fn eq_hex(a: &str, b: &str) -> bool {
 }
 
 fn read_resource_text(app: &tauri::AppHandle, name: &str) -> anyhow::Result<String> {
-  let dir = app.path().resource_dir()?;
-  let p = dir.join(name);
-  let s = fs::read_to_string(p)?;
-  Ok(s)
+  let p = find_resource_file(app, name)?;
+  Ok(fs::read_to_string(p)?)
 }
 
 fn extract_seed_resource(app: &tauri::AppHandle, dest: &Path) -> anyhow::Result<()> {
-  let res_dir = app.path().resource_dir()?;
-  let zip_path = res_dir.join(SEED_ZIP_RESOURCE);
-  if !zip_path.exists() {
-    bail!("missing resource: {}", zip_path.display());
-  }
+  let zip_path = find_resource_file(app, SEED_ZIP_RESOURCE)?;
   fs::create_dir_all(dest)?;
   extract_zip(&zip_path, dest)?;
   Ok(())
