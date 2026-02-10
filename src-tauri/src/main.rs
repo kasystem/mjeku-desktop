@@ -6,7 +6,9 @@ mod updates;
 mod util;
 
 use std::collections::HashMap;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tauri::Manager;
 
@@ -26,6 +28,37 @@ struct AppState {
 
 fn err_string(e: impl std::fmt::Display) -> String {
   e.to_string()
+}
+
+fn dev_server_is_reachable(dev_url: &str) -> bool {
+  // We only need a cheap check for localhost Vite availability.
+  let mut rest = dev_url.trim();
+  if let Some(s) = rest.strip_prefix("http://") {
+    rest = s;
+  } else if let Some(s) = rest.strip_prefix("https://") {
+    rest = s;
+  }
+
+  let host_port = rest.split('/').next().unwrap_or(rest);
+  let (host, port) = match host_port.rsplit_once(':') {
+    Some((h, p)) => (h, p),
+    None => return false,
+  };
+  let port: u16 = match port.parse() {
+    Ok(p) => p,
+    Err(_) => return false,
+  };
+
+  let addrs = match (host, port).to_socket_addrs() {
+    Ok(a) => a,
+    Err(_) => return false,
+  };
+  for addr in addrs {
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+      return true;
+    }
+  }
+  false
 }
 
 #[tauri::command]
@@ -199,8 +232,10 @@ fn main() {
       if tauri::is_dev() {
         if let Some(win) = app.get_webview_window("main") {
           let dev_url = std::env::var("MJEKU_DEV_URL").unwrap_or_else(|_| "http://127.0.0.1:5173".to_string());
-          let js = format!("window.location.replace({:?});", dev_url);
-          let _ = win.eval(&js);
+          if dev_server_is_reachable(&dev_url) {
+            let js = format!("window.location.replace({:?});", dev_url);
+            let _ = win.eval(&js);
+          }
         }
       }
       Ok(())
