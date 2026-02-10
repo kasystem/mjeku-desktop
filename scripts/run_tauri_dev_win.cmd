@@ -7,6 +7,8 @@ rem VS Build Tools + Windows SDK are installed on this machine, but vcvars doesn
 call C:\Progra~1\MIB055~1\2022\COMMUN~1\VC\Auxiliary\Build\vcvars64.bat
 
 set CARGO_EXE=C:\Users\FATLIN~1\.cargo\bin\cargo.exe
+rem Ensure cargo is discoverable (tauri CLI calls `cargo metadata`).
+set PATH=C:\Users\FATLIN~1\.cargo\bin;%PATH%
 
 set SDK_VER=10.0.19041.0
 set SDK_ROOT=C:\Progra~2\WI3CF2~1\10
