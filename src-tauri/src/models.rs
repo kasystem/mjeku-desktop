@@ -42,6 +42,33 @@ pub struct Sale {
   pub deleted: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailySaleRow {
+  pub sale_id: String,
+  pub client_id: String,
+  pub client_name: String,
+  pub date: Option<String>, // YYYY-MM-DD
+  pub total: f64,
+  pub fiscal_total: f64,
+  pub non_fiscal_total: f64,
+  pub notes: Option<String>,
+  pub updated_at: String,
+  pub classification: String, // fiscal | non_fiscal | mixed
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailySalesReport {
+  pub date: String, // YYYY-MM-DD
+  pub total: f64,
+  pub fiscal_total: f64,
+  pub non_fiscal_total: f64,
+  pub count_sales: i64,
+  pub count_fiscal_only: i64,
+  pub count_non_fiscal_only: i64,
+  pub count_mixed: i64,
+  pub rows: Vec<DailySaleRow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SalesListFilters {
   pub client_id: Option<String>,
@@ -103,6 +130,14 @@ pub struct Doctor {
   pub created_at: String,
   pub updated_at: String,
   pub deleted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorLoginOption {
+  pub id: String,
+  pub name: String,
+  pub has_account: bool,
+  pub is_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

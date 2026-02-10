@@ -83,6 +83,16 @@ CREATE TABLE IF NOT EXISTS doctors (
   deleted INTEGER DEFAULT 0
 );
 
+-- Local-only credentials for doctor logins (NOT synced to Supabase).
+CREATE TABLE IF NOT EXISTS doctor_accounts (
+  doctor_id TEXT PRIMARY KEY,
+  salt TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT,
+  updated_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS services (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -161,6 +171,9 @@ CREATE INDEX IF NOT EXISTS idx_sync_queue_created_at ON sync_queue(created_at);
 CREATE INDEX IF NOT EXISTS idx_sync_queue_table_row ON sync_queue(table_name, row_id);
 
 CREATE INDEX IF NOT EXISTS idx_doctors_updated_at ON doctors(updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_doctor_accounts_is_admin ON doctor_accounts(is_admin);
+CREATE INDEX IF NOT EXISTS idx_doctor_accounts_updated_at ON doctor_accounts(updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_services_updated_at ON services(updated_at);
 
@@ -536,6 +549,103 @@ impl Db {
     Ok(out)
   }
 
+  pub fn sales_daily_report(&self, date: &str) -> anyhow::Result<crate::models::DailySalesReport> {
+    let date = date.trim();
+    if date.is_empty() {
+      bail!("date eshte i detyrueshem");
+    }
+
+    let conn = self.conn()?;
+    let mut stmt = conn.prepare(
+      "SELECT s.id, s.client_id, COALESCE(c.name, '') AS client_name, s.date, s.total, s.notes, s.updated_at,
+              COALESCE(SUM(CASE WHEN vi.deleted = 0 AND vi.fiscal = 1 THEN (vi.qty * vi.unit_price) ELSE 0 END), 0) AS fiscal_sum,
+              COALESCE(SUM(CASE WHEN vi.deleted = 0 AND vi.fiscal = 0 THEN (vi.qty * vi.unit_price) ELSE 0 END), 0) AS non_fiscal_sum,
+              COALESCE(SUM(CASE WHEN vi.deleted = 0 THEN 1 ELSE 0 END), 0) AS item_count
+       FROM sales s
+       LEFT JOIN clients c ON c.id = s.client_id
+       LEFT JOIN visit_items vi ON vi.visit_id = s.id
+       WHERE s.deleted = 0 AND s.date = ?1
+       GROUP BY s.id
+       ORDER BY s.updated_at DESC",
+    )?;
+
+    let rows = stmt.query_map(params![date], |row| {
+      let sale_id: String = row.get(0)?;
+      let client_id: String = row.get(1)?;
+      let client_name: String = row.get(2)?;
+      let sale_date: Option<String> = row.get(3)?;
+      let sale_total: f64 = row.get(4)?;
+      let notes: Option<String> = row.get(5)?;
+      let updated_at: String = row.get(6)?;
+      let fiscal_sum: f64 = row.get(7)?;
+      let non_fiscal_sum: f64 = row.get(8)?;
+      let item_count: i64 = row.get(9)?;
+
+      // If the sale has item lines, we trust them (they support mixed fiscal/non-fiscal).
+      // Otherwise, fallback to the sale.total (assume fiscal).
+      let (fiscal_total, non_fiscal_total, total) = if item_count > 0 {
+        let total = fiscal_sum + non_fiscal_sum;
+        (fiscal_sum, non_fiscal_sum, total)
+      } else {
+        (sale_total, 0.0, sale_total)
+      };
+
+      let classification = if fiscal_total > 0.0 && non_fiscal_total > 0.0 {
+        "mixed"
+      } else if non_fiscal_total > 0.0 {
+        "non_fiscal"
+      } else {
+        "fiscal"
+      };
+
+      Ok(crate::models::DailySaleRow {
+        sale_id,
+        client_id,
+        client_name,
+        date: sale_date,
+        total,
+        fiscal_total,
+        non_fiscal_total,
+        notes,
+        updated_at,
+        classification: classification.to_string(),
+      })
+    })?;
+
+    let mut out_rows: Vec<crate::models::DailySaleRow> = Vec::new();
+    for r in rows {
+      out_rows.push(r?);
+    }
+
+    let mut fiscal_total = 0.0_f64;
+    let mut non_fiscal_total = 0.0_f64;
+    let mut count_fiscal_only = 0_i64;
+    let mut count_non_fiscal_only = 0_i64;
+    let mut count_mixed = 0_i64;
+
+    for r in &out_rows {
+      fiscal_total += r.fiscal_total;
+      non_fiscal_total += r.non_fiscal_total;
+      match r.classification.as_str() {
+        "mixed" => count_mixed += 1,
+        "non_fiscal" => count_non_fiscal_only += 1,
+        _ => count_fiscal_only += 1,
+      }
+    }
+
+    Ok(crate::models::DailySalesReport {
+      date: date.to_string(),
+      total: fiscal_total + non_fiscal_total,
+      fiscal_total,
+      non_fiscal_total,
+      count_sales: out_rows.len() as i64,
+      count_fiscal_only,
+      count_non_fiscal_only,
+      count_mixed,
+      rows: out_rows,
+    })
+  }
+
   pub fn sales_get(&self, id: &str) -> anyhow::Result<Option<Sale>> {
     let conn = self.conn()?;
     Ok(
@@ -827,6 +937,71 @@ impl Db {
     Ok(())
   }
 
+  pub fn doctors_get(&self, id: &str) -> anyhow::Result<Option<Doctor>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT id, name, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
+          params![id],
+          |row| {
+            Ok(Doctor {
+              id: row.get(0)?,
+              name: row.get(1)?,
+              phone: row.get(2)?,
+              email: row.get(3)?,
+              notes: row.get(4)?,
+              created_at: row.get(5)?,
+              updated_at: row.get(6)?,
+              deleted: row.get(7)?,
+            })
+          },
+        )
+        .optional()?,
+    )
+  }
+
+  pub fn doctor_account_get(&self, doctor_id: &str) -> anyhow::Result<Option<(String, String, bool)>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT salt, password_hash, is_admin FROM doctor_accounts WHERE doctor_id=?1",
+          params![doctor_id],
+          |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? == 1)),
+        )
+        .optional()?,
+    )
+  }
+
+  pub fn doctor_account_set(
+    &self,
+    doctor_id: &str,
+    salt: &str,
+    password_hash: &str,
+    is_admin: bool,
+    now: &str,
+  ) -> anyhow::Result<()> {
+    let conn = self.conn()?;
+    conn.execute(
+      "INSERT INTO doctor_accounts (doctor_id, salt, password_hash, is_admin, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+       ON CONFLICT(doctor_id) DO UPDATE SET
+         salt=excluded.salt,
+         password_hash=excluded.password_hash,
+         is_admin=excluded.is_admin,
+         updated_at=excluded.updated_at",
+      params![doctor_id, salt, password_hash, if is_admin { 1 } else { 0 }, now, now],
+    )?;
+    Ok(())
+  }
+
+  pub fn doctor_account_delete(&self, doctor_id: &str) -> anyhow::Result<()> {
+    let conn = self.conn()?;
+    conn.execute("DELETE FROM doctor_accounts WHERE doctor_id=?1", params![doctor_id])?;
+    Ok(())
+  }
+
   pub fn doctors_list(&self, search: Option<String>) -> anyhow::Result<Vec<Doctor>> {
     let conn = self.conn()?;
     let mut out = Vec::new();
@@ -877,6 +1052,32 @@ impl Db {
         deleted: row.get(7)?,
       })
     })?;
+    for r in rows {
+      out.push(r?);
+    }
+    Ok(out)
+  }
+
+  pub fn doctors_login_options(&self) -> anyhow::Result<Vec<crate::models::DoctorLoginOption>> {
+    let conn = self.conn()?;
+    let mut stmt = conn.prepare(
+      "SELECT d.id, d.name,
+              CASE WHEN a.doctor_id IS NULL THEN 0 ELSE 1 END AS has_account,
+              COALESCE(a.is_admin, 0) AS is_admin
+       FROM doctors d
+       LEFT JOIN doctor_accounts a ON a.doctor_id = d.id
+       WHERE d.deleted = 0
+       ORDER BY d.name ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+      Ok(crate::models::DoctorLoginOption {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        has_account: row.get::<_, i64>(2)? == 1,
+        is_admin: row.get::<_, i64>(3)? == 1,
+      })
+    })?;
+    let mut out = Vec::new();
     for r in rows {
       out.push(r?);
     }
@@ -937,6 +1138,8 @@ impl Db {
     let mut conn = self.conn()?;
     let tx = conn.transaction()?;
     tx.execute("UPDATE doctors SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+    // Local-only: remove login credentials when a doctor is deleted.
+    let _ = tx.execute("DELETE FROM doctor_accounts WHERE doctor_id=?1", params![id]);
     let row = tx
       .query_row(
         "SELECT id, name, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
@@ -1153,6 +1356,33 @@ impl Db {
     Ok(out)
   }
 
+  pub fn appointments_get(&self, id: &str) -> anyhow::Result<Option<Appointment>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT id, client_id, doctor_id, start_at, end_at, status, notes, created_at, updated_at, deleted
+           FROM appointments WHERE id=?1",
+          params![id],
+          |row| {
+            Ok(Appointment {
+              id: row.get(0)?,
+              client_id: row.get(1)?,
+              doctor_id: row.get(2)?,
+              start_at: row.get(3)?,
+              end_at: row.get(4)?,
+              status: row.get(5)?,
+              notes: row.get(6)?,
+              created_at: row.get(7)?,
+              updated_at: row.get(8)?,
+              deleted: row.get(9)?,
+            })
+          },
+        )
+        .optional()?,
+    )
+  }
+
   pub fn appointments_upsert(&self, input: AppointmentUpsertInput) -> anyhow::Result<Appointment> {
     if input.client_id.trim().is_empty() {
       bail!("client_id is required");
@@ -1305,6 +1535,32 @@ impl Db {
     Ok(out)
   }
 
+  pub fn visits_get(&self, id: &str) -> anyhow::Result<Option<Visit>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted
+           FROM visits WHERE id=?1",
+          params![id],
+          |row| {
+            Ok(Visit {
+              id: row.get(0)?,
+              client_id: row.get(1)?,
+              doctor_id: row.get(2)?,
+              date: row.get(3)?,
+              status: row.get(4)?,
+              notes: row.get(5)?,
+              created_at: row.get(6)?,
+              updated_at: row.get(7)?,
+              deleted: row.get(8)?,
+            })
+          },
+        )
+        .optional()?,
+    )
+  }
+
   pub fn visits_upsert(&self, input: VisitUpsertInput) -> anyhow::Result<Visit> {
     if input.client_id.trim().is_empty() {
       bail!("client_id is required");
@@ -1438,6 +1694,35 @@ impl Db {
       out.push(r?);
     }
     Ok(out)
+  }
+
+  pub fn visit_items_get(&self, id: &str) -> anyhow::Result<Option<VisitItem>> {
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted
+           FROM visit_items WHERE id=?1",
+          params![id],
+          |row| {
+            Ok(VisitItem {
+              id: row.get(0)?,
+              visit_id: row.get(1)?,
+              client_id: row.get(2)?,
+              tooth: row.get(3)?,
+              title: row.get(4)?,
+              qty: row.get(5)?,
+              unit_price: row.get(6)?,
+              fiscal: row.get(7)?,
+              notes: row.get(8)?,
+              created_at: row.get(9)?,
+              updated_at: row.get(10)?,
+              deleted: row.get(11)?,
+            })
+          },
+        )
+        .optional()?,
+    )
   }
 
   pub fn visit_items_upsert(&self, input: VisitItemUpsertInput) -> anyhow::Result<VisitItem> {

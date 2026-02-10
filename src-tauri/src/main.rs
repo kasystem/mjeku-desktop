@@ -12,13 +12,14 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::bail;
 use tauri::Manager;
 
-use crate::auth::{AuthState, AuthStateInfo};
+use crate::auth::{AuthState, AuthStateInfo, SessionKind};
 use crate::db::Db;
 use crate::models::{
-  Appointment, AppointmentUpsertInput, AppointmentsListFilters, AppInfo, CashEntry, CashEntryUpsertInput,
-  CashListFilters, Client, ClientUpsertInput, Doctor, DoctorUpsertInput, Payment, PaymentUpsertInput,
+  Appointment, AppointmentUpsertInput, AppointmentsListFilters, AppInfo, CashEntry, CashEntryUpsertInput, CashListFilters,
+  Client, ClientUpsertInput, DailySalesReport, Doctor, DoctorLoginOption, DoctorUpsertInput, Payment, PaymentUpsertInput,
   PaymentsListFilters, Sale, SaleUpsertInput, SalesListFilters, Service, ServiceUpsertInput, Visit, VisitItem,
   VisitItemUpsertInput, VisitItemsListFilters, VisitUpsertInput, VisitsListFilters,
 };
@@ -92,8 +93,8 @@ async fn get_app_info(app: tauri::AppHandle, state: tauri::State<'_, AppState>) 
 async fn auth_get_state(state: tauri::State<'_, AppState>) -> Result<AuthStateInfo, String> {
   let db = state.db.clone();
   let admin_unlocked = state.auth.is_admin_unlocked().await;
-  let user_logged_in = state.auth.is_user_logged_in().await;
-  tokio::task::spawn_blocking(move || crate::auth::read_state(&db, admin_unlocked, user_logged_in))
+  let session = state.auth.session().await;
+  tokio::task::spawn_blocking(move || crate::auth::read_state(&db, admin_unlocked, session))
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -154,11 +155,11 @@ async fn auth_user_login(state: tauri::State<'_, AppState>, password: String) ->
     .map_err(err_string)?;
   if ok {
     let db2 = state.db.clone();
-    tokio::task::spawn_blocking(move || crate::auth::user_set_logged_in(&db2, true))
+    tokio::task::spawn_blocking(move || crate::auth::session_set_user(&db2))
       .await
       .map_err(err_string)?
       .map_err(err_string)?;
-    state.auth.user_login().await;
+    state.auth.set_session(SessionKind::User).await;
   }
   Ok(ok)
 }
@@ -166,20 +167,90 @@ async fn auth_user_login(state: tauri::State<'_, AppState>, password: String) ->
 #[tauri::command]
 async fn auth_user_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || crate::auth::user_set_logged_in(&db, false))
+  tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
     .await
     .map_err(err_string)?
     .map_err(err_string)?;
-  state.auth.user_logout().await;
+  state.auth.set_session(SessionKind::None).await;
   state.auth.admin_lock().await;
   Ok(())
 }
 
-async fn require_user(state: &tauri::State<'_, AppState>) -> Result<(), String> {
-  if state.auth.is_user_logged_in().await {
-    Ok(())
-  } else {
-    Err("duhet te hysh me fjalekalimin e pergjithshem".to_string())
+#[tauri::command]
+async fn doctors_login_options(state: tauri::State<'_, AppState>) -> Result<Vec<DoctorLoginOption>, String> {
+  let db = state.db.clone();
+  tokio::task::spawn_blocking(move || db.doctors_login_options())
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn auth_doctor_login(state: tauri::State<'_, AppState>, doctor_id: String, password: String) -> Result<bool, String> {
+  let db = state.db.clone();
+  let did = doctor_id.clone();
+  let res = tokio::task::spawn_blocking(move || crate::auth::doctor_verify(&db, &did, &password))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+
+  match res {
+    crate::auth::DoctorVerify::NoAccount => Err("ky mjek nuk ka login. kontakto administratorin.".to_string()),
+    crate::auth::DoctorVerify::WrongPassword => Ok(false),
+    crate::auth::DoctorVerify::Ok { .. } => {
+      let db2 = state.db.clone();
+      let did2 = doctor_id.clone();
+      let session = tokio::task::spawn_blocking(move || crate::auth::session_set_doctor(&db2, &did2))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+      state.auth.set_session(session).await;
+      Ok(true)
+    }
+  }
+}
+
+#[tauri::command]
+async fn auth_doctor_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+  let db = state.db.clone();
+  tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+  state.auth.set_session(SessionKind::None).await;
+  state.auth.admin_lock().await;
+  Ok(())
+}
+
+#[tauri::command]
+async fn doctor_account_update(
+  state: tauri::State<'_, AppState>,
+  doctor_id: String,
+  password: Option<String>,
+  is_admin: bool,
+) -> Result<(), String> {
+  let _ = require_finance(&state).await?;
+  let db = state.db.clone();
+  tokio::task::spawn_blocking(move || crate::auth::doctor_account_update(&db, &doctor_id, password.as_deref(), is_admin))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
+  let s = state.auth.session().await;
+  match s {
+    SessionKind::None => Err("duhet te hysh per te vazhduar".to_string()),
+    _ => Ok(s),
+  }
+}
+
+async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
+  let s = require_login(state).await?;
+  match &s {
+    SessionKind::User => Ok(s),
+    SessionKind::Doctor { is_admin: true, .. } => Ok(s),
+    _ => Err("nuk ke akses per kete seksion".to_string()),
   }
 }
 
@@ -204,6 +275,7 @@ async fn settings_get_all(state: tauri::State<'_, AppState>) -> Result<HashMap<S
       "user_salt",
       "user_hash",
       "user_logged_in",
+      "session",
     ] {
       map.remove(k);
     }
@@ -231,9 +303,14 @@ async fn settings_set(state: tauri::State<'_, AppState>, key: String, value: Str
       | "user_salt"
       | "user_hash"
       | "user_logged_in"
+      | "session"
   );
-  if protected && !state.auth.is_admin_unlocked().await {
-    return Err("kjo vlere kerkon hyrje si admin".to_string());
+  if protected {
+    if !state.auth.is_admin_unlocked().await {
+      return Err("kjo vlere kerkon hyrje si admin".to_string());
+    }
+  } else {
+    let _ = require_login(&state).await?;
   }
 
   let db = state.db.clone();
@@ -245,7 +322,7 @@ async fn settings_set(state: tauri::State<'_, AppState>, key: String, value: Str
 
 #[tauri::command]
 async fn clients_list(state: tauri::State<'_, AppState>, search: Option<String>) -> Result<Vec<Client>, String> {
-  require_user(&state).await?;
+  let _ = require_login(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.clients_list(search))
     .await
@@ -255,7 +332,7 @@ async fn clients_list(state: tauri::State<'_, AppState>, search: Option<String>)
 
 #[tauri::command]
 async fn clients_upsert(state: tauri::State<'_, AppState>, client: ClientUpsertInput) -> Result<Client, String> {
-  require_user(&state).await?;
+  let _ = require_login(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.clients_upsert(client))
     .await
@@ -265,7 +342,7 @@ async fn clients_upsert(state: tauri::State<'_, AppState>, client: ClientUpsertI
 
 #[tauri::command]
 async fn clients_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let _ = require_login(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.clients_delete(&id))
     .await
@@ -275,7 +352,7 @@ async fn clients_delete(state: tauri::State<'_, AppState>, id: String) -> Result
 
 #[tauri::command]
 async fn sales_list(state: tauri::State<'_, AppState>, filters: Option<SalesListFilters>) -> Result<Vec<Sale>, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.sales_list(filters))
     .await
@@ -284,8 +361,18 @@ async fn sales_list(state: tauri::State<'_, AppState>, filters: Option<SalesList
 }
 
 #[tauri::command]
+async fn sales_daily_report(state: tauri::State<'_, AppState>, date: String) -> Result<DailySalesReport, String> {
+  let _ = require_finance(&state).await?;
+  let db = state.db.clone();
+  tokio::task::spawn_blocking(move || db.sales_daily_report(&date))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
 async fn sales_upsert(state: tauri::State<'_, AppState>, sale: SaleUpsertInput) -> Result<Sale, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.sales_upsert(sale))
     .await
@@ -295,7 +382,7 @@ async fn sales_upsert(state: tauri::State<'_, AppState>, sale: SaleUpsertInput) 
 
 #[tauri::command]
 async fn sales_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.sales_delete(&id))
     .await
@@ -308,7 +395,7 @@ async fn payments_list(
   state: tauri::State<'_, AppState>,
   filters: Option<PaymentsListFilters>,
 ) -> Result<Vec<Payment>, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.payments_list(filters))
     .await
@@ -318,7 +405,7 @@ async fn payments_list(
 
 #[tauri::command]
 async fn payments_upsert(state: tauri::State<'_, AppState>, payment: PaymentUpsertInput) -> Result<Payment, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.payments_upsert(payment))
     .await
@@ -328,7 +415,7 @@ async fn payments_upsert(state: tauri::State<'_, AppState>, payment: PaymentUpse
 
 #[tauri::command]
 async fn payments_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.payments_delete(&id))
     .await
@@ -338,17 +425,23 @@ async fn payments_delete(state: tauri::State<'_, AppState>, id: String) -> Resul
 
 #[tauri::command]
 async fn doctors_list(state: tauri::State<'_, AppState>, search: Option<String>) -> Result<Vec<Doctor>, String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.doctors_list(search))
-    .await
-    .map_err(err_string)?
-    .map_err(err_string)
+  tokio::task::spawn_blocking(move || match session {
+    SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } => Ok(db.doctors_get(&doctor_id)?.into_iter().filter(|d| d.deleted == 0).collect()),
+    _ => db.doctors_list(search),
+  })
+  .await
+  .map_err(err_string)?
+  .map_err(err_string)
 }
 
 #[tauri::command]
 async fn doctors_upsert(state: tauri::State<'_, AppState>, doctor: DoctorUpsertInput) -> Result<Doctor, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.doctors_upsert(doctor))
     .await
@@ -358,7 +451,7 @@ async fn doctors_upsert(state: tauri::State<'_, AppState>, doctor: DoctorUpsertI
 
 #[tauri::command]
 async fn doctors_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.doctors_delete(&id))
     .await
@@ -368,7 +461,7 @@ async fn doctors_delete(state: tauri::State<'_, AppState>, id: String) -> Result
 
 #[tauri::command]
 async fn services_list(state: tauri::State<'_, AppState>, search: Option<String>) -> Result<Vec<Service>, String> {
-  require_user(&state).await?;
+  let _ = require_login(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.services_list(search))
     .await
@@ -378,7 +471,7 @@ async fn services_list(state: tauri::State<'_, AppState>, search: Option<String>
 
 #[tauri::command]
 async fn services_upsert(state: tauri::State<'_, AppState>, service: ServiceUpsertInput) -> Result<Service, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.services_upsert(service))
     .await
@@ -388,7 +481,7 @@ async fn services_upsert(state: tauri::State<'_, AppState>, service: ServiceUpse
 
 #[tauri::command]
 async fn services_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.services_delete(&id))
     .await
@@ -401,9 +494,19 @@ async fn appointments_list(
   state: tauri::State<'_, AppState>,
   filters: Option<AppointmentsListFilters>,
 ) -> Result<Vec<Appointment>, String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.appointments_list(filters))
+  tokio::task::spawn_blocking(move || {
+    let mut f = filters.unwrap_or_default();
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      f.doctor_id = Some(doctor_id);
+    }
+    db.appointments_list(Some(f))
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -414,9 +517,19 @@ async fn appointments_upsert(
   state: tauri::State<'_, AppState>,
   appointment: AppointmentUpsertInput,
 ) -> Result<Appointment, String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.appointments_upsert(appointment))
+  tokio::task::spawn_blocking(move || {
+    let mut a = appointment;
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      a.doctor_id = Some(doctor_id);
+    }
+    db.appointments_upsert(a)
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -424,9 +537,23 @@ async fn appointments_upsert(
 
 #[tauri::command]
 async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.appointments_delete(&id))
+  tokio::task::spawn_blocking(move || {
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      let a = db
+        .appointments_get(&id)?
+        .ok_or_else(|| anyhow::anyhow!("termini nuk u gjet"))?;
+      if a.deleted == 0 && a.doctor_id.as_deref() != Some(doctor_id.as_str()) {
+        bail!("nuk ke akses per kete termin");
+      }
+    }
+    db.appointments_delete(&id)
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -434,9 +561,19 @@ async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> R
 
 #[tauri::command]
 async fn visits_list(state: tauri::State<'_, AppState>, filters: Option<VisitsListFilters>) -> Result<Vec<Visit>, String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.visits_list(filters))
+  tokio::task::spawn_blocking(move || {
+    let mut f = filters.unwrap_or_default();
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      f.doctor_id = Some(doctor_id);
+    }
+    db.visits_list(Some(f))
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -444,9 +581,25 @@ async fn visits_list(state: tauri::State<'_, AppState>, filters: Option<VisitsLi
 
 #[tauri::command]
 async fn visits_upsert(state: tauri::State<'_, AppState>, visit: VisitUpsertInput) -> Result<Visit, String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.visits_upsert(visit))
+  tokio::task::spawn_blocking(move || {
+    let mut v = visit;
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      if let Some(id) = v.id.as_deref().filter(|x| !x.trim().is_empty()) {
+        let existing = db.visits_get(id)?.ok_or_else(|| anyhow::anyhow!("vizita nuk u gjet"))?;
+        if existing.deleted == 0 && existing.doctor_id.as_deref() != Some(doctor_id.as_str()) {
+          bail!("nuk ke akses per kete vizite");
+        }
+      }
+      v.doctor_id = Some(doctor_id);
+    }
+    db.visits_upsert(v)
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -454,9 +607,23 @@ async fn visits_upsert(state: tauri::State<'_, AppState>, visit: VisitUpsertInpu
 
 #[tauri::command]
 async fn visits_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.visits_delete(&id))
+  tokio::task::spawn_blocking(move || {
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      let v = db
+        .visits_get(&id)?
+        .ok_or_else(|| anyhow::anyhow!("vizita nuk u gjet"))?;
+      if v.deleted == 0 && v.doctor_id.as_deref() != Some(doctor_id.as_str()) {
+        bail!("nuk ke akses per kete vizite");
+      }
+    }
+    db.visits_delete(&id)
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -467,9 +634,35 @@ async fn visit_items_list(
   state: tauri::State<'_, AppState>,
   filters: Option<VisitItemsListFilters>,
 ) -> Result<Vec<VisitItem>, String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.visit_items_list(filters))
+  tokio::task::spawn_blocking(move || {
+    let f = filters.unwrap_or_default();
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      let vid = f
+        .visit_id
+        .as_deref()
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("per mjek duhet visit_id"))?;
+      let v = db
+        .visits_get(&vid)?
+        .ok_or_else(|| anyhow::anyhow!("vizita nuk u gjet"))?;
+      if v.deleted == 0 && v.doctor_id.as_deref() != Some(doctor_id.as_str()) {
+        bail!("nuk ke akses per kete vizite");
+      }
+      return db.visit_items_list(Some(VisitItemsListFilters {
+        visit_id: Some(vid),
+        client_id: None,
+        include_deleted: f.include_deleted,
+      }));
+    }
+    db.visit_items_list(Some(f))
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -480,9 +673,23 @@ async fn visit_items_upsert(
   state: tauri::State<'_, AppState>,
   item: VisitItemUpsertInput,
 ) -> Result<VisitItem, String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.visit_items_upsert(item))
+  tokio::task::spawn_blocking(move || {
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      let v = db
+        .visits_get(&item.visit_id)?
+        .ok_or_else(|| anyhow::anyhow!("vizita nuk u gjet"))?;
+      if v.deleted == 0 && v.doctor_id.as_deref() != Some(doctor_id.as_str()) {
+        bail!("nuk ke akses per kete vizite");
+      }
+    }
+    db.visit_items_upsert(item)
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -490,9 +697,26 @@ async fn visit_items_upsert(
 
 #[tauri::command]
 async fn visit_items_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.visit_items_delete(&id))
+  tokio::task::spawn_blocking(move || {
+    if let SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } = session
+    {
+      let it = db
+        .visit_items_get(&id)?
+        .ok_or_else(|| anyhow::anyhow!("procedura nuk u gjet"))?;
+      let v = db
+        .visits_get(&it.visit_id)?
+        .ok_or_else(|| anyhow::anyhow!("vizita nuk u gjet"))?;
+      if v.deleted == 0 && v.doctor_id.as_deref() != Some(doctor_id.as_str()) {
+        bail!("nuk ke akses per kete vizite");
+      }
+    }
+    db.visit_items_delete(&id)
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -500,7 +724,7 @@ async fn visit_items_delete(state: tauri::State<'_, AppState>, id: String) -> Re
 
 #[tauri::command]
 async fn cash_list(state: tauri::State<'_, AppState>, filters: Option<CashListFilters>) -> Result<Vec<CashEntry>, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.cash_list(filters))
     .await
@@ -510,7 +734,7 @@ async fn cash_list(state: tauri::State<'_, AppState>, filters: Option<CashListFi
 
 #[tauri::command]
 async fn cash_upsert(state: tauri::State<'_, AppState>, entry: CashEntryUpsertInput) -> Result<CashEntry, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.cash_upsert(entry))
     .await
@@ -520,7 +744,7 @@ async fn cash_upsert(state: tauri::State<'_, AppState>, entry: CashEntryUpsertIn
 
 #[tauri::command]
 async fn cash_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.cash_delete(&id))
     .await
@@ -530,13 +754,13 @@ async fn cash_delete(state: tauri::State<'_, AppState>, id: String) -> Result<()
 
 #[tauri::command]
 async fn sync_now(state: tauri::State<'_, AppState>) -> Result<(), String> {
-  require_user(&state).await?;
+  let _ = require_login(&state).await?;
   state.sync.sync_now().await.map_err(err_string)
 }
 
 #[tauri::command]
 async fn updates_check_now(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-  require_user(&state).await?;
+  let _ = require_login(&state).await?;
   state.updates.check_now(&app).await.map_err(err_string)
 }
 
@@ -557,7 +781,7 @@ async fn reload_ui(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn invoice_export_pdf(state: tauri::State<'_, AppState>, sale_id: String) -> Result<String, String> {
-  require_user(&state).await?;
+  let _ = require_finance(&state).await?;
   let sale_id = sale_id.trim().to_string();
   if sale_id.is_empty() {
     return Err("sale_id eshte i detyrueshem".to_string());
@@ -647,8 +871,8 @@ fn main() {
       let data_dir = handle.path().app_data_dir().map_err(|e| anyhow::anyhow!(e))?;
       let db = Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?);
 
-      let user_logged_in = crate::auth::user_get_logged_in(db.as_ref()).unwrap_or(false);
-      let auth = Arc::new(AuthState::new(user_logged_in));
+      let session = crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None);
+      let auth = Arc::new(AuthState::new(session));
       let sync = Arc::new(SyncEngine::new(db.clone())?);
       let updates = Arc::new(UpdatesEngine::new(db.clone())?);
 
@@ -686,12 +910,17 @@ fn main() {
       auth_admin_change_password,
       auth_user_login,
       auth_user_logout,
+      auth_doctor_login,
+      auth_doctor_logout,
+      doctors_login_options,
+      doctor_account_update,
       settings_get_all,
       settings_set,
       clients_list,
       clients_upsert,
       clients_delete,
       sales_list,
+      sales_daily_report,
       sales_upsert,
       sales_delete,
       payments_list,
