@@ -58,22 +58,62 @@ fn find_resource_file(app: &tauri::AppHandle, name: &str) -> anyhow::Result<Path
   )
 }
 
-fn ui_bundle_has_clinic_name_key(dir: &Path) -> bool {
-  // Compatibility guard: older seed bundles used snake_case IPC args (clinic_name),
-  // while the current backend expects camelCase (clinicName). If we detect an old
-  // bundle, we can safely fall back to the packaged seed without needing the network.
+fn ui_bundle_looks_compatible(dir: &Path) -> bool {
+  // Compatibility guard: when the backend API changes, we must not keep an older UI bundle
+  // (even if it has index.html), otherwise the app breaks offline. We detect a compatible UI
+  // by checking for a few "needles" that are expected to exist in the built JS bundle.
   let assets = dir.join("assets");
   let rd = match fs::read_dir(&assets) {
     Ok(r) => r,
     Err(_) => return false,
   };
+
+  let mut has_clinic_name = false;
+  let mut has_doctor_login = false;
+  let mut has_doctors_login_options = false;
+  let mut has_doctor_account_update = false;
+  let mut has_sales_daily_report = false;
+
   for ent in rd.flatten() {
     let p = ent.path();
     if p.extension().and_then(|s| s.to_str()) != Some("js") {
       continue;
     }
     if let Ok(bytes) = fs::read(&p) {
-      if bytes.windows(b"clinicName".len()).any(|w| w == b"clinicName") {
+      if !has_clinic_name && bytes.windows(b"clinicName".len()).any(|w| w == b"clinicName") {
+        has_clinic_name = true;
+      }
+      if !has_doctor_login && bytes.windows(b"auth_doctor_login".len()).any(|w| w == b"auth_doctor_login") {
+        has_doctor_login = true;
+      }
+      if !has_doctors_login_options
+        && bytes
+          .windows(b"doctors_login_options".len())
+          .any(|w| w == b"doctors_login_options")
+      {
+        has_doctors_login_options = true;
+      }
+      if !has_doctor_account_update
+        && bytes
+          .windows(b"doctor_account_update".len())
+          .any(|w| w == b"doctor_account_update")
+      {
+        has_doctor_account_update = true;
+      }
+      if !has_sales_daily_report
+        && bytes
+          .windows(b"sales_daily_report".len())
+          .any(|w| w == b"sales_daily_report")
+      {
+        has_sales_daily_report = true;
+      }
+
+      if has_clinic_name
+        && has_doctor_login
+        && has_doctors_login_options
+        && has_doctor_account_update
+        && has_sales_daily_report
+      {
         return true;
       }
     }
@@ -212,7 +252,7 @@ impl UpdatesEngine {
     let current_has_index = current_dir.as_ref().is_some_and(|d| d.join("index.html").exists());
     let current_looks_compatible = current_dir
       .as_ref()
-      .is_some_and(|d| ui_bundle_has_clinic_name_key(d));
+      .is_some_and(|d| ui_bundle_looks_compatible(d));
     if current_has_index && current_looks_compatible {
       return Ok(());
     }
