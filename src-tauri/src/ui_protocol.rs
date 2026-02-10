@@ -31,7 +31,7 @@ fn sanitize_rel_path(p: &str) -> Option<PathBuf> {
   Some(rel)
 }
 
-pub fn handle(ctx: tauri::UriSchemeContext, request: tauri::http::Request<Vec<u8>>) -> Response<Vec<u8>> {
+pub fn handle(ctx: tauri::UriSchemeContext<'_, tauri::Wry>, request: tauri::http::Request<Vec<u8>>) -> Response<Vec<u8>> {
   let app = ctx.app_handle();
   let path = request.uri().path();
 
@@ -98,4 +98,3 @@ pub fn handle(ctx: tauri::UriSchemeContext, request: tauri::http::Request<Vec<u8
     .body(bytes)
     .unwrap()
 }
-

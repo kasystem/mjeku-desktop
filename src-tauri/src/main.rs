@@ -194,6 +194,15 @@ fn main() {
       updates.clone().spawn_background(handle.clone());
 
       app.manage(AppState { db, sync, updates });
+
+      // In dev, load the Vite dev server for fast iteration.
+      if tauri::is_dev() {
+        if let Some(win) = app.get_webview_window("main") {
+          let dev_url = std::env::var("MJEKU_DEV_URL").unwrap_or_else(|_| "http://127.0.0.1:5173".to_string());
+          let js = format!("window.location.replace({:?});", dev_url);
+          let _ = win.eval(&js);
+        }
+      }
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
@@ -217,4 +226,3 @@ fn main() {
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
-

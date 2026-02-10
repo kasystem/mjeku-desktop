@@ -12,6 +12,23 @@ use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 
 const KEY_SUPABASE_URL: &str = "supabase_url";
 const KEY_SUPABASE_ANON_KEY: &str = "supabase_anon_key";
+const KEY_SUPABASE_API_KEY: &str = "supabase_api_key";
+
+fn looks_like_jwt(token: &str) -> bool {
+  let t = token.trim();
+  // Supabase legacy anon keys are JWTs that typically start with `eyJ` and have 3 segments.
+  t.starts_with("eyJ") && t.matches('.').count() >= 2
+}
+
+fn with_supabase_auth(req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+  let req = req.header("apikey", api_key);
+  // Only send Authorization when the key is JWT-like; sending a non-JWT publishable key can cause 401.
+  if looks_like_jwt(api_key) {
+    req.bearer_auth(api_key)
+  } else {
+    req
+  }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SyncPublicStatus {
@@ -64,15 +81,18 @@ impl SyncEngine {
     let _guard = self.lock.lock().await;
 
     let supabase_url = self.db.setting_get(KEY_SUPABASE_URL)?;
-    let anon_key = self.db.setting_get(KEY_SUPABASE_ANON_KEY)?;
+    let api_key = self
+      .db
+      .setting_get(KEY_SUPABASE_API_KEY)?
+      .or_else(|| self.db.setting_get(KEY_SUPABASE_ANON_KEY).ok().flatten());
 
-    if supabase_url.as_deref().unwrap_or("").trim().is_empty() || anon_key.as_deref().unwrap_or("").trim().is_empty() {
+    if supabase_url.as_deref().unwrap_or("").trim().is_empty() || api_key.as_deref().unwrap_or("").trim().is_empty() {
       self.set_status("pending", None).await;
       return Ok(());
     }
 
     let supabase_url = supabase_url.unwrap();
-    let anon_key = anon_key.unwrap();
+    let api_key = api_key.unwrap();
 
     let last_sync_time = self
       .db
@@ -81,7 +101,7 @@ impl SyncEngine {
     let sync_started_at = now_iso();
 
     // Pull first (to avoid overwriting newer remote updates).
-    if let Err(e) = self.pull_updates(&supabase_url, &anon_key, &last_sync_time).await {
+    if let Err(e) = self.pull_updates(&supabase_url, &api_key, &last_sync_time).await {
       if contains_network_error(&e) {
         self.set_status("pending", Some("offline".to_string())).await;
         return Ok(());
@@ -91,7 +111,7 @@ impl SyncEngine {
     }
 
     // Push queue.
-    if let Err(e) = self.push_queue(&supabase_url, &anon_key).await {
+    if let Err(e) = self.push_queue(&supabase_url, &api_key).await {
       if contains_network_error(&e) {
         self.set_status("pending", Some("offline".to_string())).await;
         return Ok(());
@@ -118,10 +138,10 @@ impl SyncEngine {
     s.last_sync_error = err;
   }
 
-  async fn pull_updates(&self, supabase_url: &str, anon_key: &str, last_sync_time: &str) -> anyhow::Result<()> {
+  async fn pull_updates(&self, supabase_url: &str, api_key: &str, last_sync_time: &str) -> anyhow::Result<()> {
     let base = supabase_url.trim_end_matches('/');
     let clients: Vec<Client> = self
-      .fetch_table(base, anon_key, "clients", last_sync_time)
+      .fetch_table(base, api_key, "clients", last_sync_time)
       .await
       .context("pull clients")?;
     for c in clients {
@@ -129,7 +149,7 @@ impl SyncEngine {
     }
 
     let sales: Vec<Sale> = self
-      .fetch_table(base, anon_key, "sales", last_sync_time)
+      .fetch_table(base, api_key, "sales", last_sync_time)
       .await
       .context("pull sales")?;
     for s in sales {
@@ -137,7 +157,7 @@ impl SyncEngine {
     }
 
     let payments: Vec<Payment> = self
-      .fetch_table(base, anon_key, "payments", last_sync_time)
+      .fetch_table(base, api_key, "payments", last_sync_time)
       .await
       .context("pull payments")?;
     for p in payments {
@@ -187,16 +207,12 @@ impl SyncEngine {
   async fn fetch_table<T: DeserializeOwned>(
     &self,
     base: &str,
-    anon_key: &str,
+    api_key: &str,
     table: &str,
     last_sync_time: &str,
   ) -> anyhow::Result<Vec<T>> {
     let url = format!("{base}/rest/v1/{table}");
-    let resp = self
-      .client
-      .get(&url)
-      .header("apikey", anon_key)
-      .bearer_auth(anon_key)
+    let resp = with_supabase_auth(self.client.get(&url), api_key)
       .query(&[
         ("select", "*"),
         ("updated_at", &format!("gt.{last_sync_time}")),
@@ -213,7 +229,7 @@ impl SyncEngine {
     Ok(rows)
   }
 
-  async fn push_queue(&self, supabase_url: &str, anon_key: &str) -> anyhow::Result<()> {
+  async fn push_queue(&self, supabase_url: &str, api_key: &str) -> anyhow::Result<()> {
     let items = self.db.sync_queue_list_pending(200)?;
     if items.is_empty() {
       return Ok(());
@@ -242,11 +258,7 @@ impl SyncEngine {
         let batch: Vec<(String, Value)> = rows.drain(0..rows.len().min(50)).collect();
         let payload: Vec<Value> = batch.iter().map(|(_, v)| v.clone()).collect();
         let url = format!("{base}/rest/v1/{table}?on_conflict=id");
-        let resp = self
-          .client
-          .post(&url)
-          .header("apikey", anon_key)
-          .bearer_auth(anon_key)
+        let resp = with_supabase_auth(self.client.post(&url), api_key)
           .header("Prefer", "resolution=merge-duplicates,return=minimal")
           .json(&payload)
           .send()
@@ -281,11 +293,7 @@ impl SyncEngine {
 
       let url = format!("{base}/rest/v1/{}?id=eq.{}", it.table_name, urlencoding::encode(&id));
       let body = serde_json::json!({ "deleted": 1, "updated_at": updated_at });
-      let resp = self
-        .client
-        .patch(&url)
-        .header("apikey", anon_key)
-        .bearer_auth(anon_key)
+      let resp = with_supabase_auth(self.client.patch(&url), api_key)
         .header("Prefer", "return=minimal")
         .json(&body)
         .send()
