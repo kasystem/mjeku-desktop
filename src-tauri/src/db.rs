@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use rusqlite::{params, Connection, OptionalExtension, OpenFlags};
@@ -1196,6 +1196,45 @@ impl Db {
       .ok_or_else(|| anyhow!("sale not found"))?;
     let payload = serde_json::to_string(&row)?;
     Self::queue_replace_pending_tx(&tx, "sales", &row.id, "delete", &payload, &now)?;
+
+    // Keep history consistent: when a sale is removed, remove linked payments too.
+    let mut linked_payments: Vec<Payment> = Vec::new();
+    {
+      let mut stmt = tx.prepare(
+        "SELECT id, client_id, sale_id, date, amount, method, notes, created_at, updated_at, deleted
+         FROM payments
+         WHERE sale_id = ?1 AND deleted = 0",
+      )?;
+      let rows = stmt.query_map(params![id], |r| {
+        Ok(Payment {
+          id: r.get(0)?,
+          client_id: r.get(1)?,
+          sale_id: r.get(2)?,
+          date: r.get(3)?,
+          amount: r.get(4)?,
+          method: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "cash".to_string()),
+          notes: r.get(6)?,
+          created_at: r.get(7)?,
+          updated_at: r.get(8)?,
+          deleted: r.get(9)?,
+        })
+      })?;
+      for r in rows {
+        linked_payments.push(r?);
+      }
+    }
+    for p in linked_payments {
+      tx.execute(
+        "UPDATE payments SET deleted=1, updated_at=?2 WHERE id=?1",
+        params![&p.id, &now],
+      )?;
+      let mut del = p.clone();
+      del.deleted = 1;
+      del.updated_at = now.clone();
+      let p_payload = serde_json::to_string(&del)?;
+      Self::queue_replace_pending_tx(&tx, "payments", &del.id, "delete", &p_payload, &now)?;
+    }
+
     tx.commit()?;
     Ok(())
   }
@@ -1270,6 +1309,24 @@ impl Db {
     Ok(path)
   }
 
+  fn fiscal_emit_clear_article_command_in_dir(output_dir: &Path, label: &str) -> anyhow::Result<PathBuf> {
+    let path = output_dir.join(format!(
+      "clear-{}-{}.inp",
+      label,
+      &Uuid::new_v4().to_string()[..8]
+    ));
+    Self::fiscal_write_inp_atomic(&path, "O,1,______,_,__;ALL\n")?;
+    Ok(path)
+  }
+
+  fn fiscal_emit_clear_article_twice(output_dir: &Path, label: &str) -> anyhow::Result<()> {
+    // 1) Legacy fixed file (compatibility with existing fiscal setup/scripts).
+    let _ = Self::fiscal_emit_clear_article_command()?;
+    // 2) Dedicated unique command file (prevents overwrite/race issues).
+    let _ = Self::fiscal_emit_clear_article_command_in_dir(output_dir, label)?;
+    Ok(())
+  }
+
   fn fiscal_wait_out_text(inp_path: &Path, timeout: Duration) -> Option<String> {
     let out_path = inp_path.with_extension("out");
     let start = std::time::Instant::now();
@@ -1297,8 +1354,44 @@ impl Db {
       || s.contains("not allowed")
   }
 
+  fn fiscal_out_program_article_error(raw: &str) -> bool {
+    let s = raw.to_ascii_lowercase();
+    s.contains("cannot program or change article") || s.contains("progr_article") || s.contains("error #11")
+  }
+
   fn fiscal_out_note_status_2(raw: &str) -> bool {
     raw.to_ascii_lowercase().contains("notestatus;2")
+  }
+
+  fn fiscal_print_errors_path(inp_path: &Path) -> Option<PathBuf> {
+    let parent = inp_path.parent()?;
+    let name = inp_path.file_name()?;
+    Some(parent.join("PrintErrors").join(name))
+  }
+
+  fn fiscal_wait_moved_to_print_errors(inp_path: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+      if let Some(p) = Self::fiscal_print_errors_path(inp_path) {
+        if p.exists() {
+          return true;
+        }
+      }
+      std::thread::sleep(Duration::from_millis(150));
+    }
+    false
+  }
+
+  fn fiscal_plu_counter_key(clinic_id: &str) -> String {
+    let mut suffix = clinic_id
+      .trim()
+      .chars()
+      .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+      .collect::<String>();
+    if suffix.is_empty() {
+      suffix = "default".to_string();
+    }
+    format!("fiscal_plu_counter_{}", suffix)
   }
 
   pub fn fiscal_receipt_generate_inp(&self, sale_id: &str, output_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -1344,6 +1437,9 @@ impl Db {
       if sale.deleted != 0 {
         bail!("fatura eshte e fshire");
       }
+      if sale.fiscalized != 0 {
+        bail!("fatura eshte fiskalizuar tashme");
+      }
 
       let client_exists: Option<String> = conn
         .query_row("SELECT id FROM clients WHERE id=?1", params![&sale.client_id], |row| row.get(0))
@@ -1385,8 +1481,9 @@ impl Db {
       bail!("nuk ka rreshta fiskal pa fiskalizuar");
     }
 
-    // Required by fiscal flow: clear article list before printing receipt.
-    Self::fiscal_emit_clear_article_command()?;
+    // Required by fiscal flow: clear article list twice before printing receipt.
+    Self::fiscal_emit_clear_article_twice(output_dir, "before-1")?;
+    Self::fiscal_emit_clear_article_twice(output_dir, "before-2")?;
 
     // Step A: check if there is an open note. If NoteStatus=2, close with N before real sale.
     let g_path = output_dir.join(format!("status-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
@@ -1401,8 +1498,20 @@ impl Db {
 
     // Real sale lines: only actual sale items (no test rows).
     let mut sale_body = String::new();
+    let mut lines_for_fallback: Vec<(String, f64, f64, i64, i64)> = Vec::new(); // desc, unit_price, qty, vat_group, plu
     let mut total = 0.0_f64;
-    for (idx, it) in items.iter().enumerate() {
+    let clinic_id = self.setting_get("clinic_id")?.unwrap_or_default();
+    let plu_counter_key = Self::fiscal_plu_counter_key(&clinic_id);
+    let mut last_plu = self
+      .setting_get(&plu_counter_key)?
+      .and_then(|v| v.trim().parse::<i64>().ok())
+      .unwrap_or(15005);
+    if last_plu < 15005 {
+      last_plu = 15005;
+      self.setting_set(&plu_counter_key, &last_plu.to_string())?;
+    }
+
+    for it in &items {
       let qty = if it.qty.is_finite() && it.qty > 0.0 { it.qty } else { 1.0 };
       let unit_price = if it.unit_price.is_finite() && it.unit_price >= 0.0 {
         it.unit_price
@@ -1414,7 +1523,13 @@ impl Db {
 
       let desc = Self::fiscal_sanitize_text(&it.title);
       let vat_group = Self::fiscal_vat_group_for_code(&it.vat_code, vat_e_group);
-      let item_code = 15001_i64 + idx as i64;
+
+      // Per-clinic PLU sequence:
+      // default last value starts at 15005, then each product consumes next PLU.
+      last_plu += 1;
+      let item_code = last_plu;
+      self.setting_set(&plu_counter_key, &last_plu.to_string())?;
+
       sale_body.push_str(&format!(
         "S,1,______,_,__;{};{:.2};{};1;1;{};0;{};0;0\n",
         desc,
@@ -1423,28 +1538,61 @@ impl Db {
         vat_group,
         item_code
       ));
+      lines_for_fallback.push((desc, unit_price, qty, vat_group, item_code));
     }
     sale_body.push_str("T,1,______,_,__;\n");
 
     let primary_path = output_dir.join(format!("kupon-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
     Self::fiscal_write_inp_atomic(&primary_path, &sale_body)?;
     let primary_out = Self::fiscal_wait_out_text(&primary_path, Duration::from_secs(8));
+    let primary_print_error = Self::fiscal_wait_moved_to_print_errors(&primary_path, Duration::from_secs(8));
 
-    // Step B: if S/T failed, fallback with K + real S/T.
+    // Step B: if S/T failed, fallback:
+    // - Program-article fallback (N + U + real S/T) for Error #11 / article mode issues.
+    // - Otherwise keep previous K + real S/T fallback.
     let mut final_path = primary_path.clone();
     let mut failed_after_fallback = false;
-    if let Some(out) = primary_out.as_deref() {
-      if Self::fiscal_out_has_error(out) {
+    let primary_out_has_error = primary_out
+      .as_deref()
+      .map(Self::fiscal_out_has_error)
+      .unwrap_or(false);
+    if primary_out_has_error || primary_print_error {
+      let needs_program_fallback = primary_print_error
+        || primary_out
+          .as_deref()
+          .map(Self::fiscal_out_program_article_error)
+          .unwrap_or(false);
+
+      if needs_program_fallback {
+        let mut u_body = String::from("N,1,______,_,__;\n");
+        for (desc, unit_price, _qty, vat_group, item_code) in &lines_for_fallback {
+          u_body.push_str(&format!(
+            "U,1,______,_,__;{};{:.2};0;1;1;{};0;{};;;\n",
+            desc, unit_price, vat_group, item_code
+          ));
+        }
+        u_body.push_str(&sale_body);
+
+        let u_path = output_dir.join(format!("kupon-u-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
+        Self::fiscal_write_inp_atomic(&u_path, &u_body)?;
+        final_path = u_path.clone();
+        let u_out = Self::fiscal_wait_out_text(&u_path, Duration::from_secs(8));
+        let u_print_error = Self::fiscal_wait_moved_to_print_errors(&u_path, Duration::from_secs(8));
+        let u_failed = u_print_error || u_out.as_deref().map(Self::fiscal_out_has_error).unwrap_or(false);
+        if u_failed {
+          failed_after_fallback = true;
+        }
+      } else {
         let mut k_body = String::from("K,1,______,_,__;;1;0000;;;;;;1;\n");
         k_body.push_str(&sale_body);
         let k_path = output_dir.join(format!("kupon-k-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
         Self::fiscal_write_inp_atomic(&k_path, &k_body)?;
         final_path = k_path.clone();
         let k_out = Self::fiscal_wait_out_text(&k_path, Duration::from_secs(8));
-        if let Some(k_out) = k_out.as_deref() {
-          if Self::fiscal_out_has_error(k_out) {
-            failed_after_fallback = true;
-          }
+        let k_print_error = Self::fiscal_wait_moved_to_print_errors(&k_path, Duration::from_secs(8));
+        let k_failed = k_print_error || k_out.as_deref().map(Self::fiscal_out_has_error).unwrap_or(false);
+        if k_failed {
+          failed_after_fallback = true;
         }
       }
     }
@@ -1455,12 +1603,13 @@ impl Db {
       let close_path = output_dir.join(format!("kupon-close-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
       Self::fiscal_write_inp_atomic(&close_path, &close_body)?;
       let _ = Self::fiscal_wait_out_text(&close_path, Duration::from_secs(6));
-      let _ = Self::fiscal_emit_clear_article_command();
+      let _ = Self::fiscal_emit_clear_article_twice(output_dir, "failed-after");
       bail!("fiskalizimi deshtoi edhe pas fallback (K dhe mbyllja T/N).");
     }
 
-    // Required by fiscal flow: clear article list after printing receipt.
-    Self::fiscal_emit_clear_article_command()?;
+    // Required by fiscal flow: clear article list twice after printing receipt.
+    Self::fiscal_emit_clear_article_twice(output_dir, "after-1")?;
+    Self::fiscal_emit_clear_article_twice(output_dir, "after-2")?;
 
     // Mark items as fiscalized and queue them for sync.
     let now = now_iso();
@@ -1490,6 +1639,78 @@ impl Db {
     };
     let payload = serde_json::to_string(&updated_sale)?;
     Self::queue_replace_pending_tx(&tx, "sales", &updated_sale.id, "upsert", &payload, &now)?;
+
+    // Auto-save fiscalized value as a payment entry (cash) for this sale.
+    // Avoid duplicates when manual payments already exist.
+    let auto_note = "[AUTO-FISCAL] Kupon fiskal";
+    let existing_auto_payment: Option<(String, String)> = tx
+      .query_row(
+        "SELECT id, created_at
+         FROM payments
+         WHERE sale_id=?1 AND deleted=0 AND COALESCE(notes,'')=?2
+         LIMIT 1",
+        params![&updated_sale.id, auto_note],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+      )
+      .optional()?;
+    let has_any_payment = tx
+      .query_row(
+        "SELECT 1 FROM payments WHERE sale_id=?1 AND deleted=0 LIMIT 1",
+        params![&updated_sale.id],
+        |row| row.get::<_, i64>(0),
+      )
+      .optional()?
+      .is_some();
+
+    if existing_auto_payment.is_some() || !has_any_payment {
+      // Use a deterministic id (same as sale id) for the auto fiscal payment.
+      // This keeps the operation idempotent and avoids duplicate rows on rapid repeated calls.
+      let (payment_id, payment_created_at) = existing_auto_payment
+        .unwrap_or_else(|| (updated_sale.id.clone(), now.clone()));
+      let payment_date = updated_sale
+        .date
+        .clone()
+        .or_else(|| now.get(0..10).map(|x| x.to_string()));
+
+      tx.execute(
+        "INSERT INTO payments (id, client_id, sale_id, date, amount, method, notes, created_at, updated_at, deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'cash', ?6, ?7, ?8, 0)
+         ON CONFLICT(id) DO UPDATE SET
+           client_id=excluded.client_id,
+           sale_id=excluded.sale_id,
+           date=excluded.date,
+           amount=excluded.amount,
+           method=excluded.method,
+           notes=excluded.notes,
+           updated_at=excluded.updated_at,
+           deleted=excluded.deleted",
+        params![
+          &payment_id,
+          &updated_sale.client_id,
+          &updated_sale.id,
+          &payment_date,
+          total,
+          auto_note,
+          &payment_created_at,
+          &now
+        ],
+      )?;
+
+      let auto_payment = Payment {
+        id: payment_id.clone(),
+        client_id: updated_sale.client_id.clone(),
+        sale_id: Some(updated_sale.id.clone()),
+        date: payment_date,
+        amount: total,
+        method: "cash".to_string(),
+        notes: Some(auto_note.to_string()),
+        created_at: payment_created_at,
+        updated_at: now.clone(),
+        deleted: 0,
+      };
+      let payment_payload = serde_json::to_string(&auto_payment)?;
+      Self::queue_replace_pending_tx(&tx, "payments", &auto_payment.id, "upsert", &payment_payload, &now)?;
+    }
 
     tx.commit()?;
     Ok(final_path)
@@ -2741,7 +2962,197 @@ impl Db {
       .ok_or_else(|| anyhow!("visit not found"))?;
     let payload = serde_json::to_string(&row)?;
     Self::queue_replace_pending_tx(&tx, "visits", &row.id, "delete", &payload, &now)?;
+
+    // Keep history consistent: removing a visit also removes its procedures.
+    let mut linked_items: Vec<VisitItem> = Vec::new();
+    {
+      let mut stmt = tx.prepare(
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+         FROM visit_items
+         WHERE visit_id = ?1 AND deleted = 0",
+      )?;
+      let rows = stmt.query_map(params![id], |r| {
+        Ok(VisitItem {
+          id: r.get(0)?,
+          visit_id: r.get(1)?,
+          client_id: r.get(2)?,
+          tooth: r.get(3)?,
+          title: r.get(4)?,
+          qty: r.get(5)?,
+          unit_price: r.get(6)?,
+          fiscal: r.get(7)?,
+          vat_code: r.get(8)?,
+          fiscalized: r.get(9)?,
+          fiscalized_at: r.get(10)?,
+          notes: r.get(11)?,
+          created_at: r.get(12)?,
+          updated_at: r.get(13)?,
+          deleted: r.get(14)?,
+        })
+      })?;
+      for r in rows {
+        linked_items.push(r?);
+      }
+    }
+    for it in linked_items {
+      tx.execute(
+        "UPDATE visit_items SET deleted=1, updated_at=?2 WHERE id=?1",
+        params![&it.id, &now],
+      )?;
+      let mut del = it.clone();
+      del.deleted = 1;
+      del.updated_at = now.clone();
+      let it_payload = serde_json::to_string(&del)?;
+      Self::queue_replace_pending_tx(&tx, "visit_items", &del.id, "delete", &it_payload, &now)?;
+    }
+
+    // If visit has an invoice (same id), remove sale + linked payments as well.
+    let linked_sale = tx
+      .query_row(
+        "SELECT id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted
+         FROM sales
+         WHERE id = ?1 AND deleted = 0
+         LIMIT 1",
+        params![id],
+        |r| {
+          Ok(Sale {
+            id: r.get(0)?,
+            client_id: r.get(1)?,
+            date: r.get(2)?,
+            total: r.get(3)?,
+            notes: r.get(4)?,
+            fiscalized: r.get(5)?,
+            fiscalized_at: r.get(6)?,
+            created_at: r.get(7)?,
+            updated_at: r.get(8)?,
+            deleted: r.get(9)?,
+          })
+        },
+      )
+      .optional()?;
+    if let Some(s) = linked_sale {
+      tx.execute(
+        "UPDATE sales SET deleted=1, updated_at=?2 WHERE id=?1",
+        params![&s.id, &now],
+      )?;
+      let mut s_del = s.clone();
+      s_del.deleted = 1;
+      s_del.updated_at = now.clone();
+      let s_payload = serde_json::to_string(&s_del)?;
+      Self::queue_replace_pending_tx(&tx, "sales", &s_del.id, "delete", &s_payload, &now)?;
+    }
+
+    let mut linked_payments: Vec<Payment> = Vec::new();
+    {
+      let mut stmt = tx.prepare(
+        "SELECT id, client_id, sale_id, date, amount, method, notes, created_at, updated_at, deleted
+         FROM payments
+         WHERE sale_id = ?1 AND deleted = 0",
+      )?;
+      let rows = stmt.query_map(params![id], |r| {
+        Ok(Payment {
+          id: r.get(0)?,
+          client_id: r.get(1)?,
+          sale_id: r.get(2)?,
+          date: r.get(3)?,
+          amount: r.get(4)?,
+          method: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "cash".to_string()),
+          notes: r.get(6)?,
+          created_at: r.get(7)?,
+          updated_at: r.get(8)?,
+          deleted: r.get(9)?,
+        })
+      })?;
+      for r in rows {
+        linked_payments.push(r?);
+      }
+    }
+    for p in linked_payments {
+      tx.execute(
+        "UPDATE payments SET deleted=1, updated_at=?2 WHERE id=?1",
+        params![&p.id, &now],
+      )?;
+      let mut del = p.clone();
+      del.deleted = 1;
+      del.updated_at = now.clone();
+      let p_payload = serde_json::to_string(&del)?;
+      Self::queue_replace_pending_tx(&tx, "payments", &del.id, "delete", &p_payload, &now)?;
+    }
+
     tx.commit()?;
+    Ok(())
+  }
+
+  pub fn history_reset_all(&self) -> anyhow::Result<()> {
+    // Reset all history modules (offline-first): mark local rows deleted and queue deletes for cloud sync.
+    let visit_ids: Vec<String> = self
+      .visits_list(Some(VisitsListFilters {
+        include_deleted: Some(false),
+        ..Default::default()
+      }))?
+      .into_iter()
+      .map(|x| x.id)
+      .collect();
+    for id in visit_ids {
+      self.visits_delete(&id)?;
+    }
+
+    let sale_ids: Vec<String> = self
+      .sales_list(Some(SalesListFilters {
+        client_id: None,
+        date_from: None,
+        date_to: None,
+        include_deleted: Some(false),
+      }))?
+      .into_iter()
+      .map(|x| x.id)
+      .collect();
+    for id in sale_ids {
+      self.sales_delete(&id)?;
+    }
+
+    let payment_ids: Vec<String> = self
+      .payments_list(Some(PaymentsListFilters {
+        include_deleted: Some(false),
+        ..Default::default()
+      }))?
+      .into_iter()
+      .map(|x| x.id)
+      .collect();
+    for id in payment_ids {
+      self.payments_delete(&id)?;
+    }
+
+    let appointment_ids: Vec<String> = self
+      .appointments_list(Some(AppointmentsListFilters {
+        client_id: None,
+        doctor_id: None,
+        start_from: None,
+        start_to: None,
+        status: None,
+        include_deleted: Some(false),
+      }))?
+      .into_iter()
+      .map(|x| x.id)
+      .collect();
+    for id in appointment_ids {
+      self.appointments_delete(&id)?;
+    }
+
+    // Any orphan procedure rows not covered by visit cascade.
+    let orphan_item_ids: Vec<String> = self
+      .visit_items_list(Some(VisitItemsListFilters {
+        visit_id: None,
+        client_id: None,
+        include_deleted: Some(false),
+      }))?
+      .into_iter()
+      .map(|x| x.id)
+      .collect();
+    for id in orphan_item_ids {
+      self.visit_items_delete(&id)?;
+    }
+
     Ok(())
   }
 

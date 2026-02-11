@@ -110,53 +110,41 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
 
   if let Some(bytes) = data.header_png.as_deref() {
     let mut cur = Cursor::new(bytes);
-    let decoder = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur).context("decode header png")?;
-    let img = Image::try_from(decoder).context("load header image")?;
+    if let Ok(decoder) = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur) {
+      if let Ok(img) = Image::try_from(decoder) {
+        let w_px = img.image.width.0 as f32;
+        let h_px = img.image.height.0 as f32;
+        if w_px > 0.0 && h_px > 0.0 {
+          let available_w = page_w - left - right;
+          let natural_h = available_w * (h_px / w_px);
+          let max_h = 85.0_f32;
+          let (draw_w, draw_h) = if natural_h <= max_h {
+            (available_w, natural_h)
+          } else {
+            (max_h * (w_px / h_px), max_h)
+          };
+          let x = left + ((available_w - draw_w) / 2.0);
+          let lower_y = page_h - top - draw_h;
 
-    let w_px = img.image.width.0 as f32;
-    let h_px = img.image.height.0 as f32;
-    if w_px > 0.0 && h_px > 0.0 {
-      let available_w = page_w - left - right;
-      let natural_h = available_w * (h_px / w_px);
-      let max_h = 85.0_f32;
-      let (draw_w, draw_h) = if natural_h <= max_h {
-        (available_w, natural_h)
-      } else {
-        (max_h * (w_px / h_px), max_h)
-      };
-      let x = left + ((available_w - draw_w) / 2.0);
-      let lower_y = page_h - top - draw_h;
+          let dpi: f32 = 300.0;
+          let scale_x: f32 = draw_w * dpi / (w_px * 25.4);
+          let scale_y: f32 = draw_h * dpi / (h_px * 25.4);
+          img.add_to_layer(
+            layer.clone(),
+            ImageTransform {
+              translate_x: Some(Mm(x)),
+              translate_y: Some(Mm(lower_y)),
+              rotate: None,
+              scale_x: Some(scale_x),
+              scale_y: Some(scale_y),
+              dpi: Some(dpi),
+            },
+          );
 
-      let dpi: f32 = 300.0;
-      let scale_x: f32 = draw_w * dpi / (w_px * 25.4);
-      let scale_y: f32 = draw_h * dpi / (h_px * 25.4);
-      img.add_to_layer(
-        layer.clone(),
-        ImageTransform {
-          translate_x: Some(Mm(x)),
-          translate_y: Some(Mm(lower_y)),
-          rotate: None,
-          scale_x: Some(scale_x),
-          scale_y: Some(scale_y),
-          dpi: Some(dpi),
-        },
-      );
-
-      y = lower_y - 8.0;
+          y = lower_y - 8.0;
+        }
+      }
     }
-  } else {
-    write_line_with_font(
-      &doc,
-      &mut page,
-      &mut layer,
-      &mut y,
-      left,
-      lh,
-      &font_b,
-      data.clinic_name.clone(),
-      18.0,
-    )?;
-    y -= 2.0;
   }
 
   write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font_b, "FATURË".to_string(), 14.0)?;
@@ -400,4 +388,3 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
   let cursor = writer.into_inner().map_err(|e| anyhow!("save pdf: {e}"))?;
   Ok(cursor.into_inner())
 }
-

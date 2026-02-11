@@ -1,0 +1,5 @@
+{
+  "build": {
+    "beforeBuildCommand": "node scripts/prepare_ui_seed.mjs"
+  }
+}

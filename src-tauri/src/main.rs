@@ -90,6 +90,9 @@ fn dev_server_is_reachable(dev_url: &str) -> bool {
 }
 
 fn fiscal_temp_dir() -> anyhow::Result<PathBuf> {
+  #[cfg(target_os = "windows")]
+  let dir = PathBuf::from(r"C:\Temp");
+  #[cfg(not(target_os = "windows"))]
   let dir = std::env::temp_dir().join("mjeku-fiscal");
   std::fs::create_dir_all(&dir)?;
   Ok(dir)
@@ -1398,7 +1401,7 @@ async fn reload_ui(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn invoice_export_fiscal_inp(app: tauri::AppHandle, state: tauri::State<'_, AppState>, sale_id: String) -> Result<String, String> {
+async fn invoice_export_fiscal_inp(_app: tauri::AppHandle, state: tauri::State<'_, AppState>, sale_id: String) -> Result<String, String> {
   let _ = require_finance(&state).await?;
   let provider = get_fiscal_printer_provider(&state).await?;
   require_enternet_for_fiscal(&provider)?;
@@ -1407,7 +1410,10 @@ async fn invoice_export_fiscal_inp(app: tauri::AppHandle, state: tauri::State<'_
     return Err("sale_id eshte i detyrueshem".to_string());
   }
 
-  let out_dir = app
+  #[cfg(target_os = "windows")]
+  let out_dir = PathBuf::from(r"C:\Temp");
+  #[cfg(not(target_os = "windows"))]
+  let out_dir = _app
     .path()
     .app_data_dir()
     .map_err(|e| anyhow::anyhow!(e))
@@ -1555,6 +1561,16 @@ async fn admin_reset_clinic(app: tauri::AppHandle, state: tauri::State<'_, AppSt
 }
 
 #[tauri::command]
+async fn history_reset_all(state: tauri::State<'_, AppState>) -> Result<(), String> {
+  let _ = require_owner(&state).await?;
+  let db = state.db.clone();
+  tokio::task::spawn_blocking(move || db.history_reset_all())
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
 async fn invoice_export_pdf(app: tauri::AppHandle, state: tauri::State<'_, AppState>, sale_id: String) -> Result<String, String> {
   let session = require_finance(&state).await?;
   let fiscal_only = matches!(
@@ -1665,6 +1681,16 @@ async fn invoice_export_pdf(app: tauri::AppHandle, state: tauri::State<'_, AppSt
     };
 
     let pdf_bytes = crate::invoice::render_invoice_pdf(&data).map_err(err_string)?;
+
+    // Also persist a physical PDF copy for desktop usage.
+    #[cfg(target_os = "windows")]
+    let out_dir = PathBuf::from(r"C:\Temp");
+    #[cfg(not(target_os = "windows"))]
+    let out_dir = data_dir.join("temp");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let out_path = out_dir.join(format!("Fature-{}.pdf", sale.id));
+    let _ = std::fs::write(out_path, &pdf_bytes);
+
     Ok(general_purpose::STANDARD.encode(pdf_bytes))
   })
   .await
@@ -1814,6 +1840,7 @@ fn main() {
       fiscal_report_x_inp,
       fiscal_report_z_inp,
       admin_reset_clinic,
+      history_reset_all,
       invoice_export_pdf,
       error_logs_list,
       error_logs_clear
