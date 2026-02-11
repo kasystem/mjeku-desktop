@@ -11,8 +11,9 @@ mod util;
 
 use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
 use tauri::Manager;
@@ -70,6 +71,44 @@ fn dev_server_is_reachable(dev_url: &str) -> bool {
     }
   }
   false
+}
+
+fn fiscal_temp_dir() -> anyhow::Result<PathBuf> {
+  let dir = std::env::temp_dir().join("mjeku-fiscal");
+  std::fs::create_dir_all(&dir)?;
+  Ok(dir)
+}
+
+fn write_fiscal_temp_inp(prefix: &str, body: &str) -> anyhow::Result<PathBuf> {
+  let dir = fiscal_temp_dir()?;
+  let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+  let rnd = uuid::Uuid::new_v4().to_string();
+  let name = format!("{}-{}-{}.inp", prefix, ts, &rnd[..8]);
+  let path = dir.join(name);
+  std::fs::write(&path, body.as_bytes())?;
+  Ok(path)
+}
+
+fn wait_out_text(inp_path: &Path, timeout: Duration) -> Option<String> {
+  let out_path = inp_path.with_extension("out");
+  let start = std::time::Instant::now();
+  while start.elapsed() < timeout {
+    match std::fs::read_to_string(&out_path) {
+      Ok(x) => return Some(x),
+      Err(e) => {
+        if e.kind() != std::io::ErrorKind::NotFound {
+          return Some(format!("read_out_error: {}", e));
+        }
+      }
+    }
+    std::thread::sleep(Duration::from_millis(150));
+  }
+  None
+}
+
+fn has_note_status_2(raw: &str) -> bool {
+  let s = raw.to_ascii_lowercase();
+  s.contains("notestatus;2")
 }
 
 #[tauri::command]
@@ -1005,6 +1044,74 @@ async fn invoice_export_fiscal_inp(app: tauri::AppHandle, state: tauri::State<'_
 }
 
 #[tauri::command]
+async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
+  let _ = require_finance(&state).await?;
+  tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+    let p = write_fiscal_temp_inp("x-raport", "X,1,______,_,__;")?;
+    Ok(p.display().to_string())
+  })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn fiscal_report_z_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
+  let _ = require_finance(&state).await?;
+  tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+    let mut files: Vec<String> = Vec::new();
+
+    let z1 = write_fiscal_temp_inp("z-raport", "Z,1,______,_,__;")?;
+    files.push(z1.display().to_string());
+
+    let g1 = write_fiscal_temp_inp("z-status", "G,1,______,_,__;NoteStatus")?;
+    files.push(g1.display().to_string());
+    let g1_out = wait_out_text(&g1, Duration::from_secs(4));
+    let mut used_fallback = false;
+
+    if let Some(out) = g1_out.as_deref() {
+      if has_note_status_2(out) {
+        used_fallback = true;
+        let n = write_fiscal_temp_inp("z-close-open", "N,1,______,_,__;")?;
+        files.push(n.display().to_string());
+        let _ = wait_out_text(&n, Duration::from_secs(3));
+
+        let z2 = write_fiscal_temp_inp("z-raport-retry", "Z,1,______,_,__;")?;
+        files.push(z2.display().to_string());
+        let _ = wait_out_text(&z2, Duration::from_secs(4));
+
+        let g2 = write_fiscal_temp_inp("z-status-after-retry", "G,1,______,_,__;NoteStatus")?;
+        files.push(g2.display().to_string());
+        let g2_out = wait_out_text(&g2, Duration::from_secs(4)).unwrap_or_default();
+
+        if has_note_status_2(&g2_out) {
+          bail!("Z Raport nuk po ben: edhe pas N mbetet fature e hapur (NoteStatus;2).");
+        }
+      }
+    }
+
+    if used_fallback {
+      return Ok(format!(
+        "Z Raport u dergua me fallback (G -> N -> Z). Temp: {}",
+        files.join(" | ")
+      ));
+    }
+
+    if g1_out.is_none() {
+      return Ok(format!(
+        "Z Raport u krijua ne Temp, por pa konfirmim nga pajisja fiskale. Temp: {}",
+        files.join(" | ")
+      ));
+    }
+
+    Ok(format!("Z Raport u krijua ne Temp: {}", files.join(" | ")))
+  })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
 async fn admin_reset_clinic(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
   if !state.auth.is_admin_unlocked().await {
     return Err("kjo veprim kerkon hyrje si admin".to_string());
@@ -1239,6 +1346,8 @@ fn main() {
       updates_apply_downloaded,
       reload_ui,
       invoice_export_fiscal_inp,
+      fiscal_report_x_inp,
+      fiscal_report_z_inp,
       admin_reset_clinic,
       invoice_export_pdf
     ])
