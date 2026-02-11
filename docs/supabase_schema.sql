@@ -101,8 +101,27 @@ create table if not exists public.visits (
   client_id uuid not null,
   doctor_id uuid,
   date date,
+  visit_time text,
   status text not null,
   notes text,
+  body_weight text,
+  body_weight_unit text,
+  body_height text,
+  body_height_unit text,
+  head_circumference text,
+  head_circumference_unit text,
+  body_temperature text,
+  body_temperature_unit text,
+  blood_oxygen text,
+  blood_oxygen_unit text,
+  glycemia text,
+  glycemia_unit text,
+  pulse text,
+  pulse_unit text,
+  bmi text,
+  blood_pressure_systolic text,
+  blood_pressure_diastolic text,
+  blood_pressure_unit text,
   complaints text,
   additional_notes text,
   controls text,
@@ -118,6 +137,25 @@ create table if not exists public.visits (
 );
 
 -- Safe migration for existing projects (keeps old tables compatible).
+alter table public.visits add column if not exists visit_time text;
+alter table public.visits add column if not exists body_weight text;
+alter table public.visits add column if not exists body_weight_unit text;
+alter table public.visits add column if not exists body_height text;
+alter table public.visits add column if not exists body_height_unit text;
+alter table public.visits add column if not exists head_circumference text;
+alter table public.visits add column if not exists head_circumference_unit text;
+alter table public.visits add column if not exists body_temperature text;
+alter table public.visits add column if not exists body_temperature_unit text;
+alter table public.visits add column if not exists blood_oxygen text;
+alter table public.visits add column if not exists blood_oxygen_unit text;
+alter table public.visits add column if not exists glycemia text;
+alter table public.visits add column if not exists glycemia_unit text;
+alter table public.visits add column if not exists pulse text;
+alter table public.visits add column if not exists pulse_unit text;
+alter table public.visits add column if not exists bmi text;
+alter table public.visits add column if not exists blood_pressure_systolic text;
+alter table public.visits add column if not exists blood_pressure_diastolic text;
+alter table public.visits add column if not exists blood_pressure_unit text;
 alter table public.visits add column if not exists complaints text;
 alter table public.visits add column if not exists additional_notes text;
 alter table public.visits add column if not exists controls text;
