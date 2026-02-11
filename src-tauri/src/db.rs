@@ -141,6 +141,15 @@ CREATE TABLE IF NOT EXISTS visits (
   date TEXT,
   status TEXT NOT NULL,
   notes TEXT,
+  complaints TEXT,
+  additional_notes TEXT,
+  controls TEXT,
+  remarks TEXT,
+  analyses TEXT,
+  advice TEXT,
+  therapies TEXT,
+  diagnosis TEXT,
+  examinations TEXT,
   created_at TEXT,
   updated_at TEXT,
   deleted INTEGER DEFAULT 0
@@ -255,6 +264,21 @@ impl Db {
     // sales
     Self::add_column_if_missing(conn, "sales", "fiscalized", "INTEGER NOT NULL DEFAULT 0")?;
     Self::add_column_if_missing(conn, "sales", "fiscalized_at", "TEXT")?;
+
+    // visits
+    for (col, ddl) in [
+      ("complaints", "TEXT"),
+      ("additional_notes", "TEXT"),
+      ("controls", "TEXT"),
+      ("remarks", "TEXT"),
+      ("analyses", "TEXT"),
+      ("advice", "TEXT"),
+      ("therapies", "TEXT"),
+      ("diagnosis", "TEXT"),
+      ("examinations", "TEXT"),
+    ] {
+      Self::add_column_if_missing(conn, "visits", col, ddl)?;
+    }
 
     // visit_items
     Self::add_column_if_missing(conn, "visit_items", "vat_code", "TEXT NOT NULL DEFAULT 'C'")?;
@@ -2288,7 +2312,7 @@ impl Db {
     let include_deleted = f.include_deleted.unwrap_or(false);
 
     let mut sql = String::from(
-      "SELECT id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted
+      "SELECT id, client_id, doctor_id, date, status, notes, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted
        FROM visits WHERE 1=1",
     );
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
@@ -2330,9 +2354,18 @@ impl Db {
         date: row.get(3)?,
         status: row.get(4)?,
         notes: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-        deleted: row.get(8)?,
+        complaints: row.get(6)?,
+        additional_notes: row.get(7)?,
+        controls: row.get(8)?,
+        remarks: row.get(9)?,
+        analyses: row.get(10)?,
+        advice: row.get(11)?,
+        therapies: row.get(12)?,
+        diagnosis: row.get(13)?,
+        examinations: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+        deleted: row.get(17)?,
       })
     })?;
     for r in rows {
@@ -2346,7 +2379,7 @@ impl Db {
     Ok(
       conn
         .query_row(
-          "SELECT id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted
+          "SELECT id, client_id, doctor_id, date, status, notes, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted
            FROM visits WHERE id=?1",
           params![id],
           |row| {
@@ -2357,9 +2390,18 @@ impl Db {
               date: row.get(3)?,
               status: row.get(4)?,
               notes: row.get(5)?,
-              created_at: row.get(6)?,
-              updated_at: row.get(7)?,
-              deleted: row.get(8)?,
+              complaints: row.get(6)?,
+              additional_notes: row.get(7)?,
+              controls: row.get(8)?,
+              remarks: row.get(9)?,
+              analyses: row.get(10)?,
+              advice: row.get(11)?,
+              therapies: row.get(12)?,
+              diagnosis: row.get(13)?,
+              examinations: row.get(14)?,
+              created_at: row.get(15)?,
+              updated_at: row.get(16)?,
+              deleted: row.get(17)?,
             })
           },
         )
@@ -2380,6 +2422,15 @@ impl Db {
     let doctor_id = input.doctor_id;
     let date = input.date;
     let notes = input.notes;
+    let complaints = input.complaints;
+    let additional_notes = input.additional_notes;
+    let controls = input.controls;
+    let remarks = input.remarks;
+    let analyses = input.analyses;
+    let advice = input.advice;
+    let therapies = input.therapies;
+    let diagnosis = input.diagnosis;
+    let examinations = input.examinations;
     let now = now_iso();
 
     let mut conn = self.conn()?;
@@ -2390,17 +2441,44 @@ impl Db {
     let created_at = existing_created_at.unwrap_or_else(|| now.clone());
 
     tx.execute(
-      "INSERT INTO visits (id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+      "INSERT INTO visits (id, client_id, doctor_id, date, status, notes, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0)
        ON CONFLICT(id) DO UPDATE SET
          client_id=excluded.client_id,
          doctor_id=excluded.doctor_id,
          date=excluded.date,
          status=excluded.status,
          notes=excluded.notes,
+         complaints=excluded.complaints,
+         additional_notes=excluded.additional_notes,
+         controls=excluded.controls,
+         remarks=excluded.remarks,
+         analyses=excluded.analyses,
+         advice=excluded.advice,
+         therapies=excluded.therapies,
+         diagnosis=excluded.diagnosis,
+         examinations=excluded.examinations,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
-      params![id, &client_id, &doctor_id, &date, &status, &notes, &created_at, &now],
+      params![
+        id,
+        &client_id,
+        &doctor_id,
+        &date,
+        &status,
+        &notes,
+        &complaints,
+        &additional_notes,
+        &controls,
+        &remarks,
+        &analyses,
+        &advice,
+        &therapies,
+        &diagnosis,
+        &examinations,
+        &created_at,
+        &now
+      ],
     )?;
     let row = Visit {
       id: id.clone(),
@@ -2409,6 +2487,15 @@ impl Db {
       date,
       status,
       notes,
+      complaints,
+      additional_notes,
+      controls,
+      remarks,
+      analyses,
+      advice,
+      therapies,
+      diagnosis,
+      examinations,
       created_at: created_at.clone(),
       updated_at: now.clone(),
       deleted: 0,
@@ -2429,7 +2516,7 @@ impl Db {
     tx.execute("UPDATE visits SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
     let row = tx
       .query_row(
-        "SELECT id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted FROM visits WHERE id=?1",
+        "SELECT id, client_id, doctor_id, date, status, notes, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted FROM visits WHERE id=?1",
         params![id],
         |r| {
           Ok(Visit {
@@ -2439,9 +2526,18 @@ impl Db {
             date: r.get(3)?,
             status: r.get(4)?,
             notes: r.get(5)?,
-            created_at: r.get(6)?,
-            updated_at: r.get(7)?,
-            deleted: r.get(8)?,
+            complaints: r.get(6)?,
+            additional_notes: r.get(7)?,
+            controls: r.get(8)?,
+            remarks: r.get(9)?,
+            analyses: r.get(10)?,
+            advice: r.get(11)?,
+            therapies: r.get(12)?,
+            diagnosis: r.get(13)?,
+            examinations: r.get(14)?,
+            created_at: r.get(15)?,
+            updated_at: r.get(16)?,
+            deleted: r.get(17)?,
           })
         },
       )
@@ -3173,14 +3269,23 @@ impl Db {
   pub fn apply_remote_visit(&self, row: &Visit) -> anyhow::Result<()> {
     let conn = self.conn()?;
     conn.execute(
-      "INSERT INTO visits (id, client_id, doctor_id, date, status, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+      "INSERT INTO visits (id, client_id, doctor_id, date, status, notes, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
        ON CONFLICT(id) DO UPDATE SET
          client_id=excluded.client_id,
          doctor_id=excluded.doctor_id,
          date=excluded.date,
          status=excluded.status,
          notes=excluded.notes,
+         complaints=excluded.complaints,
+         additional_notes=excluded.additional_notes,
+         controls=excluded.controls,
+         remarks=excluded.remarks,
+         analyses=excluded.analyses,
+         advice=excluded.advice,
+         therapies=excluded.therapies,
+         diagnosis=excluded.diagnosis,
+         examinations=excluded.examinations,
          created_at=excluded.created_at,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
@@ -3191,6 +3296,15 @@ impl Db {
         row.date,
         row.status,
         row.notes,
+        row.complaints,
+        row.additional_notes,
+        row.controls,
+        row.remarks,
+        row.analyses,
+        row.advice,
+        row.therapies,
+        row.diagnosis,
+        row.examinations,
         row.created_at,
         row.updated_at,
         row.deleted

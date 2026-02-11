@@ -103,10 +103,30 @@ create table if not exists public.visits (
   date date,
   status text not null,
   notes text,
+  complaints text,
+  additional_notes text,
+  controls text,
+  remarks text,
+  analyses text,
+  advice text,
+  therapies text,
+  diagnosis text,
+  examinations text,
   created_at timestamptz,
   updated_at timestamptz,
   deleted integer not null default 0
 );
+
+-- Safe migration for existing projects (keeps old tables compatible).
+alter table public.visits add column if not exists complaints text;
+alter table public.visits add column if not exists additional_notes text;
+alter table public.visits add column if not exists controls text;
+alter table public.visits add column if not exists remarks text;
+alter table public.visits add column if not exists analyses text;
+alter table public.visits add column if not exists advice text;
+alter table public.visits add column if not exists therapies text;
+alter table public.visits add column if not exists diagnosis text;
+alter table public.visits add column if not exists examinations text;
 
 create table if not exists public.visit_items (
   id uuid primary key,

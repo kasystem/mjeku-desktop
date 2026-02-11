@@ -257,6 +257,15 @@ pub struct Visit {
   pub date: Option<String>, // YYYY-MM-DD
   pub status: String,       // draft | final
   pub notes: Option<String>,
+  pub complaints: Option<String>,
+  pub additional_notes: Option<String>,
+  pub controls: Option<String>,
+  pub remarks: Option<String>,
+  pub analyses: Option<String>,
+  pub advice: Option<String>,
+  pub therapies: Option<String>,
+  pub diagnosis: Option<String>,
+  pub examinations: Option<String>,
   pub created_at: String,
   pub updated_at: String,
   pub deleted: i64,
@@ -280,6 +289,15 @@ pub struct VisitUpsertInput {
   pub date: Option<String>,
   pub status: String,
   pub notes: Option<String>,
+  pub complaints: Option<String>,
+  pub additional_notes: Option<String>,
+  pub controls: Option<String>,
+  pub remarks: Option<String>,
+  pub analyses: Option<String>,
+  pub advice: Option<String>,
+  pub therapies: Option<String>,
+  pub diagnosis: Option<String>,
+  pub examinations: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
