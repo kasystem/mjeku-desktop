@@ -25,6 +25,7 @@ const KEY_SESSION: &str = "session";
 pub enum UserRole {
   Owner,
   Cashier,
+  LogsAdmin,
 }
 
 impl UserRole {
@@ -32,6 +33,7 @@ impl UserRole {
     match self {
       UserRole::Owner => "owner",
       UserRole::Cashier => "cashier",
+      UserRole::LogsAdmin => "logs_admin",
     }
   }
 }
@@ -144,7 +146,7 @@ fn session_info_from_kind(db: &Db, kind: &SessionKind) -> anyhow::Result<Session
       user_role: Some(role.as_str().to_string()),
       doctor_id: None,
       doctor_name: None,
-      doctor_is_admin: true,
+      doctor_is_admin: matches!(role, UserRole::Owner | UserRole::Cashier),
     }),
     SessionKind::Doctor { doctor_id, is_admin } => {
       let doctor_name = db
@@ -324,6 +326,11 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
   if raw.eq_ignore_ascii_case("cashier") {
     return Ok(SessionKind::User { role: UserRole::Cashier });
   }
+  if raw.eq_ignore_ascii_case("logs_admin") {
+    return Ok(SessionKind::User {
+      role: UserRole::LogsAdmin,
+    });
+  }
 
   if let Some(rest) = raw.strip_prefix("doctor:") {
     let doctor_id = rest.trim().to_string();
@@ -362,6 +369,12 @@ pub fn session_set_user(db: &Db) -> anyhow::Result<()> {
 
 pub fn session_set_cashier(db: &Db) -> anyhow::Result<()> {
   db.setting_set(KEY_SESSION, "cashier")?;
+  db.setting_set(KEY_USER_LOGGED_IN, "0")?;
+  Ok(())
+}
+
+pub fn session_set_logs_admin(db: &Db) -> anyhow::Result<()> {
+  db.setting_set(KEY_SESSION, "logs_admin")?;
   db.setting_set(KEY_USER_LOGGED_IN, "0")?;
   Ok(())
 }

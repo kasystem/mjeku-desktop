@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,18 @@ use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 const KEY_SUPABASE_URL: &str = "supabase_url";
 const KEY_SUPABASE_ANON_KEY: &str = "supabase_anon_key";
 const KEY_SUPABASE_API_KEY: &str = "supabase_api_key";
+const KEY_ERROR_LOG_PATH: &str = "error_log_path";
+
+fn append_sync_error(db: &Db, source: &str, message: &str) {
+  let path: Option<PathBuf> = db
+    .setting_get(KEY_ERROR_LOG_PATH)
+    .ok()
+    .flatten()
+    .map(PathBuf::from);
+  if let Some(path) = path {
+    let _ = crate::error_logs::append(&path, source, message);
+  }
+}
 
 fn looks_like_jwt(token: &str) -> bool {
   let t = token.trim();
@@ -103,9 +116,11 @@ impl SyncEngine {
     // Pull first (to avoid overwriting newer remote updates).
     if let Err(e) = self.pull_updates(&supabase_url, &api_key, &last_sync_time).await {
       if contains_network_error(&e) {
+        append_sync_error(self.db.as_ref(), "sync_pull", &format!("offline: {e}"));
         self.set_status("pending", Some("offline".to_string())).await;
         return Ok(());
       }
+      append_sync_error(self.db.as_ref(), "sync_pull", &e.to_string());
       self.set_status("error", Some(e.to_string())).await;
       return Err(e);
     }
@@ -113,9 +128,11 @@ impl SyncEngine {
     // Push queue.
     if let Err(e) = self.push_queue(&supabase_url, &api_key).await {
       if contains_network_error(&e) {
+        append_sync_error(self.db.as_ref(), "sync_push", &format!("offline: {e}"));
         self.set_status("pending", Some("offline".to_string())).await;
         return Ok(());
       }
+      append_sync_error(self.db.as_ref(), "sync_push", &e.to_string());
       self.set_status("error", Some(e.to_string())).await;
       return Err(e);
     }
@@ -344,6 +361,11 @@ impl SyncEngine {
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+      append_sync_error(
+        self.db.as_ref(),
+        "sync_fetch_table",
+        &format!("supabase pull failed {table}: {status} {body}"),
+      );
       bail!("supabase pull failed {table}: {status} {body}");
     }
     let rows: Vec<T> = serde_json::from_str(&body).context("decode json")?;
@@ -388,6 +410,7 @@ impl SyncEngine {
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
           let msg = format!("supabase upsert failed {table}: {status} {body}");
+          append_sync_error(self.db.as_ref(), "sync_upsert", &msg);
           for (qid, _) in batch {
             self.db.sync_queue_mark_failed(&qid, &msg)?;
           }
@@ -423,6 +446,7 @@ impl SyncEngine {
       let text = resp.text().await.unwrap_or_default();
       if !status.is_success() {
         let msg = format!("supabase delete failed {}: {status} {text}", it.table_name);
+        append_sync_error(self.db.as_ref(), "sync_delete", &msg);
         self.db.sync_queue_mark_failed(&it.id, &msg)?;
         bail!("{msg}");
       }

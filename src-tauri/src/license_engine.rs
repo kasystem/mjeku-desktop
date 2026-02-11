@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
@@ -10,12 +11,24 @@ use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 const KEY_SUPABASE_URL: &str = "supabase_url";
 const KEY_SUPABASE_ANON_KEY: &str = "supabase_anon_key";
 const KEY_SUPABASE_API_KEY: &str = "supabase_api_key";
+const KEY_ERROR_LOG_PATH: &str = "error_log_path";
 
 const KEY_LICENSE_ACTIVE_UNTIL: &str = "license_active_until";
 const KEY_LICENSE_DISABLED: &str = "license_disabled";
 const KEY_LICENSE_LAST_CHECKED_AT: &str = "license_last_checked_at";
 
 const GRACE_DAYS: i64 = 7;
+
+fn append_license_error(db: &Db, source: &str, message: &str) {
+  let path: Option<PathBuf> = db
+    .setting_get(KEY_ERROR_LOG_PATH)
+    .ok()
+    .flatten()
+    .map(PathBuf::from);
+  if let Some(path) = path {
+    let _ = crate::error_logs::append(&path, source, message);
+  }
+}
 
 fn looks_like_jwt(token: &str) -> bool {
   let t = token.trim();
@@ -127,10 +140,12 @@ impl LicenseEngine {
       Ok(r) => r,
       Err(e) => {
         if is_network_error(&e) {
+          append_license_error(self.db.as_ref(), "license_check", &format!("offline: {e}"));
           let st = Self::compute_offline_state(self.db.as_ref())?;
           self.set_state(st).await;
           return Ok(());
         }
+        append_license_error(self.db.as_ref(), "license_check", &e.to_string());
         bail!("license check request failed: {e}");
       }
     };
@@ -139,6 +154,7 @@ impl LicenseEngine {
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
       // Treat auth issues as "error" but still allow grace if previously valid.
+      append_license_error(self.db.as_ref(), "license_check", &format!("license check failed: {status} {body}"));
       let mut st = Self::compute_offline_state(self.db.as_ref())?;
       st.ok = st.ok && st.status == "offline_grace";
       st.status = "error".to_string();
@@ -270,4 +286,3 @@ impl LicenseEngine {
     })
   }
 }
-

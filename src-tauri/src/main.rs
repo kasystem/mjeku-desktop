@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod desktop_updates;
+mod error_logs;
 mod invoice;
 mod license_engine;
 mod models;
@@ -30,16 +31,24 @@ use crate::models::{
 use crate::sync_engine::SyncEngine;
 use crate::updates::UpdatesEngine;
 
+const LOGS_ADMIN_USER: &str = "fatlindadmin";
+const LOGS_ADMIN_PASS: &str = "Fatlind0)";
+
 struct AppState {
   db: Arc<Db>,
   auth: Arc<AuthState>,
   sync: Arc<SyncEngine>,
   updates: Arc<UpdatesEngine>,
   license: Arc<LicenseEngine>,
+  error_log_path: PathBuf,
 }
 
 fn err_string(e: impl std::fmt::Display) -> String {
   e.to_string()
+}
+
+fn append_error_log(state: &AppState, source: &str, message: &str) {
+  let _ = crate::error_logs::append(&state.error_log_path, source, message);
 }
 
 fn dev_server_is_reachable(dev_url: &str) -> bool {
@@ -249,8 +258,44 @@ async fn auth_user_login(state: tauri::State<'_, AppState>, password: String) ->
         })
         .await;
     }
+    crate::auth::UserRole::LogsAdmin => {
+      tokio::task::spawn_blocking(move || crate::auth::session_set_logs_admin(&db2))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+      state
+        .auth
+        .set_session(SessionKind::User {
+          role: crate::auth::UserRole::LogsAdmin,
+        })
+        .await;
+    }
   }
 
+  Ok(true)
+}
+
+#[tauri::command]
+async fn auth_logs_admin_login(state: tauri::State<'_, AppState>, username: String, password: String) -> Result<bool, String> {
+  let user = username.trim().to_lowercase();
+  let pass = password.trim();
+  if user != LOGS_ADMIN_USER || pass != LOGS_ADMIN_PASS {
+    append_error_log(state.inner(), "auth_logs_admin_login", "hyrje e pasakte per logs_admin");
+    return Ok(false);
+  }
+
+  let db = state.db.clone();
+  tokio::task::spawn_blocking(move || crate::auth::session_set_logs_admin(&db))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+
+  state
+    .auth
+    .set_session(SessionKind::User {
+      role: crate::auth::UserRole::LogsAdmin,
+    })
+    .await;
   Ok(true)
 }
 
@@ -350,6 +395,9 @@ async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind
   let s = state.auth.session().await;
   match s {
     SessionKind::None => Err("duhet te hysh per te vazhduar".to_string()),
+    SessionKind::User {
+      role: crate::auth::UserRole::LogsAdmin,
+    } => Ok(s),
     _ => {
       if !state.license.is_ok().await {
         return Err("licenca skadoi ose eshte e bllokuar".to_string());
@@ -362,9 +410,24 @@ async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind
 async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
   let s = require_login(state).await?;
   match &s {
-    SessionKind::User { .. } => Ok(s),
+    SessionKind::User {
+      role: crate::auth::UserRole::Owner,
+    } => Ok(s),
+    SessionKind::User {
+      role: crate::auth::UserRole::Cashier,
+    } => Ok(s),
     SessionKind::Doctor { is_admin: true, .. } => Ok(s),
     _ => Err("nuk ke akses per kete seksion".to_string()),
+  }
+}
+
+async fn require_logs_admin(state: &tauri::State<'_, AppState>) -> Result<(), String> {
+  let s = state.auth.session().await;
+  match s {
+    SessionKind::User {
+      role: crate::auth::UserRole::LogsAdmin,
+    } => Ok(()),
+    _ => Err("nuk ke akses ne error logs".to_string()),
   }
 }
 
@@ -1296,6 +1359,30 @@ async fn invoice_export_pdf(app: tauri::AppHandle, state: tauri::State<'_, AppSt
   .map_err(err_string)?
 }
 
+#[tauri::command]
+async fn error_logs_list(
+  state: tauri::State<'_, AppState>,
+  limit: Option<u32>,
+) -> Result<Vec<crate::error_logs::ErrorLogEntry>, String> {
+  let _ = require_logs_admin(&state).await?;
+  let path = state.error_log_path.clone();
+  let lim = limit.unwrap_or(500).clamp(1, 5000) as usize;
+  tokio::task::spawn_blocking(move || crate::error_logs::list(&path, lim))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn error_logs_clear(state: tauri::State<'_, AppState>) -> Result<(), String> {
+  let _ = require_logs_admin(&state).await?;
+  let path = state.error_log_path.clone();
+  tokio::task::spawn_blocking(move || crate::error_logs::clear(&path))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
 fn main() {
   tauri::Builder::default()
     .register_uri_scheme_protocol("mjeku", ui_protocol::handle)
@@ -1313,6 +1400,8 @@ fn main() {
         let _ = std::fs::remove_file(&reset_flag);
       }
       let db = Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?);
+      let error_log_path = data_dir.join("logs").join("errors.log");
+      db.setting_set("error_log_path", &error_log_path.display().to_string())?;
 
       let session = crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None);
       let auth = Arc::new(AuthState::new(session));
@@ -1333,6 +1422,7 @@ fn main() {
         sync,
         updates,
         license,
+        error_log_path,
       });
 
       // In dev, load the Vite dev server for fast iteration.
@@ -1355,6 +1445,7 @@ fn main() {
       auth_admin_lock,
       auth_admin_change_password,
       auth_user_login,
+      auth_logs_admin_login,
       auth_user_logout,
       auth_doctor_login,
       auth_doctor_logout,
@@ -1402,7 +1493,9 @@ fn main() {
       fiscal_report_x_inp,
       fiscal_report_z_inp,
       admin_reset_clinic,
-      invoice_export_pdf
+      invoice_export_pdf,
+      error_logs_list,
+      error_logs_clear
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
