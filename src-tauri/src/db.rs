@@ -1188,6 +1188,26 @@ impl Db {
     Ok(())
   }
 
+  fn fiscal_clear_article_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+      PathBuf::from(r"C:\Temp\ClearArticle.inp")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+      std::env::temp_dir().join("ClearArticle.inp")
+    }
+  }
+
+  fn fiscal_emit_clear_article_command() -> anyhow::Result<PathBuf> {
+    let path = Self::fiscal_clear_article_path();
+    if let Some(parent) = path.parent() {
+      fs::create_dir_all(parent).with_context(|| format!("create clear-article dir: {}", parent.display()))?;
+    }
+    Self::fiscal_write_inp_atomic(&path, "O,1,______,_,__;ALL\n")?;
+    Ok(path)
+  }
+
   fn fiscal_wait_out_text(inp_path: &Path, timeout: Duration) -> Option<String> {
     let out_path = inp_path.with_extension("out");
     let start = std::time::Instant::now();
@@ -1303,6 +1323,9 @@ impl Db {
       bail!("nuk ka rreshta fiskal pa fiskalizuar");
     }
 
+    // Required by fiscal flow: clear article list before printing receipt.
+    Self::fiscal_emit_clear_article_command()?;
+
     // Step A: check if there is an open note. If NoteStatus=2, close with N before real sale.
     let g_path = output_dir.join(format!("status-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
     Self::fiscal_write_inp_atomic(&g_path, "G,1,______,_,__;NoteStatus\n")?;
@@ -1370,8 +1393,12 @@ impl Db {
       let close_path = output_dir.join(format!("kupon-close-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
       Self::fiscal_write_inp_atomic(&close_path, &close_body)?;
       let _ = Self::fiscal_wait_out_text(&close_path, Duration::from_secs(6));
+      let _ = Self::fiscal_emit_clear_article_command();
       bail!("fiskalizimi deshtoi edhe pas fallback (K dhe mbyllja T/N).");
     }
+
+    // Required by fiscal flow: clear article list after printing receipt.
+    Self::fiscal_emit_clear_article_command()?;
 
     // Mark items as fiscalized and queue them for sync.
     let now = now_iso();
