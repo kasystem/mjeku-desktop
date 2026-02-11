@@ -34,6 +34,12 @@ use crate::updates::UpdatesEngine;
 const LOGS_ADMIN_USER: &str = "fatlindadmin";
 const LOGS_ADMIN_PASS: &str = "Fatlind0)";
 const FISCAL_PRINTER_PROVIDER_KEY: &str = "fiscal_printer_provider";
+const KEY_SUPABASE_URL: &str = "supabase_url";
+const KEY_SUPABASE_API_KEY: &str = "supabase_api_key";
+const KEY_SUPABASE_ANON_KEY: &str = "supabase_anon_key";
+
+const TOKEN_MODE_EXISTING: &str = "existing";
+const TOKEN_MODE_NEW: &str = "new";
 
 struct AppState {
   db: Arc<Db>,
@@ -130,6 +136,61 @@ fn has_note_status_2(raw: &str) -> bool {
   s.contains("notestatus;2")
 }
 
+fn looks_like_jwt_token(token: &str) -> bool {
+  let t = token.trim();
+  t.starts_with("eyJ") && t.matches('.').count() >= 2
+}
+
+fn with_supabase_auth_request(req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+  let req = req.header("apikey", api_key);
+  if looks_like_jwt_token(api_key) {
+    req.bearer_auth(api_key)
+  } else {
+    req
+  }
+}
+
+fn normalize_provision_token(v: &str) -> String {
+  v.trim().to_ascii_uppercase().replace(' ', "")
+}
+
+fn normalize_token_mode(v: Option<&str>, has_clinic_id: bool) -> &'static str {
+  let x = v.unwrap_or("").trim().to_ascii_lowercase();
+  if x == TOKEN_MODE_NEW || x == "new_clinic" || x == "setup" {
+    return TOKEN_MODE_NEW;
+  }
+  if x == TOKEN_MODE_EXISTING || x == "existing_clinic" || x == "login" {
+    return TOKEN_MODE_EXISTING;
+  }
+  if has_clinic_id {
+    TOKEN_MODE_EXISTING
+  } else {
+    TOKEN_MODE_NEW
+  }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProvisionTokenRow {
+  clinic_id: Option<String>,
+  clinic_name: Option<String>,
+  mode: Option<String>,
+  one_time: Option<bool>,
+  disabled: Option<bool>,
+  expires_at: Option<String>,
+  used_at: Option<String>,
+  bootstrap_admin_salt: Option<String>,
+  bootstrap_admin_hash: Option<String>,
+  bootstrap_user_salt: Option<String>,
+  bootstrap_user_hash: Option<String>,
+  bootstrap_cashier_salt: Option<String>,
+  bootstrap_cashier_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProvisionClinicNameRow {
+  clinic_name: Option<String>,
+}
+
 fn normalize_fiscal_printer_provider(v: &str) -> Option<String> {
   let s = v.trim().to_ascii_lowercase().replace('-', "_").replace(' ', "_");
   match s.as_str() {
@@ -222,6 +283,207 @@ async fn auth_setup(
     .await
     .map_err(err_string)?
     .map_err(err_string)
+}
+
+#[tauri::command]
+async fn provision_apply_token(state: tauri::State<'_, AppState>, token: String) -> Result<AuthStateInfo, String> {
+  let token_code = normalize_provision_token(&token);
+  if token_code.is_empty() {
+    return Err("tokeni eshte i detyrueshem".to_string());
+  }
+
+  let db = state.db.clone();
+  let already_configured = tokio::task::spawn_blocking(move || crate::auth::is_configured(&db))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+  if already_configured {
+    return Err("aplikacioni eshte konfiguruar tashme".to_string());
+  }
+
+  let db = state.db.clone();
+  let (supabase_url, api_key) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+    let supabase_url = db.setting_get(KEY_SUPABASE_URL)?.unwrap_or_default();
+    let api_key = db
+      .setting_get(KEY_SUPABASE_API_KEY)?
+      .or_else(|| db.setting_get(KEY_SUPABASE_ANON_KEY).ok().flatten())
+      .unwrap_or_default();
+    if supabase_url.trim().is_empty() || api_key.trim().is_empty() {
+      bail!("mungon konfigurimi i Supabase URL/Key");
+    }
+    Ok((supabase_url, api_key))
+  })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+
+  let client = reqwest::Client::builder()
+    .timeout(Duration::from_secs(15))
+    .build()
+    .map_err(err_string)?;
+  let base = supabase_url.trim_end_matches('/').to_string();
+  let token_url = format!("{base}/rest/v1/clinic_tokens");
+  let now = crate::util::now_iso();
+
+  let resp = with_supabase_auth_request(client.get(&token_url), &api_key)
+    .query(&[
+      (
+        "select",
+        "token_code,clinic_id,clinic_name,mode,one_time,disabled,expires_at,used_at,bootstrap_admin_salt,bootstrap_admin_hash,bootstrap_user_salt,bootstrap_user_hash,bootstrap_cashier_salt,bootstrap_cashier_hash",
+      ),
+      ("token_code", &format!("eq.{}", token_code)),
+      ("limit", "1"),
+    ])
+    .send()
+    .await
+    .map_err(err_string)?;
+  let status = resp.status();
+  let body = resp.text().await.unwrap_or_default();
+  if !status.is_success() {
+    return Err(format!("token check failed: {} {}", status, body));
+  }
+  let mut rows: Vec<ProvisionTokenRow> = serde_json::from_str(&body).map_err(err_string)?;
+  if rows.is_empty() {
+    return Err("tokeni nuk u gjet".to_string());
+  }
+  let row = rows.remove(0);
+
+  if row.disabled.unwrap_or(false) {
+    return Err("tokeni eshte i çaktivizuar".to_string());
+  }
+  if row.one_time.unwrap_or(true) && row.used_at.as_deref().unwrap_or("").trim().len() > 0 {
+    return Err("tokeni eshte perdorur me pare".to_string());
+  }
+  if let Some(exp) = row.expires_at.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    let now_dt = crate::util::parse_rfc3339_to_utc(&now).map_err(err_string)?;
+    let exp_dt = crate::util::parse_rfc3339_to_utc(exp).map_err(err_string)?;
+    if now_dt > exp_dt {
+      return Err("tokeni ka skaduar".to_string());
+    }
+  }
+
+  let mut clinic_id = row
+    .clinic_id
+    .as_deref()
+    .unwrap_or("")
+    .trim()
+    .to_string();
+  let mut clinic_name = row
+    .clinic_name
+    .as_deref()
+    .unwrap_or("")
+    .trim()
+    .to_string();
+  let mode = normalize_token_mode(row.mode.as_deref(), !clinic_id.is_empty());
+  if clinic_id.is_empty() {
+    clinic_id = uuid::Uuid::new_v4().to_string();
+  }
+
+  if clinic_name.is_empty() {
+    let registry_url = format!("{base}/rest/v1/clinic_registry");
+    let resp = with_supabase_auth_request(client.get(&registry_url), &api_key)
+      .query(&[
+        ("select", "clinic_name"),
+        ("clinic_id", &format!("eq.{}", clinic_id)),
+        ("limit", "1"),
+      ])
+      .send()
+      .await
+      .map_err(err_string)?;
+    if resp.status().is_success() {
+      let txt = resp.text().await.unwrap_or_default();
+      if let Ok(mut xs) = serde_json::from_str::<Vec<ProvisionClinicNameRow>>(&txt) {
+        if let Some(x) = xs.pop() {
+          let n = x.clinic_name.unwrap_or_default();
+          if !n.trim().is_empty() {
+            clinic_name = n.trim().to_string();
+          }
+        }
+      }
+    }
+  }
+  if clinic_name.is_empty() {
+    clinic_name = "Klinika".to_string();
+  }
+
+  let mut patch = serde_json::json!({
+    "clinic_id": clinic_id,
+    "clinic_name": clinic_name,
+    "used_at": now,
+    "updated_at": now
+  });
+  if row.one_time.unwrap_or(true) {
+    patch["disabled"] = serde_json::Value::Bool(true);
+  }
+  let patch_url = format!(
+    "{token_url}?token_code=eq.{}",
+    urlencoding::encode(&token_code)
+  );
+  let patch_resp = with_supabase_auth_request(client.patch(&patch_url), &api_key)
+    .header("Prefer", "return=minimal")
+    .json(&patch)
+    .send()
+    .await
+    .map_err(err_string)?;
+  if !patch_resp.status().is_success() {
+    let st = patch_resp.status();
+    let txt = patch_resp.text().await.unwrap_or_default();
+    return Err(format!("token update failed: {} {}", st, txt));
+  }
+
+  let out = if mode == TOKEN_MODE_EXISTING {
+    let admin_salt = row.bootstrap_admin_salt.as_deref().unwrap_or("").trim().to_string();
+    let admin_hash = row.bootstrap_admin_hash.as_deref().unwrap_or("").trim().to_string();
+    let user_salt = row.bootstrap_user_salt.as_deref().unwrap_or("").trim().to_string();
+    let user_hash = row.bootstrap_user_hash.as_deref().unwrap_or("").trim().to_string();
+    if admin_salt.is_empty() || admin_hash.is_empty() || user_salt.is_empty() || user_hash.is_empty() {
+      return Err("tokeni i klinikes ekzistuese nuk ka kredenciale bootstrap (owner/admin).".to_string());
+    }
+    let cashier_salt = row
+      .bootstrap_cashier_salt
+      .as_deref()
+      .map(str::trim)
+      .filter(|x| !x.is_empty())
+      .map(str::to_string);
+    let cashier_hash = row
+      .bootstrap_cashier_hash
+      .as_deref()
+      .map(str::trim)
+      .filter(|x| !x.is_empty())
+      .map(str::to_string);
+
+    let db = state.db.clone();
+    let clinic_id2 = clinic_id.clone();
+    let clinic_name2 = clinic_name.clone();
+    tokio::task::spawn_blocking(move || {
+      crate::auth::provision_existing(
+        &db,
+        &clinic_id2,
+        &clinic_name2,
+        &admin_salt,
+        &admin_hash,
+        &user_salt,
+        &user_hash,
+        cashier_salt.as_deref(),
+        cashier_hash.as_deref(),
+      )
+    })
+      .await
+      .map_err(err_string)?
+      .map_err(err_string)?
+  } else {
+    let db = state.db.clone();
+    let clinic_id2 = clinic_id.clone();
+    let clinic_name2 = clinic_name.clone();
+    tokio::task::spawn_blocking(move || crate::auth::provision_new(&db, &clinic_id2, &clinic_name2))
+      .await
+      .map_err(err_string)?
+      .map_err(err_string)?
+  };
+
+  state.auth.set_session(SessionKind::None).await;
+  state.auth.admin_lock().await;
+  Ok(out)
 }
 
 #[tauri::command]
@@ -1499,6 +1761,7 @@ fn main() {
       get_app_info,
       auth_get_state,
       auth_setup,
+      provision_apply_token,
       auth_admin_unlock,
       auth_admin_lock,
       auth_admin_change_password,

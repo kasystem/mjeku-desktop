@@ -1,5 +1,5 @@
 -- Mjeku Supabase schema (run in Supabase SQL editor)
--- Tables: clients, sales, payments, doctors, services, appointments, visits, visit_items, cash_ledger, app_license, clinic_registry
+-- Tables: clients, sales, payments, doctors, services, appointments, visits, visit_items, cash_ledger, app_license, clinic_registry, clinic_tokens
 -- Notes:
 -- - This keeps `deleted` as an integer (0/1) to match the local SQLite schema.
 -- - You can either disable RLS (simplest for single-clinic project) or add permissive policies for anon.
@@ -166,6 +166,27 @@ create table if not exists public.clinic_registry (
   updated_at timestamptz not null default now()
 );
 
+-- Onboarding tokens (vendor creates; desktop consumes once or multiple times).
+create table if not exists public.clinic_tokens (
+  token_code text primary key,
+  clinic_id uuid,
+  clinic_name text,
+  mode text not null default 'new',
+  one_time boolean not null default true,
+  disabled boolean not null default false,
+  expires_at timestamptz,
+  used_at timestamptz,
+  bootstrap_admin_salt text,
+  bootstrap_admin_hash text,
+  bootstrap_user_salt text,
+  bootstrap_user_hash text,
+  bootstrap_cashier_salt text,
+  bootstrap_cashier_hash text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint clinic_tokens_mode_check check (mode in ('new', 'existing'))
+);
+
 create index if not exists clients_updated_at_idx on public.clients(updated_at);
 create index if not exists sales_client_id_idx on public.sales(client_id);
 create index if not exists sales_date_idx on public.sales(date);
@@ -202,6 +223,11 @@ create index if not exists app_license_updated_at_idx on public.app_license(upda
 create index if not exists clinic_registry_updated_at_idx on public.clinic_registry(updated_at);
 create index if not exists clinic_registry_approved_idx on public.clinic_registry(approved);
 create index if not exists clinic_registry_last_seen_at_idx on public.clinic_registry(last_seen_at);
+create index if not exists clinic_tokens_clinic_id_idx on public.clinic_tokens(clinic_id);
+create index if not exists clinic_tokens_mode_idx on public.clinic_tokens(mode);
+create index if not exists clinic_tokens_expires_at_idx on public.clinic_tokens(expires_at);
+create index if not exists clinic_tokens_used_at_idx on public.clinic_tokens(used_at);
+create index if not exists clinic_tokens_updated_at_idx on public.clinic_tokens(updated_at);
 
 -- RLS guidance:
 -- Option A (simplest): disable RLS on these tables.
@@ -216,6 +242,7 @@ create index if not exists clinic_registry_last_seen_at_idx on public.clinic_reg
 --   alter table public.cash_ledger disable row level security;
 --   alter table public.app_license disable row level security;
 --   alter table public.clinic_registry disable row level security;
+--   alter table public.clinic_tokens disable row level security;
 --
 -- Option B: enable RLS and allow anon read/write (only if this project is private to the clinic).
 --   alter table public.clients enable row level security;
@@ -244,3 +271,8 @@ create index if not exists clinic_registry_last_seen_at_idx on public.clinic_reg
 --   create policy "anon_select_clinic_registry" on public.clinic_registry for select to anon using (true);
 --   create policy "anon_upsert_clinic_registry" on public.clinic_registry for insert to anon with check (true);
 --   create policy "anon_update_clinic_registry" on public.clinic_registry for update to anon using (true) with check (true);
+--   alter table public.clinic_tokens enable row level security;
+--   -- Desktop app finds token by code and marks it used.
+--   create policy "anon_select_clinic_tokens" on public.clinic_tokens for select to anon using (true);
+--   create policy "anon_insert_clinic_tokens" on public.clinic_tokens for insert to anon with check (true);
+--   create policy "anon_update_clinic_tokens" on public.clinic_tokens for update to anon using (true) with check (true);

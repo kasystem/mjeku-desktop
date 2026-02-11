@@ -211,7 +211,16 @@ pub fn setup_v2(
     bail!("aplikacioni eshte konfiguruar tashme");
   }
 
-  let clinic_id = Uuid::new_v4().to_string();
+  let clinic_id = db
+    .setting_get(KEY_CLINIC_ID)?
+    .unwrap_or_default()
+    .trim()
+    .to_string();
+  let clinic_id = if clinic_id.is_empty() {
+    Uuid::new_v4().to_string()
+  } else {
+    clinic_id
+  };
   let admin_salt = Uuid::new_v4().to_string();
   let admin_hash = hash_password(&admin_salt, admin_password);
   let user_salt = Uuid::new_v4().to_string();
@@ -237,6 +246,82 @@ pub fn setup_v2(
   db.setting_set(KEY_SESSION, "")?;
   db.setting_set(KEY_USER_LOGGED_IN, "0")?;
 
+  read_state(db, false, SessionKind::None)
+}
+
+pub fn provision_existing(
+  db: &Db,
+  clinic_id: &str,
+  clinic_name: &str,
+  admin_salt: &str,
+  admin_hash: &str,
+  user_salt: &str,
+  user_hash: &str,
+  cashier_salt: Option<&str>,
+  cashier_hash: Option<&str>,
+) -> anyhow::Result<AuthStateInfo> {
+  let clinic_id = clinic_id.trim();
+  if clinic_id.is_empty() {
+    bail!("clinic_id mungon");
+  }
+  let clinic_name = clinic_name.trim();
+  if clinic_name.is_empty() {
+    bail!("clinic_name mungon");
+  }
+  if admin_salt.trim().is_empty()
+    || admin_hash.trim().is_empty()
+    || user_salt.trim().is_empty()
+    || user_hash.trim().is_empty()
+  {
+    bail!("tokeni nuk ka kredenciale bootstrap te plota");
+  }
+
+  db.setting_set(KEY_CLINIC_ID, clinic_id)?;
+  db.setting_set(KEY_CLINIC_NAME, clinic_name)?;
+  db.setting_set(KEY_ADMIN_SALT, admin_salt.trim())?;
+  db.setting_set(KEY_ADMIN_HASH, admin_hash.trim())?;
+  db.setting_set(KEY_USER_SALT, user_salt.trim())?;
+  db.setting_set(KEY_USER_HASH, user_hash.trim())?;
+
+  match (cashier_salt.map(str::trim), cashier_hash.map(str::trim)) {
+    (Some(s), Some(h)) if !s.is_empty() && !h.is_empty() => {
+      db.setting_set(KEY_CASHIER_SALT, s)?;
+      db.setting_set(KEY_CASHIER_HASH, h)?;
+    }
+    _ => {
+      db.setting_set(KEY_CASHIER_SALT, "")?;
+      db.setting_set(KEY_CASHIER_HASH, "")?;
+    }
+  }
+
+  db.setting_set(KEY_SESSION, "")?;
+  db.setting_set(KEY_USER_LOGGED_IN, "0")?;
+  read_state(db, false, SessionKind::None)
+}
+
+pub fn provision_new(db: &Db, clinic_id: &str, clinic_name: &str) -> anyhow::Result<AuthStateInfo> {
+  let clinic_id = clinic_id.trim();
+  if clinic_id.is_empty() {
+    bail!("clinic_id mungon");
+  }
+  let clinic_name = clinic_name.trim();
+  if clinic_name.is_empty() {
+    bail!("clinic_name mungon");
+  }
+
+  db.setting_set(KEY_CLINIC_ID, clinic_id)?;
+  db.setting_set(KEY_CLINIC_NAME, clinic_name)?;
+
+  // Force setup flow for new clinic provisioning.
+  db.setting_set(KEY_ADMIN_SALT, "")?;
+  db.setting_set(KEY_ADMIN_HASH, "")?;
+  db.setting_set(KEY_USER_SALT, "")?;
+  db.setting_set(KEY_USER_HASH, "")?;
+  db.setting_set(KEY_CASHIER_SALT, "")?;
+  db.setting_set(KEY_CASHIER_HASH, "")?;
+
+  db.setting_set(KEY_SESSION, "")?;
+  db.setting_set(KEY_USER_LOGGED_IN, "0")?;
   read_state(db, false, SessionKind::None)
 }
 
