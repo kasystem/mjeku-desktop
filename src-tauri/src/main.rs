@@ -775,10 +775,12 @@ async fn doctors_list(state: tauri::State<'_, AppState>, search: Option<String>)
 async fn doctors_upsert(state: tauri::State<'_, AppState>, doctor: DoctorUpsertInput) -> Result<Doctor, String> {
   let _ = require_owner(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.doctors_upsert(doctor))
+  let row = tokio::task::spawn_blocking(move || db.doctors_upsert(doctor))
     .await
     .map_err(err_string)?
-    .map_err(err_string)
+    .map_err(err_string)?;
+  let _ = state.sync.sync_now().await;
+  Ok(row)
 }
 
 #[tauri::command]
@@ -788,7 +790,9 @@ async fn doctors_delete(state: tauri::State<'_, AppState>, id: String) -> Result
   tokio::task::spawn_blocking(move || db.doctors_delete(&id))
     .await
     .map_err(err_string)?
-    .map_err(err_string)
+    .map_err(err_string)?;
+  let _ = state.sync.sync_now().await;
+  Ok(())
 }
 
 #[tauri::command]
