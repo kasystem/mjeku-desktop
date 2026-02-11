@@ -27,6 +27,17 @@ CREATE TABLE IF NOT EXISTS clients (
   phone TEXT,
   email TEXT,
   notes TEXT,
+  first_name TEXT,
+  last_name TEXT,
+  parent_name TEXT,
+  dob TEXT,
+  gender TEXT,
+  city TEXT,
+  address TEXT,
+  allergies TEXT,
+  weight_kg REAL,
+  height_cm REAL,
+  patient_code TEXT,
   created_at TEXT,
   updated_at TEXT,
   deleted INTEGER DEFAULT 0
@@ -38,6 +49,8 @@ CREATE TABLE IF NOT EXISTS sales (
   date TEXT,
   total REAL NOT NULL,
   notes TEXT,
+  fiscalized INTEGER NOT NULL DEFAULT 0,
+  fiscalized_at TEXT,
   created_at TEXT,
   updated_at TEXT,
   deleted INTEGER DEFAULT 0
@@ -74,7 +87,10 @@ CREATE TABLE IF NOT EXISTS app_settings (
 
 CREATE TABLE IF NOT EXISTS doctors (
   id TEXT PRIMARY KEY,
+  code TEXT,
   name TEXT NOT NULL,
+  title TEXT,
+  specialty TEXT,
   phone TEXT,
   email TEXT,
   notes TEXT,
@@ -97,6 +113,7 @@ CREATE TABLE IF NOT EXISTS services (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
   default_price REAL NOT NULL,
+  vat_code TEXT NOT NULL DEFAULT 'C',
   notes TEXT,
   created_at TEXT,
   updated_at TEXT,
@@ -137,6 +154,9 @@ CREATE TABLE IF NOT EXISTS visit_items (
   qty REAL NOT NULL,
   unit_price REAL NOT NULL,
   fiscal INTEGER NOT NULL DEFAULT 1,
+  vat_code TEXT NOT NULL DEFAULT 'C',
+  fiscalized INTEGER NOT NULL DEFAULT 0,
+  fiscalized_at TEXT,
   notes TEXT,
   created_at TEXT,
   updated_at TEXT,
@@ -154,48 +174,6 @@ CREATE TABLE IF NOT EXISTS cash_ledger (
   updated_at TEXT,
   deleted INTEGER DEFAULT 0
 );
-
-CREATE INDEX IF NOT EXISTS idx_clients_updated_at ON clients(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_sales_client_id ON sales(client_id);
-CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(date);
-CREATE INDEX IF NOT EXISTS idx_sales_updated_at ON sales(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_payments_client_id ON payments(client_id);
-CREATE INDEX IF NOT EXISTS idx_payments_sale_id ON payments(sale_id);
-CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(date);
-CREATE INDEX IF NOT EXISTS idx_payments_updated_at ON payments(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON sync_queue(status);
-CREATE INDEX IF NOT EXISTS idx_sync_queue_created_at ON sync_queue(created_at);
-CREATE INDEX IF NOT EXISTS idx_sync_queue_table_row ON sync_queue(table_name, row_id);
-
-CREATE INDEX IF NOT EXISTS idx_doctors_updated_at ON doctors(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_doctor_accounts_is_admin ON doctor_accounts(is_admin);
-CREATE INDEX IF NOT EXISTS idx_doctor_accounts_updated_at ON doctor_accounts(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_services_updated_at ON services(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_appointments_client_id ON appointments(client_id);
-CREATE INDEX IF NOT EXISTS idx_appointments_doctor_id ON appointments(doctor_id);
-CREATE INDEX IF NOT EXISTS idx_appointments_start_at ON appointments(start_at);
-CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
-CREATE INDEX IF NOT EXISTS idx_appointments_updated_at ON appointments(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_visits_client_id ON visits(client_id);
-CREATE INDEX IF NOT EXISTS idx_visits_doctor_id ON visits(doctor_id);
-CREATE INDEX IF NOT EXISTS idx_visits_date ON visits(date);
-CREATE INDEX IF NOT EXISTS idx_visits_status ON visits(status);
-CREATE INDEX IF NOT EXISTS idx_visits_updated_at ON visits(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_visit_items_visit_id ON visit_items(visit_id);
-CREATE INDEX IF NOT EXISTS idx_visit_items_client_id ON visit_items(client_id);
-CREATE INDEX IF NOT EXISTS idx_visit_items_updated_at ON visit_items(updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_cash_ledger_type ON cash_ledger(type);
-CREATE INDEX IF NOT EXISTS idx_cash_ledger_date ON cash_ledger(date);
-CREATE INDEX IF NOT EXISTS idx_cash_ledger_updated_at ON cash_ledger(updated_at);
 "#;
 
 pub struct Db {
@@ -213,6 +191,7 @@ impl Db {
     let conn = Connection::open_with_flags(&db_path, flags).with_context(|| format!("open sqlite: {}", db_path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(MIGRATION_SQL)?;
+    Self::run_migrations(&conn)?;
 
     Ok(Self {
       db_path,
@@ -226,6 +205,116 @@ impl Db {
 
   fn conn(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
     self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))
+  }
+
+  fn has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let n: i64 = conn.query_row(
+      "SELECT COUNT(1) FROM pragma_table_info(?1) WHERE name=?2",
+      params![table, column],
+      |r| r.get(0),
+    )?;
+    Ok(n > 0)
+  }
+
+  fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> anyhow::Result<()> {
+    if Self::has_column(conn, table, column)? {
+      return Ok(());
+    }
+    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"), [])?;
+    Ok(())
+  }
+
+  fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
+    // Additive migrations for older local DBs. Keep these idempotent.
+    // clients
+    for (col, ddl) in [
+      ("first_name", "TEXT"),
+      ("last_name", "TEXT"),
+      ("parent_name", "TEXT"),
+      ("dob", "TEXT"),
+      ("gender", "TEXT"),
+      ("city", "TEXT"),
+      ("address", "TEXT"),
+      ("allergies", "TEXT"),
+      ("weight_kg", "REAL"),
+      ("height_cm", "REAL"),
+      ("patient_code", "TEXT"),
+    ] {
+      Self::add_column_if_missing(conn, "clients", col, ddl)?;
+    }
+
+    // doctors
+    for (col, ddl) in [("code", "TEXT"), ("title", "TEXT"), ("specialty", "TEXT")] {
+      Self::add_column_if_missing(conn, "doctors", col, ddl)?;
+    }
+
+    // services
+    Self::add_column_if_missing(conn, "services", "vat_code", "TEXT NOT NULL DEFAULT 'C'")?;
+
+    // sales
+    Self::add_column_if_missing(conn, "sales", "fiscalized", "INTEGER NOT NULL DEFAULT 0")?;
+    Self::add_column_if_missing(conn, "sales", "fiscalized_at", "TEXT")?;
+
+    // visit_items
+    Self::add_column_if_missing(conn, "visit_items", "vat_code", "TEXT NOT NULL DEFAULT 'C'")?;
+    Self::add_column_if_missing(conn, "visit_items", "fiscalized", "INTEGER NOT NULL DEFAULT 0")?;
+    Self::add_column_if_missing(conn, "visit_items", "fiscalized_at", "TEXT")?;
+
+    // Ensure new indexes exist.
+    // Note: indexes are safe to re-run with IF NOT EXISTS.
+    conn.execute_batch(
+      r#"
+      CREATE INDEX IF NOT EXISTS idx_clients_updated_at ON clients(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_clients_patient_code ON clients(patient_code);
+
+      CREATE INDEX IF NOT EXISTS idx_sales_client_id ON sales(client_id);
+      CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(date);
+      CREATE INDEX IF NOT EXISTS idx_sales_updated_at ON sales(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_sales_fiscalized ON sales(fiscalized);
+
+      CREATE INDEX IF NOT EXISTS idx_payments_client_id ON payments(client_id);
+      CREATE INDEX IF NOT EXISTS idx_payments_sale_id ON payments(sale_id);
+      CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(date);
+      CREATE INDEX IF NOT EXISTS idx_payments_updated_at ON payments(updated_at);
+
+      CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON sync_queue(status);
+      CREATE INDEX IF NOT EXISTS idx_sync_queue_created_at ON sync_queue(created_at);
+      CREATE INDEX IF NOT EXISTS idx_sync_queue_table_row ON sync_queue(table_name, row_id);
+
+      CREATE INDEX IF NOT EXISTS idx_doctors_updated_at ON doctors(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_doctors_code ON doctors(code);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_doctors_code_unique ON doctors(code) WHERE code IS NOT NULL AND code <> '' AND deleted = 0;
+
+      CREATE INDEX IF NOT EXISTS idx_doctor_accounts_is_admin ON doctor_accounts(is_admin);
+      CREATE INDEX IF NOT EXISTS idx_doctor_accounts_updated_at ON doctor_accounts(updated_at);
+
+      CREATE INDEX IF NOT EXISTS idx_services_updated_at ON services(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_services_vat_code ON services(vat_code);
+
+      CREATE INDEX IF NOT EXISTS idx_appointments_client_id ON appointments(client_id);
+      CREATE INDEX IF NOT EXISTS idx_appointments_doctor_id ON appointments(doctor_id);
+      CREATE INDEX IF NOT EXISTS idx_appointments_start_at ON appointments(start_at);
+      CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
+      CREATE INDEX IF NOT EXISTS idx_appointments_updated_at ON appointments(updated_at);
+
+      CREATE INDEX IF NOT EXISTS idx_visits_client_id ON visits(client_id);
+      CREATE INDEX IF NOT EXISTS idx_visits_doctor_id ON visits(doctor_id);
+      CREATE INDEX IF NOT EXISTS idx_visits_date ON visits(date);
+      CREATE INDEX IF NOT EXISTS idx_visits_status ON visits(status);
+      CREATE INDEX IF NOT EXISTS idx_visits_updated_at ON visits(updated_at);
+
+      CREATE INDEX IF NOT EXISTS idx_visit_items_visit_id ON visit_items(visit_id);
+      CREATE INDEX IF NOT EXISTS idx_visit_items_client_id ON visit_items(client_id);
+      CREATE INDEX IF NOT EXISTS idx_visit_items_updated_at ON visit_items(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_visit_items_fiscalized ON visit_items(fiscalized);
+
+      CREATE INDEX IF NOT EXISTS idx_cash_ledger_type ON cash_ledger(type);
+      CREATE INDEX IF NOT EXISTS idx_cash_ledger_date ON cash_ledger(date);
+      CREATE INDEX IF NOT EXISTS idx_cash_ledger_updated_at ON cash_ledger(updated_at);
+      "#,
+    )?;
+
+    Ok(())
   }
 
   pub fn settings_get_all(&self) -> anyhow::Result<HashMap<String, String>> {
@@ -348,9 +437,13 @@ impl Db {
     if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
       let like = format!("%{}%", s.trim());
       let mut stmt = conn.prepare(
-        "SELECT id, name, phone, email, notes, created_at, updated_at, deleted
+        "SELECT id, name, phone, email, notes,
+                first_name, last_name, parent_name, dob, gender, city, address, allergies, weight_kg, height_cm, patient_code,
+                created_at, updated_at, deleted
          FROM clients
-         WHERE deleted = 0 AND (name LIKE ?1 OR phone LIKE ?1 OR email LIKE ?1)
+         WHERE deleted = 0 AND (
+           name LIKE ?1 OR phone LIKE ?1 OR email LIKE ?1 OR COALESCE(patient_code,'') LIKE ?1
+         )
          ORDER BY updated_at DESC
          LIMIT 1000",
       )?;
@@ -361,9 +454,20 @@ impl Db {
           phone: row.get(2)?,
           email: row.get(3)?,
           notes: row.get(4)?,
-          created_at: row.get(5)?,
-          updated_at: row.get(6)?,
-          deleted: row.get(7)?,
+          first_name: row.get(5)?,
+          last_name: row.get(6)?,
+          parent_name: row.get(7)?,
+          dob: row.get(8)?,
+          gender: row.get(9)?,
+          city: row.get(10)?,
+          address: row.get(11)?,
+          allergies: row.get(12)?,
+          weight_kg: row.get(13)?,
+          height_cm: row.get(14)?,
+          patient_code: row.get(15)?,
+          created_at: row.get(16)?,
+          updated_at: row.get(17)?,
+          deleted: row.get(18)?,
         })
       })?;
       for r in rows {
@@ -373,7 +477,9 @@ impl Db {
     }
 
     let mut stmt = conn.prepare(
-      "SELECT id, name, phone, email, notes, created_at, updated_at, deleted
+      "SELECT id, name, phone, email, notes,
+              first_name, last_name, parent_name, dob, gender, city, address, allergies, weight_kg, height_cm, patient_code,
+              created_at, updated_at, deleted
        FROM clients
        WHERE deleted = 0
        ORDER BY updated_at DESC
@@ -386,9 +492,20 @@ impl Db {
         phone: row.get(2)?,
         email: row.get(3)?,
         notes: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        deleted: row.get(7)?,
+        first_name: row.get(5)?,
+        last_name: row.get(6)?,
+        parent_name: row.get(7)?,
+        dob: row.get(8)?,
+        gender: row.get(9)?,
+        city: row.get(10)?,
+        address: row.get(11)?,
+        allergies: row.get(12)?,
+        weight_kg: row.get(13)?,
+        height_cm: row.get(14)?,
+        patient_code: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        deleted: row.get(18)?,
       })
     })?;
     for r in rows {
@@ -402,7 +519,10 @@ impl Db {
     Ok(
       conn
         .query_row(
-          "SELECT id, name, phone, email, notes, created_at, updated_at, deleted FROM clients WHERE id=?1",
+          "SELECT id, name, phone, email, notes,
+                  first_name, last_name, parent_name, dob, gender, city, address, allergies, weight_kg, height_cm, patient_code,
+                  created_at, updated_at, deleted
+           FROM clients WHERE id=?1",
           params![id],
           |row| {
             Ok(Client {
@@ -411,9 +531,20 @@ impl Db {
               phone: row.get(2)?,
               email: row.get(3)?,
               notes: row.get(4)?,
-              created_at: row.get(5)?,
-              updated_at: row.get(6)?,
-              deleted: row.get(7)?,
+              first_name: row.get(5)?,
+              last_name: row.get(6)?,
+              parent_name: row.get(7)?,
+              dob: row.get(8)?,
+              gender: row.get(9)?,
+              city: row.get(10)?,
+              address: row.get(11)?,
+              allergies: row.get(12)?,
+              weight_kg: row.get(13)?,
+              height_cm: row.get(14)?,
+              patient_code: row.get(15)?,
+              created_at: row.get(16)?,
+              updated_at: row.get(17)?,
+              deleted: row.get(18)?,
             })
           },
         )
@@ -430,6 +561,17 @@ impl Db {
     let phone = input.phone;
     let email = input.email;
     let notes = input.notes;
+    let first_name = input.first_name;
+    let last_name = input.last_name;
+    let parent_name = input.parent_name;
+    let dob = input.dob;
+    let gender = input.gender;
+    let city = input.city;
+    let address = input.address;
+    let allergies = input.allergies;
+    let weight_kg = input.weight_kg;
+    let height_cm = input.height_cm;
+    let patient_code = input.patient_code;
     let now = now_iso();
 
     let mut conn = self.conn()?;
@@ -440,16 +582,50 @@ impl Db {
     let created_at = existing_created_at.unwrap_or_else(|| now.clone());
 
     tx.execute(
-      "INSERT INTO clients (id, name, phone, email, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+      "INSERT INTO clients (id, name, phone, email, notes,
+                            first_name, last_name, parent_name, dob, gender, city, address, allergies, weight_kg, height_cm, patient_code,
+                            created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5,
+               ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+               ?17, ?18, 0)
        ON CONFLICT(id) DO UPDATE SET
          name=excluded.name,
          phone=excluded.phone,
          email=excluded.email,
          notes=excluded.notes,
+         first_name=excluded.first_name,
+         last_name=excluded.last_name,
+         parent_name=excluded.parent_name,
+         dob=excluded.dob,
+         gender=excluded.gender,
+         city=excluded.city,
+         address=excluded.address,
+         allergies=excluded.allergies,
+         weight_kg=excluded.weight_kg,
+         height_cm=excluded.height_cm,
+         patient_code=excluded.patient_code,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
-      params![id, name, &phone, &email, &notes, &created_at, &now],
+      params![
+        id,
+        name,
+        &phone,
+        &email,
+        &notes,
+        &first_name,
+        &last_name,
+        &parent_name,
+        &dob,
+        &gender,
+        &city,
+        &address,
+        &allergies,
+        &weight_kg,
+        &height_cm,
+        &patient_code,
+        &created_at,
+        &now
+      ],
     )?;
     let row = Client {
       id: id.clone(),
@@ -457,6 +633,17 @@ impl Db {
       phone,
       email,
       notes,
+      first_name,
+      last_name,
+      parent_name,
+      dob,
+      gender,
+      city,
+      address,
+      allergies,
+      weight_kg,
+      height_cm,
+      patient_code,
       created_at: created_at.clone(),
       updated_at: now.clone(),
       deleted: 0,
@@ -477,7 +664,10 @@ impl Db {
     tx.execute("UPDATE clients SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
     let row = tx
       .query_row(
-        "SELECT id, name, phone, email, notes, created_at, updated_at, deleted FROM clients WHERE id=?1",
+        "SELECT id, name, phone, email, notes,
+                first_name, last_name, parent_name, dob, gender, city, address, allergies, weight_kg, height_cm, patient_code,
+                created_at, updated_at, deleted
+         FROM clients WHERE id=?1",
         params![id],
         |r| {
           Ok(Client {
@@ -486,9 +676,20 @@ impl Db {
             phone: r.get(2)?,
             email: r.get(3)?,
             notes: r.get(4)?,
-            created_at: r.get(5)?,
-            updated_at: r.get(6)?,
-            deleted: r.get(7)?,
+            first_name: r.get(5)?,
+            last_name: r.get(6)?,
+            parent_name: r.get(7)?,
+            dob: r.get(8)?,
+            gender: r.get(9)?,
+            city: r.get(10)?,
+            address: r.get(11)?,
+            allergies: r.get(12)?,
+            weight_kg: r.get(13)?,
+            height_cm: r.get(14)?,
+            patient_code: r.get(15)?,
+            created_at: r.get(16)?,
+            updated_at: r.get(17)?,
+            deleted: r.get(18)?,
           })
         },
       )
@@ -505,7 +706,7 @@ impl Db {
     let include_deleted = f.include_deleted.unwrap_or(false);
 
     let mut sql = String::from(
-      "SELECT id, client_id, date, total, notes, created_at, updated_at, deleted
+      "SELECT id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted
        FROM sales WHERE 1=1",
     );
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
@@ -538,9 +739,78 @@ impl Db {
         date: row.get(2)?,
         total: row.get(3)?,
         notes: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        deleted: row.get(7)?,
+        fiscalized: row.get(5)?,
+        fiscalized_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        deleted: row.get(9)?,
+      })
+    })?;
+    for r in rows {
+      out.push(r?);
+    }
+    Ok(out)
+  }
+
+  // Cashier view: only show fiscal part of a sale (hide non-fiscal-only sales).
+  // For sales without item lines, we assume they are fiscal (sale.total).
+  pub fn sales_list_fiscal_only(&self, filters: Option<SalesListFilters>) -> anyhow::Result<Vec<Sale>> {
+    let f = filters.unwrap_or_default();
+    let include_deleted = f.include_deleted.unwrap_or(false);
+
+    let mut sql = String::from(
+      "SELECT s.id, s.client_id, s.date,
+              CASE
+                WHEN COALESCE(SUM(CASE WHEN vi.deleted = 0 THEN 1 ELSE 0 END), 0) > 0
+                THEN COALESCE(SUM(CASE WHEN vi.deleted = 0 AND vi.fiscal = 1 THEN (vi.qty * vi.unit_price) ELSE 0 END), 0)
+                ELSE s.total
+              END AS total_effective,
+              s.notes, s.fiscalized, s.fiscalized_at, s.created_at, s.updated_at, s.deleted
+       FROM sales s
+       LEFT JOIN visit_items vi ON vi.visit_id = s.id
+       WHERE 1=1",
+    );
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+
+    if !include_deleted {
+      sql.push_str(" AND s.deleted = 0");
+    }
+    if let Some(cid) = f.client_id.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND s.client_id = ?{}", args.len() + 1));
+      args.push(cid.into());
+    }
+    if let Some(d) = f.date_from.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND s.date >= ?{}", args.len() + 1));
+      args.push(d.into());
+    }
+    if let Some(d) = f.date_to.filter(|x| !x.trim().is_empty()) {
+      sql.push_str(&format!(" AND s.date <= ?{}", args.len() + 1));
+      args.push(d.into());
+    }
+
+    sql.push_str(" GROUP BY s.id");
+    sql.push_str(
+      " HAVING
+          COALESCE(SUM(CASE WHEN vi.deleted = 0 THEN 1 ELSE 0 END), 0) = 0
+          OR COALESCE(SUM(CASE WHEN vi.deleted = 0 AND vi.fiscal = 1 THEN (vi.qty * vi.unit_price) ELSE 0 END), 0) > 0",
+    );
+    sql.push_str(" ORDER BY s.date DESC, s.updated_at DESC LIMIT 2000");
+
+    let conn = self.conn()?;
+    let mut stmt = conn.prepare(&sql)?;
+    let mut out = Vec::new();
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+      Ok(Sale {
+        id: row.get(0)?,
+        client_id: row.get(1)?,
+        date: row.get(2)?,
+        total: row.get(3)?,
+        notes: row.get(4)?,
+        fiscalized: row.get(5)?,
+        fiscalized_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        deleted: row.get(9)?,
       })
     })?;
     for r in rows {
@@ -646,12 +916,113 @@ impl Db {
     })
   }
 
+  pub fn sales_daily_report_for_doctor(&self, date: &str, doctor_id: &str) -> anyhow::Result<crate::models::DailySalesReport> {
+    let date = date.trim();
+    if date.is_empty() {
+      bail!("date eshte i detyrueshem");
+    }
+    let doctor_id = doctor_id.trim();
+    if doctor_id.is_empty() {
+      bail!("doctor_id eshte i detyrueshem");
+    }
+
+    let conn = self.conn()?;
+    let mut stmt = conn.prepare(
+      "SELECT s.id, s.client_id, COALESCE(c.name, '') AS client_name, s.date, s.total, s.notes, s.updated_at,
+              COALESCE(SUM(CASE WHEN vi.deleted = 0 AND vi.fiscal = 1 THEN (vi.qty * vi.unit_price) ELSE 0 END), 0) AS fiscal_sum,
+              COALESCE(SUM(CASE WHEN vi.deleted = 0 AND vi.fiscal = 0 THEN (vi.qty * vi.unit_price) ELSE 0 END), 0) AS non_fiscal_sum,
+              COALESCE(SUM(CASE WHEN vi.deleted = 0 THEN 1 ELSE 0 END), 0) AS item_count
+       FROM sales s
+       INNER JOIN visits v ON v.id = s.id
+       LEFT JOIN clients c ON c.id = s.client_id
+       LEFT JOIN visit_items vi ON vi.visit_id = s.id
+       WHERE s.deleted = 0 AND v.deleted = 0 AND s.date = ?1 AND v.doctor_id = ?2
+       GROUP BY s.id
+       ORDER BY s.updated_at DESC",
+    )?;
+
+    let rows = stmt.query_map(params![date, doctor_id], |row| {
+      let sale_id: String = row.get(0)?;
+      let client_id: String = row.get(1)?;
+      let client_name: String = row.get(2)?;
+      let sale_date: Option<String> = row.get(3)?;
+      let sale_total: f64 = row.get(4)?;
+      let notes: Option<String> = row.get(5)?;
+      let updated_at: String = row.get(6)?;
+      let fiscal_sum: f64 = row.get(7)?;
+      let non_fiscal_sum: f64 = row.get(8)?;
+      let item_count: i64 = row.get(9)?;
+
+      let (fiscal_total, non_fiscal_total, total) = if item_count > 0 {
+        let total = fiscal_sum + non_fiscal_sum;
+        (fiscal_sum, non_fiscal_sum, total)
+      } else {
+        (sale_total, 0.0, sale_total)
+      };
+
+      let classification = if fiscal_total > 0.0 && non_fiscal_total > 0.0 {
+        "mixed"
+      } else if non_fiscal_total > 0.0 {
+        "non_fiscal"
+      } else {
+        "fiscal"
+      };
+
+      Ok(crate::models::DailySaleRow {
+        sale_id,
+        client_id,
+        client_name,
+        date: sale_date,
+        total,
+        fiscal_total,
+        non_fiscal_total,
+        notes,
+        updated_at,
+        classification: classification.to_string(),
+      })
+    })?;
+
+    let mut out_rows: Vec<crate::models::DailySaleRow> = Vec::new();
+    for r in rows {
+      out_rows.push(r?);
+    }
+
+    let mut fiscal_total = 0.0_f64;
+    let mut non_fiscal_total = 0.0_f64;
+    let mut count_fiscal_only = 0_i64;
+    let mut count_non_fiscal_only = 0_i64;
+    let mut count_mixed = 0_i64;
+
+    for r in &out_rows {
+      fiscal_total += r.fiscal_total;
+      non_fiscal_total += r.non_fiscal_total;
+      match r.classification.as_str() {
+        "mixed" => count_mixed += 1,
+        "non_fiscal" => count_non_fiscal_only += 1,
+        _ => count_fiscal_only += 1,
+      }
+    }
+
+    Ok(crate::models::DailySalesReport {
+      date: date.to_string(),
+      total: fiscal_total + non_fiscal_total,
+      fiscal_total,
+      non_fiscal_total,
+      count_sales: out_rows.len() as i64,
+      count_fiscal_only,
+      count_non_fiscal_only,
+      count_mixed,
+      rows: out_rows,
+    })
+  }
+
   pub fn sales_get(&self, id: &str) -> anyhow::Result<Option<Sale>> {
     let conn = self.conn()?;
     Ok(
       conn
         .query_row(
-          "SELECT id, client_id, date, total, notes, created_at, updated_at, deleted FROM sales WHERE id=?1",
+          "SELECT id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted
+           FROM sales WHERE id=?1",
           params![id],
           |row| {
             Ok(Sale {
@@ -660,9 +1031,11 @@ impl Db {
               date: row.get(2)?,
               total: row.get(3)?,
               notes: row.get(4)?,
-              created_at: row.get(5)?,
-              updated_at: row.get(6)?,
-              deleted: row.get(7)?,
+              fiscalized: row.get(5)?,
+              fiscalized_at: row.get(6)?,
+              created_at: row.get(7)?,
+              updated_at: row.get(8)?,
+              deleted: row.get(9)?,
             })
           },
         )
@@ -686,22 +1059,30 @@ impl Db {
 
     let mut conn = self.conn()?;
     let tx = conn.transaction()?;
-    let existing_created_at: Option<String> = tx
-      .query_row("SELECT created_at FROM sales WHERE id=?1", params![id], |row| row.get(0))
+    let existing: Option<(String, i64, Option<String>)> = tx
+      .query_row(
+        "SELECT created_at, fiscalized, fiscalized_at FROM sales WHERE id=?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+      )
       .optional()?;
-    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+    let created_at = existing.as_ref().map(|x| x.0.clone()).unwrap_or_else(|| now.clone());
+    let fiscalized = existing.as_ref().map(|x| x.1).unwrap_or(0);
+    let fiscalized_at: Option<String> = existing.and_then(|x| x.2);
 
     tx.execute(
-      "INSERT INTO sales (id, client_id, date, total, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+      "INSERT INTO sales (id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
        ON CONFLICT(id) DO UPDATE SET
          client_id=excluded.client_id,
          date=excluded.date,
          total=excluded.total,
          notes=excluded.notes,
+         fiscalized=excluded.fiscalized,
+         fiscalized_at=excluded.fiscalized_at,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
-      params![id, &client_id, &date, total, &notes, &created_at, &now],
+      params![id, &client_id, &date, total, &notes, fiscalized, &fiscalized_at, &created_at, &now],
     )?;
     let row = Sale {
       id: id.clone(),
@@ -709,6 +1090,8 @@ impl Db {
       date,
       total,
       notes,
+      fiscalized,
+      fiscalized_at,
       created_at: created_at.clone(),
       updated_at: now.clone(),
       deleted: 0,
@@ -729,7 +1112,7 @@ impl Db {
     tx.execute("UPDATE sales SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
     let row = tx
       .query_row(
-        "SELECT id, client_id, date, total, notes, created_at, updated_at, deleted FROM sales WHERE id=?1",
+        "SELECT id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted FROM sales WHERE id=?1",
         params![id],
         |r| {
           Ok(Sale {
@@ -738,9 +1121,11 @@ impl Db {
             date: r.get(2)?,
             total: r.get(3)?,
             notes: r.get(4)?,
-            created_at: r.get(5)?,
-            updated_at: r.get(6)?,
-            deleted: r.get(7)?,
+            fiscalized: r.get(5)?,
+            fiscalized_at: r.get(6)?,
+            created_at: r.get(7)?,
+            updated_at: r.get(8)?,
+            deleted: r.get(9)?,
           })
         },
       )
@@ -750,6 +1135,172 @@ impl Db {
     Self::queue_replace_pending_tx(&tx, "sales", &row.id, "delete", &payload, &now)?;
     tx.commit()?;
     Ok(())
+  }
+
+  pub fn fiscal_receipt_generate_inp(&self, sale_id: &str, output_dir: &Path) -> anyhow::Result<PathBuf> {
+    let sale_id = sale_id.trim();
+    if sale_id.is_empty() {
+      bail!("sale_id eshte i detyrueshem");
+    }
+
+    fs::create_dir_all(output_dir).with_context(|| format!("create fiscal dir: {}", output_dir.display()))?;
+
+    let now = now_iso();
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
+
+    let sale: Sale = tx
+      .query_row(
+        "SELECT id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted
+         FROM sales WHERE id=?1",
+        params![sale_id],
+        |row| {
+          Ok(Sale {
+            id: row.get(0)?,
+            client_id: row.get(1)?,
+            date: row.get(2)?,
+            total: row.get(3)?,
+            notes: row.get(4)?,
+            fiscalized: row.get(5)?,
+            fiscalized_at: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+            deleted: row.get(9)?,
+          })
+        },
+      )
+      .optional()?
+      .ok_or_else(|| anyhow!("fatura nuk u gjet"))?;
+    if sale.deleted != 0 {
+      bail!("fatura eshte e fshire");
+    }
+
+    let client: Client = tx
+      .query_row(
+        "SELECT id, name, phone, email, notes,
+                first_name, last_name, parent_name, dob, gender, city, address, allergies, weight_kg, height_cm, patient_code,
+                created_at, updated_at, deleted
+         FROM clients WHERE id=?1",
+        params![&sale.client_id],
+        |row| {
+          Ok(Client {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            phone: row.get(2)?,
+            email: row.get(3)?,
+            notes: row.get(4)?,
+            first_name: row.get(5)?,
+            last_name: row.get(6)?,
+            parent_name: row.get(7)?,
+            dob: row.get(8)?,
+            gender: row.get(9)?,
+            city: row.get(10)?,
+            address: row.get(11)?,
+            allergies: row.get(12)?,
+            weight_kg: row.get(13)?,
+            height_cm: row.get(14)?,
+            patient_code: row.get(15)?,
+            created_at: row.get(16)?,
+            updated_at: row.get(17)?,
+            deleted: row.get(18)?,
+          })
+        },
+      )
+      .optional()?
+      .ok_or_else(|| anyhow!("pacienti nuk u gjet"))?;
+
+    // Only fiscal (kupon) rows that haven't been fiscalized yet.
+    let mut items: Vec<VisitItem> = Vec::new();
+    {
+      let mut stmt = tx.prepare(
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+         FROM visit_items
+         WHERE visit_id=?1 AND deleted=0 AND fiscal=1 AND fiscalized=0
+         ORDER BY created_at ASC",
+      )?;
+      let rows = stmt.query_map(params![sale_id], |row| {
+        Ok(VisitItem {
+          id: row.get(0)?,
+          visit_id: row.get(1)?,
+          client_id: row.get(2)?,
+          tooth: row.get(3)?,
+          title: row.get(4)?,
+          qty: row.get(5)?,
+          unit_price: row.get(6)?,
+          fiscal: row.get(7)?,
+          vat_code: row.get(8)?,
+          fiscalized: row.get(9)?,
+          fiscalized_at: row.get(10)?,
+          notes: row.get(11)?,
+          created_at: row.get(12)?,
+          updated_at: row.get(13)?,
+          deleted: row.get(14)?,
+        })
+      })?;
+      for r in rows {
+        items.push(r?);
+      }
+    }
+    if items.is_empty() {
+      bail!("nuk ka rreshta fiskal pa fiskalizuar");
+    }
+
+    // Create the .inp file (generic text format; integrate with your fiscal printer software).
+    let file_name = format!("kupon-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]);
+    let path = output_dir.join(file_name);
+    let mut body = String::new();
+    body.push_str("MJEKU_FISCAL_INP\n");
+    body.push_str(&format!("sale_id={}\n", sale.id));
+    body.push_str(&format!("date={}\n", sale.date.clone().unwrap_or_default()));
+    body.push_str(&format!("client_name={}\n", client.name));
+    body.push_str(&format!("client_phone={}\n", client.phone.clone().unwrap_or_default()));
+    body.push_str("items:\n");
+    let mut total = 0.0_f64;
+    for it in &items {
+      let sub = it.qty * it.unit_price;
+      total += sub;
+      body.push_str(&format!(
+        "- tooth={} title={} qty={} unit_price={} total={} vat_code={}\n",
+        it.tooth.clone().unwrap_or_default(),
+        it.title.replace('\n', " ").replace('\r', " "),
+        it.qty,
+        it.unit_price,
+        sub,
+        it.vat_code
+      ));
+    }
+    body.push_str(&format!("TOTAL={}\n", total));
+    fs::write(&path, body.as_bytes()).with_context(|| format!("write inp: {}", path.display()))?;
+
+    // Mark items as fiscalized and queue them for sync.
+    for it in &mut items {
+      tx.execute(
+        "UPDATE visit_items SET fiscalized=1, fiscalized_at=?2, updated_at=?2 WHERE id=?1",
+        params![&it.id, &now],
+      )?;
+      it.fiscalized = 1;
+      it.fiscalized_at = Some(now.clone());
+      it.updated_at = now.clone();
+      let payload = serde_json::to_string(&it)?;
+      Self::queue_replace_pending_tx(&tx, "visit_items", &it.id, "upsert", &payload, &now)?;
+    }
+
+    // Mark the sale as fiscalized (at least once). If more fiscal rows are added later, it can be fiscalized again.
+    tx.execute(
+      "UPDATE sales SET fiscalized=1, fiscalized_at=?2, updated_at=?2 WHERE id=?1",
+      params![sale_id, &now],
+    )?;
+    let updated_sale = Sale {
+      fiscalized: 1,
+      fiscalized_at: Some(now.clone()),
+      updated_at: now.clone(),
+      ..sale
+    };
+    let payload = serde_json::to_string(&updated_sale)?;
+    Self::queue_replace_pending_tx(&tx, "sales", &updated_sale.id, "upsert", &payload, &now)?;
+
+    tx.commit()?;
+    Ok(path)
   }
 
   pub fn payments_list(&self, filters: Option<PaymentsListFilters>) -> anyhow::Result<Vec<Payment>> {
@@ -942,23 +1493,71 @@ impl Db {
     Ok(
       conn
         .query_row(
-          "SELECT id, name, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
+          "SELECT id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
           params![id],
           |row| {
             Ok(Doctor {
               id: row.get(0)?,
-              name: row.get(1)?,
-              phone: row.get(2)?,
-              email: row.get(3)?,
-              notes: row.get(4)?,
-              created_at: row.get(5)?,
-              updated_at: row.get(6)?,
-              deleted: row.get(7)?,
+              code: row.get(1)?,
+              name: row.get(2)?,
+              title: row.get(3)?,
+              specialty: row.get(4)?,
+              phone: row.get(5)?,
+              email: row.get(6)?,
+              notes: row.get(7)?,
+              created_at: row.get(8)?,
+              updated_at: row.get(9)?,
+              deleted: row.get(10)?,
             })
           },
         )
         .optional()?,
     )
+  }
+
+  pub fn doctors_get_by_code(&self, code: &str) -> anyhow::Result<Option<Doctor>> {
+    let code = code.trim();
+    if code.is_empty() {
+      return Ok(None);
+    }
+    let conn = self.conn()?;
+    Ok(
+      conn
+        .query_row(
+          "SELECT id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted
+           FROM doctors
+           WHERE deleted = 0 AND LOWER(COALESCE(code,'')) = LOWER(?1)
+           LIMIT 1",
+          params![code],
+          |row| {
+            Ok(Doctor {
+              id: row.get(0)?,
+              code: row.get(1)?,
+              name: row.get(2)?,
+              title: row.get(3)?,
+              specialty: row.get(4)?,
+              phone: row.get(5)?,
+              email: row.get(6)?,
+              notes: row.get(7)?,
+              created_at: row.get(8)?,
+              updated_at: row.get(9)?,
+              deleted: row.get(10)?,
+            })
+          },
+        )
+        .optional()?,
+    )
+  }
+
+  pub fn doctor_id_from_code_or_id(&self, code_or_id: &str) -> anyhow::Result<Option<String>> {
+    let s = code_or_id.trim();
+    if s.is_empty() {
+      return Ok(None);
+    }
+    if let Some(d) = self.doctors_get(s)?.filter(|d| d.deleted == 0) {
+      return Ok(Some(d.id));
+    }
+    Ok(self.doctors_get_by_code(s)?.map(|d| d.id))
   }
 
   pub fn doctor_account_get(&self, doctor_id: &str) -> anyhow::Result<Option<(String, String, bool)>> {
@@ -1009,22 +1608,25 @@ impl Db {
     if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
       let like = format!("%{}%", s.trim());
       let mut stmt = conn.prepare(
-        "SELECT id, name, phone, email, notes, created_at, updated_at, deleted
+        "SELECT id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted
          FROM doctors
-         WHERE deleted = 0 AND (name LIKE ?1 OR phone LIKE ?1 OR email LIKE ?1)
+         WHERE deleted = 0 AND (name LIKE ?1 OR phone LIKE ?1 OR email LIKE ?1 OR COALESCE(code,'') LIKE ?1)
          ORDER BY updated_at DESC
          LIMIT 1000",
       )?;
       let rows = stmt.query_map(params![like], |row| {
         Ok(Doctor {
           id: row.get(0)?,
-          name: row.get(1)?,
-          phone: row.get(2)?,
-          email: row.get(3)?,
-          notes: row.get(4)?,
-          created_at: row.get(5)?,
-          updated_at: row.get(6)?,
-          deleted: row.get(7)?,
+          code: row.get(1)?,
+          name: row.get(2)?,
+          title: row.get(3)?,
+          specialty: row.get(4)?,
+          phone: row.get(5)?,
+          email: row.get(6)?,
+          notes: row.get(7)?,
+          created_at: row.get(8)?,
+          updated_at: row.get(9)?,
+          deleted: row.get(10)?,
         })
       })?;
       for r in rows {
@@ -1034,7 +1636,7 @@ impl Db {
     }
 
     let mut stmt = conn.prepare(
-      "SELECT id, name, phone, email, notes, created_at, updated_at, deleted
+      "SELECT id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted
        FROM doctors
        WHERE deleted = 0
        ORDER BY updated_at DESC
@@ -1043,13 +1645,16 @@ impl Db {
     let rows = stmt.query_map([], |row| {
       Ok(Doctor {
         id: row.get(0)?,
-        name: row.get(1)?,
-        phone: row.get(2)?,
-        email: row.get(3)?,
-        notes: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        deleted: row.get(7)?,
+        code: row.get(1)?,
+        name: row.get(2)?,
+        title: row.get(3)?,
+        specialty: row.get(4)?,
+        phone: row.get(5)?,
+        email: row.get(6)?,
+        notes: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+        deleted: row.get(10)?,
       })
     })?;
     for r in rows {
@@ -1061,7 +1666,7 @@ impl Db {
   pub fn doctors_login_options(&self) -> anyhow::Result<Vec<crate::models::DoctorLoginOption>> {
     let conn = self.conn()?;
     let mut stmt = conn.prepare(
-      "SELECT d.id, d.name,
+      "SELECT d.id, d.code, d.name, d.title, d.specialty,
               CASE WHEN a.doctor_id IS NULL THEN 0 ELSE 1 END AS has_account,
               COALESCE(a.is_admin, 0) AS is_admin
        FROM doctors d
@@ -1072,9 +1677,12 @@ impl Db {
     let rows = stmt.query_map([], |row| {
       Ok(crate::models::DoctorLoginOption {
         id: row.get(0)?,
-        name: row.get(1)?,
-        has_account: row.get::<_, i64>(2)? == 1,
-        is_admin: row.get::<_, i64>(3)? == 1,
+        code: row.get(1)?,
+        name: row.get(2)?,
+        title: row.get(3)?,
+        specialty: row.get(4)?,
+        has_account: row.get::<_, i64>(5)? == 1,
+        is_admin: row.get::<_, i64>(6)? == 1,
       })
     })?;
     let mut out = Vec::new();
@@ -1090,6 +1698,9 @@ impl Db {
       bail!("doctor name is required");
     }
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let code = input.code.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+    let title = input.title.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+    let specialty = input.specialty.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
     let phone = input.phone;
     let email = input.email;
     let notes = input.notes;
@@ -1097,26 +1708,58 @@ impl Db {
 
     let mut conn = self.conn()?;
     let tx = conn.transaction()?;
+
+    // Ensure code uniqueness among non-deleted doctors.
+    if let Some(c) = code.as_deref() {
+      let existing: Option<String> = tx
+        .query_row(
+          "SELECT id FROM doctors WHERE deleted = 0 AND LOWER(COALESCE(code,'')) = LOWER(?1) AND id <> ?2 LIMIT 1",
+          params![c, &id],
+          |r| r.get(0),
+        )
+        .optional()?;
+      if existing.is_some() {
+        bail!("kodi i mjekut ekziston. perdor nje kod tjeter");
+      }
+    }
+
     let existing_created_at: Option<String> = tx
       .query_row("SELECT created_at FROM doctors WHERE id=?1", params![id], |row| row.get(0))
       .optional()?;
     let created_at = existing_created_at.unwrap_or_else(|| now.clone());
 
     tx.execute(
-      "INSERT INTO doctors (id, name, phone, email, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+      "INSERT INTO doctors (id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)
        ON CONFLICT(id) DO UPDATE SET
+         code=excluded.code,
          name=excluded.name,
+         title=excluded.title,
+         specialty=excluded.specialty,
          phone=excluded.phone,
          email=excluded.email,
          notes=excluded.notes,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
-      params![id, name, &phone, &email, &notes, &created_at, &now],
+      params![
+        id,
+        &code,
+        name,
+        &title,
+        &specialty,
+        &phone,
+        &email,
+        &notes,
+        &created_at,
+        &now
+      ],
     )?;
     let row = Doctor {
       id: id.clone(),
+      code,
       name: name.to_string(),
+      title,
+      specialty,
       phone,
       email,
       notes,
@@ -1142,18 +1785,21 @@ impl Db {
     let _ = tx.execute("DELETE FROM doctor_accounts WHERE doctor_id=?1", params![id]);
     let row = tx
       .query_row(
-        "SELECT id, name, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
+        "SELECT id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
         params![id],
         |r| {
           Ok(Doctor {
             id: r.get(0)?,
-            name: r.get(1)?,
-            phone: r.get(2)?,
-            email: r.get(3)?,
-            notes: r.get(4)?,
-            created_at: r.get(5)?,
-            updated_at: r.get(6)?,
-            deleted: r.get(7)?,
+            code: r.get(1)?,
+            name: r.get(2)?,
+            title: r.get(3)?,
+            specialty: r.get(4)?,
+            phone: r.get(5)?,
+            email: r.get(6)?,
+            notes: r.get(7)?,
+            created_at: r.get(8)?,
+            updated_at: r.get(9)?,
+            deleted: r.get(10)?,
           })
         },
       )
@@ -1172,7 +1818,7 @@ impl Db {
     if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
       let like = format!("%{}%", s.trim());
       let mut stmt = conn.prepare(
-        "SELECT id, title, default_price, notes, created_at, updated_at, deleted
+        "SELECT id, title, default_price, vat_code, notes, created_at, updated_at, deleted
          FROM services
          WHERE deleted = 0 AND (title LIKE ?1 OR notes LIKE ?1)
          ORDER BY updated_at DESC
@@ -1183,10 +1829,11 @@ impl Db {
           id: row.get(0)?,
           title: row.get(1)?,
           default_price: row.get(2)?,
-          notes: row.get(3)?,
-          created_at: row.get(4)?,
-          updated_at: row.get(5)?,
-          deleted: row.get(6)?,
+          vat_code: row.get(3)?,
+          notes: row.get(4)?,
+          created_at: row.get(5)?,
+          updated_at: row.get(6)?,
+          deleted: row.get(7)?,
         })
       })?;
       for r in rows {
@@ -1196,7 +1843,7 @@ impl Db {
     }
 
     let mut stmt = conn.prepare(
-      "SELECT id, title, default_price, notes, created_at, updated_at, deleted
+      "SELECT id, title, default_price, vat_code, notes, created_at, updated_at, deleted
        FROM services
        WHERE deleted = 0
        ORDER BY updated_at DESC
@@ -1207,10 +1854,11 @@ impl Db {
         id: row.get(0)?,
         title: row.get(1)?,
         default_price: row.get(2)?,
-        notes: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-        deleted: row.get(6)?,
+        vat_code: row.get(3)?,
+        notes: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        deleted: row.get(7)?,
       })
     })?;
     for r in rows {
@@ -1229,6 +1877,31 @@ impl Db {
     }
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let default_price = input.default_price;
+    let vat_registered = self
+      .setting_get("clinic_vat_registered")
+      .unwrap_or(None)
+      .unwrap_or_default()
+      .trim()
+      == "1";
+
+    let mut vat_code = input.vat_code.unwrap_or_else(|| "".to_string()).trim().to_uppercase();
+    if vat_registered {
+      // VAT registered: A (0% exempt), D (8%), E (18%).
+      if vat_code.is_empty() {
+        vat_code = "A".to_string();
+      }
+      if vat_code == "C" {
+        // Convert legacy "not VAT" into 0% exempt.
+        vat_code = "A".to_string();
+      }
+      match vat_code.as_str() {
+        "A" | "D" | "E" => {}
+        _ => bail!("vat_code duhet te jete A, D ose E (kur biznesi eshte ne TVSH)"),
+      }
+    } else {
+      // Not VAT registered: always "C" (0% - not in VAT).
+      vat_code = "C".to_string();
+    }
     let notes = input.notes;
     let now = now_iso();
 
@@ -1240,20 +1913,22 @@ impl Db {
     let created_at = existing_created_at.unwrap_or_else(|| now.clone());
 
     tx.execute(
-      "INSERT INTO services (id, title, default_price, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+      "INSERT INTO services (id, title, default_price, vat_code, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
        ON CONFLICT(id) DO UPDATE SET
          title=excluded.title,
          default_price=excluded.default_price,
+         vat_code=excluded.vat_code,
          notes=excluded.notes,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
-      params![id, title, default_price, &notes, &created_at, &now],
+      params![id, title, default_price, &vat_code, &notes, &created_at, &now],
     )?;
     let row = Service {
       id: id.clone(),
       title: title.to_string(),
       default_price,
+      vat_code,
       notes,
       created_at: created_at.clone(),
       updated_at: now.clone(),
@@ -1275,17 +1950,18 @@ impl Db {
     tx.execute("UPDATE services SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
     let row = tx
       .query_row(
-        "SELECT id, title, default_price, notes, created_at, updated_at, deleted FROM services WHERE id=?1",
+        "SELECT id, title, default_price, vat_code, notes, created_at, updated_at, deleted FROM services WHERE id=?1",
         params![id],
         |r| {
           Ok(Service {
             id: r.get(0)?,
             title: r.get(1)?,
             default_price: r.get(2)?,
-            notes: r.get(3)?,
-            created_at: r.get(4)?,
-            updated_at: r.get(5)?,
-            deleted: r.get(6)?,
+            vat_code: r.get(3)?,
+            notes: r.get(4)?,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+            deleted: r.get(7)?,
           })
         },
       )
@@ -1652,7 +2328,7 @@ impl Db {
     let include_deleted = f.include_deleted.unwrap_or(false);
 
     let mut sql = String::from(
-      "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted
+      "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
        FROM visit_items WHERE 1=1",
     );
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
@@ -1684,10 +2360,13 @@ impl Db {
         qty: row.get(5)?,
         unit_price: row.get(6)?,
         fiscal: row.get(7)?,
-        notes: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
-        deleted: row.get(11)?,
+        vat_code: row.get(8)?,
+        fiscalized: row.get(9)?,
+        fiscalized_at: row.get(10)?,
+        notes: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        deleted: row.get(14)?,
       })
     })?;
     for r in rows {
@@ -1701,7 +2380,7 @@ impl Db {
     Ok(
       conn
         .query_row(
-          "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted
+          "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
            FROM visit_items WHERE id=?1",
           params![id],
           |row| {
@@ -1714,10 +2393,13 @@ impl Db {
               qty: row.get(5)?,
               unit_price: row.get(6)?,
               fiscal: row.get(7)?,
-              notes: row.get(8)?,
-              created_at: row.get(9)?,
-              updated_at: row.get(10)?,
-              deleted: row.get(11)?,
+              vat_code: row.get(8)?,
+              fiscalized: row.get(9)?,
+              fiscalized_at: row.get(10)?,
+              notes: row.get(11)?,
+              created_at: row.get(12)?,
+              updated_at: row.get(13)?,
+              deleted: row.get(14)?,
             })
           },
         )
@@ -1750,19 +2432,65 @@ impl Db {
     let qty = input.qty;
     let unit_price = input.unit_price;
     let fiscal = if input.fiscal.unwrap_or(true) { 1 } else { 0 };
+    let vat_registered = self
+      .setting_get("clinic_vat_registered")
+      .unwrap_or(None)
+      .unwrap_or_default()
+      .trim()
+      == "1";
+
+    let mut vat_code = input.vat_code.unwrap_or_else(|| "".to_string()).trim().to_uppercase();
+    if vat_registered {
+      if vat_code.is_empty() {
+        vat_code = "A".to_string();
+      }
+      if vat_code == "C" {
+        vat_code = "A".to_string();
+      }
+      match vat_code.as_str() {
+        "A" | "D" | "E" => {}
+        _ => bail!("vat_code duhet te jete A, D ose E (kur biznesi eshte ne TVSH)"),
+      }
+    } else {
+      vat_code = "C".to_string();
+    }
     let notes = input.notes;
     let now = now_iso();
 
     let mut conn = self.conn()?;
     let tx = conn.transaction()?;
-    let existing_created_at: Option<String> = tx
-      .query_row("SELECT created_at FROM visit_items WHERE id=?1", params![id], |row| row.get(0))
+    let existing: Option<(String, i64, Option<String>, String, f64, f64, String)> = tx
+      .query_row(
+        "SELECT created_at, fiscalized, fiscalized_at, title, qty, unit_price, vat_code FROM visit_items WHERE id=?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+      )
       .optional()?;
-    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+    let created_at = existing.as_ref().map(|x| x.0.clone()).unwrap_or_else(|| now.clone());
+
+    // Preserve fiscalization only when the fiscal line hasn't changed.
+    let (fiscalized, fiscalized_at) = if fiscal == 1 {
+      if let Some((_, ex_fisc, ex_at, ex_title, ex_qty, ex_price, ex_vat)) = existing.as_ref() {
+        if *ex_fisc == 1
+          && ex_title.trim() == title
+          && (*ex_qty - qty).abs() < 0.000_000_1
+          && (*ex_price - unit_price).abs() < 0.000_000_1
+          && ex_vat.trim().eq_ignore_ascii_case(&vat_code)
+        {
+          (*ex_fisc, ex_at.clone())
+        } else {
+          (0, None)
+        }
+      } else {
+        (0, None)
+      }
+    } else {
+      (0, None)
+    };
 
     tx.execute(
-      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
+      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)
        ON CONFLICT(id) DO UPDATE SET
          visit_id=excluded.visit_id,
          client_id=excluded.client_id,
@@ -1771,6 +2499,9 @@ impl Db {
          qty=excluded.qty,
          unit_price=excluded.unit_price,
          fiscal=excluded.fiscal,
+         vat_code=excluded.vat_code,
+         fiscalized=excluded.fiscalized,
+         fiscalized_at=excluded.fiscalized_at,
          notes=excluded.notes,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
@@ -1783,6 +2514,9 @@ impl Db {
         qty,
         unit_price,
         fiscal,
+        &vat_code,
+        fiscalized,
+        &fiscalized_at,
         &notes,
         &created_at,
         &now
@@ -1797,6 +2531,9 @@ impl Db {
       qty,
       unit_price,
       fiscal,
+      vat_code,
+      fiscalized,
+      fiscalized_at,
       notes,
       created_at: created_at.clone(),
       updated_at: now.clone(),
@@ -1818,7 +2555,7 @@ impl Db {
     tx.execute("UPDATE visit_items SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
     let row = tx
       .query_row(
-        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
          FROM visit_items WHERE id=?1",
         params![id],
         |r| {
@@ -1831,10 +2568,13 @@ impl Db {
             qty: r.get(5)?,
             unit_price: r.get(6)?,
             fiscal: r.get(7)?,
-            notes: r.get(8)?,
-            created_at: r.get(9)?,
-            updated_at: r.get(10)?,
-            deleted: r.get(11)?,
+            vat_code: r.get(8)?,
+            fiscalized: r.get(9)?,
+            fiscalized_at: r.get(10)?,
+            notes: r.get(11)?,
+            created_at: r.get(12)?,
+            updated_at: r.get(13)?,
+            deleted: r.get(14)?,
           })
         },
       )
@@ -2097,13 +2837,28 @@ impl Db {
   pub fn apply_remote_client(&self, row: &Client) -> anyhow::Result<()> {
     let conn = self.conn()?;
     conn.execute(
-      "INSERT INTO clients (id, name, phone, email, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      "INSERT INTO clients (id, name, phone, email, notes,
+                            first_name, last_name, parent_name, dob, gender, city, address, allergies, weight_kg, height_cm, patient_code,
+                            created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5,
+               ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+               ?17, ?18, ?19)
        ON CONFLICT(id) DO UPDATE SET
          name=excluded.name,
          phone=excluded.phone,
          email=excluded.email,
          notes=excluded.notes,
+         first_name=excluded.first_name,
+         last_name=excluded.last_name,
+         parent_name=excluded.parent_name,
+         dob=excluded.dob,
+         gender=excluded.gender,
+         city=excluded.city,
+         address=excluded.address,
+         allergies=excluded.allergies,
+         weight_kg=excluded.weight_kg,
+         height_cm=excluded.height_cm,
+         patient_code=excluded.patient_code,
          created_at=excluded.created_at,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
@@ -2113,6 +2868,17 @@ impl Db {
         row.phone,
         row.email,
         row.notes,
+        row.first_name,
+        row.last_name,
+        row.parent_name,
+        row.dob,
+        row.gender,
+        row.city,
+        row.address,
+        row.allergies,
+        row.weight_kg,
+        row.height_cm,
+        row.patient_code,
         row.created_at,
         row.updated_at,
         row.deleted
@@ -2124,13 +2890,15 @@ impl Db {
   pub fn apply_remote_sale(&self, row: &Sale) -> anyhow::Result<()> {
     let conn = self.conn()?;
     conn.execute(
-      "INSERT INTO sales (id, client_id, date, total, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      "INSERT INTO sales (id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
        ON CONFLICT(id) DO UPDATE SET
          client_id=excluded.client_id,
          date=excluded.date,
          total=excluded.total,
          notes=excluded.notes,
+         fiscalized=excluded.fiscalized,
+         fiscalized_at=excluded.fiscalized_at,
          created_at=excluded.created_at,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
@@ -2140,6 +2908,8 @@ impl Db {
         row.date,
         row.total,
         row.notes,
+        row.fiscalized,
+        row.fiscalized_at,
         row.created_at,
         row.updated_at,
         row.deleted
@@ -2182,10 +2952,13 @@ impl Db {
   pub fn apply_remote_doctor(&self, row: &Doctor) -> anyhow::Result<()> {
     let conn = self.conn()?;
     conn.execute(
-      "INSERT INTO doctors (id, name, phone, email, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      "INSERT INTO doctors (id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
        ON CONFLICT(id) DO UPDATE SET
+         code=excluded.code,
          name=excluded.name,
+         title=excluded.title,
+         specialty=excluded.specialty,
          phone=excluded.phone,
          email=excluded.email,
          notes=excluded.notes,
@@ -2194,7 +2967,10 @@ impl Db {
          deleted=excluded.deleted",
       params![
         row.id,
+        row.code,
         row.name,
+        row.title,
+        row.specialty,
         row.phone,
         row.email,
         row.notes,
@@ -2209,11 +2985,12 @@ impl Db {
   pub fn apply_remote_service(&self, row: &Service) -> anyhow::Result<()> {
     let conn = self.conn()?;
     conn.execute(
-      "INSERT INTO services (id, title, default_price, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      "INSERT INTO services (id, title, default_price, vat_code, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
        ON CONFLICT(id) DO UPDATE SET
          title=excluded.title,
          default_price=excluded.default_price,
+         vat_code=excluded.vat_code,
          notes=excluded.notes,
          created_at=excluded.created_at,
          updated_at=excluded.updated_at,
@@ -2222,6 +2999,7 @@ impl Db {
         row.id,
         row.title,
         row.default_price,
+        row.vat_code,
         row.notes,
         row.created_at,
         row.updated_at,
@@ -2294,8 +3072,8 @@ impl Db {
   pub fn apply_remote_visit_item(&self, row: &VisitItem) -> anyhow::Result<()> {
     let conn = self.conn()?;
     conn.execute(
-      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
        ON CONFLICT(id) DO UPDATE SET
          visit_id=excluded.visit_id,
          client_id=excluded.client_id,
@@ -2304,6 +3082,9 @@ impl Db {
          qty=excluded.qty,
          unit_price=excluded.unit_price,
          fiscal=excluded.fiscal,
+         vat_code=excluded.vat_code,
+         fiscalized=excluded.fiscalized,
+         fiscalized_at=excluded.fiscalized_at,
          notes=excluded.notes,
          created_at=excluded.created_at,
          updated_at=excluded.updated_at,
@@ -2317,6 +3098,9 @@ impl Db {
         row.qty,
         row.unit_price,
         row.fiscal,
+        row.vat_code,
+        row.fiscalized,
+        row.fiscalized_at,
         row.notes,
         row.created_at,
         row.updated_at,

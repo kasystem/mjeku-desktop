@@ -11,24 +11,42 @@ const KEY_ADMIN_SALT: &str = "admin_salt";
 const KEY_ADMIN_HASH: &str = "admin_hash";
 const KEY_USER_SALT: &str = "user_salt";
 const KEY_USER_HASH: &str = "user_hash";
+const KEY_CASHIER_SALT: &str = "cashier_salt";
+const KEY_CASHIER_HASH: &str = "cashier_hash";
 
 // Legacy (v1) login persistence key for the shared user password.
 const KEY_USER_LOGGED_IN: &str = "user_logged_in";
 
 // Session is persisted so the app keeps working fully offline across restarts.
-// Values: "" | "user" | "doctor:<doctor_id>"
+// Values: "" | "owner" | "cashier" | "doctor:<doctor_id>"
 const KEY_SESSION: &str = "session";
+
+#[derive(Debug, Clone)]
+pub enum UserRole {
+  Owner,
+  Cashier,
+}
+
+impl UserRole {
+  pub fn as_str(&self) -> &'static str {
+    match self {
+      UserRole::Owner => "owner",
+      UserRole::Cashier => "cashier",
+    }
+  }
+}
 
 #[derive(Debug, Clone)]
 pub enum SessionKind {
   None,
-  User,
+  User { role: UserRole },
   Doctor { doctor_id: String, is_admin: bool },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionInfo {
   pub kind: String, // none | user | doctor
+  pub user_role: Option<String>, // owner | cashier
   pub doctor_id: Option<String>,
   pub doctor_name: Option<String>,
   pub doctor_is_admin: bool,
@@ -116,12 +134,14 @@ fn session_info_from_kind(db: &Db, kind: &SessionKind) -> anyhow::Result<Session
   match kind {
     SessionKind::None => Ok(SessionInfo {
       kind: "none".to_string(),
+      user_role: None,
       doctor_id: None,
       doctor_name: None,
       doctor_is_admin: false,
     }),
-    SessionKind::User => Ok(SessionInfo {
+    SessionKind::User { role } => Ok(SessionInfo {
       kind: "user".to_string(),
+      user_role: Some(role.as_str().to_string()),
       doctor_id: None,
       doctor_name: None,
       doctor_is_admin: true,
@@ -133,6 +153,7 @@ fn session_info_from_kind(db: &Db, kind: &SessionKind) -> anyhow::Result<Session
         .map(|d| d.name);
       Ok(SessionInfo {
         kind: "doctor".to_string(),
+        user_role: None,
         doctor_id: Some(doctor_id.clone()),
         doctor_name,
         doctor_is_admin: *is_admin,
@@ -155,6 +176,16 @@ pub fn read_state(db: &Db, admin_unlocked: bool, session_kind: SessionKind) -> a
 }
 
 pub fn setup(db: &Db, clinic_name: &str, admin_password: &str, user_password: &str) -> anyhow::Result<AuthStateInfo> {
+  setup_v2(db, clinic_name, admin_password, user_password, None)
+}
+
+pub fn setup_v2(
+  db: &Db,
+  clinic_name: &str,
+  admin_password: &str,
+  owner_password: &str,
+  cashier_password: Option<&str>,
+) -> anyhow::Result<AuthStateInfo> {
   let clinic_name = clinic_name.trim();
   if clinic_name.is_empty() {
     bail!("emri i klinikes eshte i detyrueshem");
@@ -163,9 +194,15 @@ pub fn setup(db: &Db, clinic_name: &str, admin_password: &str, user_password: &s
   if admin_password.len() < 6 {
     bail!("fjalekalimi i adminit duhet te kete te pakten 6 karaktere");
   }
-  let user_password = user_password.trim();
-  if user_password.len() < 4 {
+  let owner_password = owner_password.trim();
+  if owner_password.len() < 4 {
     bail!("fjalekalimi i pergjithshem duhet te kete te pakten 4 karaktere");
+  }
+  let cashier_password = cashier_password.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+  if let Some(pw) = cashier_password.as_deref() {
+    if pw.len() < 4 {
+      bail!("fjalekalimi i arketares duhet te kete te pakten 4 karaktere");
+    }
   }
 
   if is_configured(db)? {
@@ -176,7 +213,12 @@ pub fn setup(db: &Db, clinic_name: &str, admin_password: &str, user_password: &s
   let admin_salt = Uuid::new_v4().to_string();
   let admin_hash = hash_password(&admin_salt, admin_password);
   let user_salt = Uuid::new_v4().to_string();
-  let user_hash = hash_password(&user_salt, user_password);
+  let user_hash = hash_password(&user_salt, owner_password);
+
+  let cashier_salt = cashier_password.as_deref().map(|_| Uuid::new_v4().to_string());
+  let cashier_hash = cashier_password
+    .as_deref()
+    .and_then(|pw| cashier_salt.as_deref().map(|salt| hash_password(salt, pw)));
 
   db.setting_set(KEY_CLINIC_ID, &clinic_id)?;
   db.setting_set(KEY_CLINIC_NAME, clinic_name)?;
@@ -184,6 +226,10 @@ pub fn setup(db: &Db, clinic_name: &str, admin_password: &str, user_password: &s
   db.setting_set(KEY_ADMIN_HASH, &admin_hash)?;
   db.setting_set(KEY_USER_SALT, &user_salt)?;
   db.setting_set(KEY_USER_HASH, &user_hash)?;
+  if let (Some(salt), Some(hash)) = (cashier_salt.as_deref(), cashier_hash.as_deref()) {
+    db.setting_set(KEY_CASHIER_SALT, salt)?;
+    db.setting_set(KEY_CASHIER_HASH, hash)?;
+  }
 
   // Start with no logged-in session.
   db.setting_set(KEY_SESSION, "")?;
@@ -215,15 +261,40 @@ pub fn admin_change_password(db: &Db, new_password: &str) -> anyhow::Result<()> 
   Ok(())
 }
 
-pub fn user_verify(db: &Db, password: &str) -> anyhow::Result<bool> {
-  let salt = db
-    .setting_get(KEY_USER_SALT)?
-    .ok_or_else(|| anyhow!("mungon user_salt"))?;
-  let expected = db
-    .setting_get(KEY_USER_HASH)?
-    .ok_or_else(|| anyhow!("mungon user_hash"))?;
-  let got = hash_password(&salt, password.trim());
-  Ok(expected.trim().eq_ignore_ascii_case(got.trim()))
+pub fn user_verify_role(db: &Db, password: &str) -> anyhow::Result<Option<UserRole>> {
+  let password = password.trim();
+  if password.is_empty() {
+    return Ok(None);
+  }
+
+  // Owner password (legacy `user_*` keys).
+  {
+    let salt = db
+      .setting_get(KEY_USER_SALT)?
+      .ok_or_else(|| anyhow!("mungon user_salt"))?;
+    let expected = db
+      .setting_get(KEY_USER_HASH)?
+      .ok_or_else(|| anyhow!("mungon user_hash"))?;
+    let got = hash_password(&salt, password);
+    if expected.trim().eq_ignore_ascii_case(got.trim()) {
+      return Ok(Some(UserRole::Owner));
+    }
+  }
+
+  // Optional cashier password.
+  let salt = match db.setting_get(KEY_CASHIER_SALT)? {
+    Some(s) if !s.trim().is_empty() => s,
+    _ => return Ok(None),
+  };
+  let expected = match db.setting_get(KEY_CASHIER_HASH)? {
+    Some(h) if !h.trim().is_empty() => h,
+    _ => return Ok(None),
+  };
+  let got = hash_password(&salt, password);
+  if expected.trim().eq_ignore_ascii_case(got.trim()) {
+    return Ok(Some(UserRole::Cashier));
+  }
+  Ok(None)
 }
 
 pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
@@ -236,14 +307,22 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
   if raw.is_empty() {
     // Legacy fallback.
     if db.setting_get(KEY_USER_LOGGED_IN)?.unwrap_or_default().trim() == "1" {
-      let _ = db.setting_set(KEY_SESSION, "user");
-      return Ok(SessionKind::User);
+      let _ = db.setting_set(KEY_SESSION, "owner");
+      return Ok(SessionKind::User { role: UserRole::Owner });
     }
     return Ok(SessionKind::None);
   }
 
   if raw.eq_ignore_ascii_case("user") {
-    return Ok(SessionKind::User);
+    // Legacy value.
+    let _ = db.setting_set(KEY_SESSION, "owner");
+    return Ok(SessionKind::User { role: UserRole::Owner });
+  }
+  if raw.eq_ignore_ascii_case("owner") {
+    return Ok(SessionKind::User { role: UserRole::Owner });
+  }
+  if raw.eq_ignore_ascii_case("cashier") {
+    return Ok(SessionKind::User { role: UserRole::Cashier });
   }
 
   if let Some(rest) = raw.strip_prefix("doctor:") {
@@ -275,9 +354,15 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
 }
 
 pub fn session_set_user(db: &Db) -> anyhow::Result<()> {
-  db.setting_set(KEY_SESSION, "user")?;
+  db.setting_set(KEY_SESSION, "owner")?;
   // Legacy key for older UI bundles.
   db.setting_set(KEY_USER_LOGGED_IN, "1")?;
+  Ok(())
+}
+
+pub fn session_set_cashier(db: &Db) -> anyhow::Result<()> {
+  db.setting_set(KEY_SESSION, "cashier")?;
+  db.setting_set(KEY_USER_LOGGED_IN, "0")?;
   Ok(())
 }
 
@@ -363,4 +448,3 @@ pub fn doctor_account_update(db: &Db, doctor_id: &str, password: Option<&str>, i
   db.doctor_account_set(doctor_id, &salt, &hash, is_admin, &now)?;
   Ok(())
 }
-

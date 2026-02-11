@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn default_vat_code() -> String {
+  "C".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppInfo {
   pub version: String,
@@ -7,6 +11,10 @@ pub struct AppInfo {
   pub sync_status: String, // synced | pending | error
   pub last_sync_time: Option<String>,
   pub last_sync_error: Option<String>,
+  pub license_ok: bool,
+  pub license_status: String, // ok | expired | disabled | offline_grace | unconfigured | unknown
+  pub license_active_until: Option<String>,
+  pub license_last_checked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +24,17 @@ pub struct Client {
   pub phone: Option<String>,
   pub email: Option<String>,
   pub notes: Option<String>,
+  pub first_name: Option<String>,
+  pub last_name: Option<String>,
+  pub parent_name: Option<String>,
+  pub dob: Option<String>, // YYYY-MM-DD
+  pub gender: Option<String>,
+  pub city: Option<String>,
+  pub address: Option<String>,
+  pub allergies: Option<String>,
+  pub weight_kg: Option<f64>,
+  pub height_cm: Option<f64>,
+  pub patient_code: Option<String>,
   pub created_at: String,
   pub updated_at: String,
   pub deleted: i64,
@@ -28,6 +47,17 @@ pub struct ClientUpsertInput {
   pub phone: Option<String>,
   pub email: Option<String>,
   pub notes: Option<String>,
+  pub first_name: Option<String>,
+  pub last_name: Option<String>,
+  pub parent_name: Option<String>,
+  pub dob: Option<String>,
+  pub gender: Option<String>,
+  pub city: Option<String>,
+  pub address: Option<String>,
+  pub allergies: Option<String>,
+  pub weight_kg: Option<f64>,
+  pub height_cm: Option<f64>,
+  pub patient_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +67,10 @@ pub struct Sale {
   pub date: Option<String>, // YYYY-MM-DD
   pub total: f64,
   pub notes: Option<String>,
+  #[serde(default)]
+  pub fiscalized: i64, // 1/0
+  #[serde(default)]
+  pub fiscalized_at: Option<String>,
   pub created_at: String,
   pub updated_at: String,
   pub deleted: i64,
@@ -123,7 +157,10 @@ pub struct PaymentUpsertInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Doctor {
   pub id: String,
+  pub code: Option<String>,
   pub name: String,
+  pub title: Option<String>,
+  pub specialty: Option<String>,
   pub phone: Option<String>,
   pub email: Option<String>,
   pub notes: Option<String>,
@@ -135,7 +172,10 @@ pub struct Doctor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorLoginOption {
   pub id: String,
+  pub code: Option<String>,
   pub name: String,
+  pub title: Option<String>,
+  pub specialty: Option<String>,
   pub has_account: bool,
   pub is_admin: bool,
 }
@@ -143,7 +183,10 @@ pub struct DoctorLoginOption {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorUpsertInput {
   pub id: Option<String>,
+  pub code: Option<String>,
   pub name: String,
+  pub title: Option<String>,
+  pub specialty: Option<String>,
   pub phone: Option<String>,
   pub email: Option<String>,
   pub notes: Option<String>,
@@ -154,6 +197,8 @@ pub struct Service {
   pub id: String,
   pub title: String,
   pub default_price: f64,
+  #[serde(default = "default_vat_code")]
+  pub vat_code: String, // A | C | D | E
   pub notes: Option<String>,
   pub created_at: String,
   pub updated_at: String,
@@ -165,6 +210,7 @@ pub struct ServiceUpsertInput {
   pub id: Option<String>,
   pub title: String,
   pub default_price: f64,
+  pub vat_code: Option<String>,
   pub notes: Option<String>,
 }
 
@@ -246,6 +292,12 @@ pub struct VisitItem {
   pub qty: f64,
   pub unit_price: f64,
   pub fiscal: i64, // 1/0
+  #[serde(default = "default_vat_code")]
+  pub vat_code: String, // A | C | D | E
+  #[serde(default)]
+  pub fiscalized: i64, // 1/0
+  #[serde(default)]
+  pub fiscalized_at: Option<String>,
   pub notes: Option<String>,
   pub created_at: String,
   pub updated_at: String,
@@ -269,6 +321,7 @@ pub struct VisitItemUpsertInput {
   pub qty: f64,
   pub unit_price: f64,
   pub fiscal: Option<bool>,
+  pub vat_code: Option<String>,
   pub notes: Option<String>,
 }
 

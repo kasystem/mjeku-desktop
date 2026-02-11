@@ -43,18 +43,40 @@ pub struct UpdatesEngine {
 
 fn find_resource_file(app: &tauri::AppHandle, name: &str) -> anyhow::Result<PathBuf> {
   let dir = app.path().resource_dir()?;
-  let cand1 = dir.join(name);
-  let cand2 = dir.join("resources").join(name);
-  if cand1.exists() {
-    return Ok(cand1);
+  let mut tries: Vec<PathBuf> = Vec::new();
+
+  // Typical layout in dev/release.
+  tries.push(dir.join(name));
+  tries.push(dir.join("resources").join(name));
+
+  // `tauri dev` can sometimes not copy resources into `resource_dir()` on Windows. Fall back to the
+  // source-tree `src-tauri/resources` by walking up from the executable:
+  //   .../src-tauri/target/debug/<exe>
+  if let Ok(exe) = std::env::current_exe() {
+    if let Some(src_tauri_dir) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+      tries.push(src_tauri_dir.join("resources").join(name));
+    }
   }
-  if cand2.exists() {
-    return Ok(cand2);
+
+  // Also try relative to the current working directory (when running from the repo root).
+  if let Ok(cwd) = std::env::current_dir() {
+    tries.push(cwd.join("src-tauri").join("resources").join(name));
+    tries.push(cwd.join("resources").join(name));
   }
+
+  for p in &tries {
+    if p.exists() {
+      return Ok(p.clone());
+    }
+  }
+
   bail!(
-    "missing resource: {} (also tried {})",
-    cand1.display(),
-    cand2.display()
+    "missing resource: tried {}",
+    tries
+      .iter()
+      .map(|p| p.display().to_string())
+      .collect::<Vec<_>>()
+      .join(" | ")
   )
 }
 

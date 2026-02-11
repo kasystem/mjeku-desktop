@@ -1,6 +1,8 @@
 mod auth;
 mod db;
+mod desktop_updates;
 mod invoice;
+mod license_engine;
 mod models;
 mod sync_engine;
 mod ui_protocol;
@@ -17,6 +19,7 @@ use tauri::Manager;
 
 use crate::auth::{AuthState, AuthStateInfo, SessionKind};
 use crate::db::Db;
+use crate::license_engine::LicenseEngine;
 use crate::models::{
   Appointment, AppointmentUpsertInput, AppointmentsListFilters, AppInfo, CashEntry, CashEntryUpsertInput, CashListFilters,
   Client, ClientUpsertInput, DailySalesReport, Doctor, DoctorLoginOption, DoctorUpsertInput, Payment, PaymentUpsertInput,
@@ -31,6 +34,7 @@ struct AppState {
   auth: Arc<AuthState>,
   sync: Arc<SyncEngine>,
   updates: Arc<UpdatesEngine>,
+  license: Arc<LicenseEngine>,
 }
 
 fn err_string(e: impl std::fmt::Display) -> String {
@@ -73,6 +77,7 @@ async fn get_app_info(app: tauri::AppHandle, state: tauri::State<'_, AppState>) 
   let version = app.package_info().version.to_string();
   let ui_version = crate::updates::current_ui_version(&app).unwrap_or_else(|_| "seed".to_string());
   let sync_status = state.sync.get_status().await;
+  let lic = state.license.get_state().await;
 
   let db = state.db.clone();
   let last_sync_time = tokio::task::spawn_blocking(move || db.get_last_sync_time())
@@ -86,6 +91,10 @@ async fn get_app_info(app: tauri::AppHandle, state: tauri::State<'_, AppState>) 
     sync_status: sync_status.sync_status,
     last_sync_time,
     last_sync_error: sync_status.last_sync_error,
+    license_ok: lic.ok,
+    license_status: lic.status,
+    license_active_until: lic.active_until,
+    license_last_checked_at: lic.last_checked_at,
   })
 }
 
@@ -106,9 +115,18 @@ async fn auth_setup(
   clinic_name: String,
   admin_password: String,
   user_password: String,
+  cashier_password: Option<String>,
 ) -> Result<AuthStateInfo, String> {
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || crate::auth::setup(&db, &clinic_name, &admin_password, &user_password))
+  tokio::task::spawn_blocking(move || {
+    crate::auth::setup_v2(
+      &db,
+      &clinic_name,
+      &admin_password,
+      &user_password,
+      cashier_password.as_deref(),
+    )
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -149,19 +167,43 @@ async fn auth_admin_change_password(state: tauri::State<'_, AppState>, new_passw
 #[tauri::command]
 async fn auth_user_login(state: tauri::State<'_, AppState>, password: String) -> Result<bool, String> {
   let db = state.db.clone();
-  let ok = tokio::task::spawn_blocking(move || crate::auth::user_verify(&db, &password))
+  let role = tokio::task::spawn_blocking(move || crate::auth::user_verify_role(&db, &password))
     .await
     .map_err(err_string)?
     .map_err(err_string)?;
-  if ok {
-    let db2 = state.db.clone();
-    tokio::task::spawn_blocking(move || crate::auth::session_set_user(&db2))
-      .await
-      .map_err(err_string)?
-      .map_err(err_string)?;
-    state.auth.set_session(SessionKind::User).await;
+  let Some(role) = role else {
+    return Ok(false);
+  };
+
+  let db2 = state.db.clone();
+  match role {
+    crate::auth::UserRole::Owner => {
+      tokio::task::spawn_blocking(move || crate::auth::session_set_user(&db2))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+      state
+        .auth
+        .set_session(SessionKind::User {
+          role: crate::auth::UserRole::Owner,
+        })
+        .await;
+    }
+    crate::auth::UserRole::Cashier => {
+      tokio::task::spawn_blocking(move || crate::auth::session_set_cashier(&db2))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+      state
+        .auth
+        .set_session(SessionKind::User {
+          role: crate::auth::UserRole::Cashier,
+        })
+        .await;
+    }
   }
-  Ok(ok)
+
+  Ok(true)
 }
 
 #[tauri::command]
@@ -186,10 +228,30 @@ async fn doctors_login_options(state: tauri::State<'_, AppState>) -> Result<Vec<
 }
 
 #[tauri::command]
-async fn auth_doctor_login(state: tauri::State<'_, AppState>, doctor_id: String, password: String) -> Result<bool, String> {
+async fn auth_doctor_login(
+  state: tauri::State<'_, AppState>,
+  doctor_id: String,
+  password: String,
+) -> Result<bool, String> {
+  // Support logging in by either doctor UUID or a short code.
+  let key = doctor_id.trim().to_string();
+  if key.is_empty() {
+    return Err("doctor_id eshte i detyrueshem".to_string());
+  }
+
   let db = state.db.clone();
-  let did = doctor_id.clone();
-  let res = tokio::task::spawn_blocking(move || crate::auth::doctor_verify(&db, &did, &password))
+  let resolved = tokio::task::spawn_blocking(move || db.doctor_id_from_code_or_id(&key))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+  let Some(did) = resolved else {
+    return Err("mjeku nuk u gjet".to_string());
+  };
+
+  let db2 = state.db.clone();
+  let did2 = did.clone();
+  let pw2 = password.clone();
+  let res = tokio::task::spawn_blocking(move || crate::auth::doctor_verify(&db2, &did2, &pw2))
     .await
     .map_err(err_string)?
     .map_err(err_string)?;
@@ -199,8 +261,7 @@ async fn auth_doctor_login(state: tauri::State<'_, AppState>, doctor_id: String,
     crate::auth::DoctorVerify::WrongPassword => Ok(false),
     crate::auth::DoctorVerify::Ok { .. } => {
       let db2 = state.db.clone();
-      let did2 = doctor_id.clone();
-      let session = tokio::task::spawn_blocking(move || crate::auth::session_set_doctor(&db2, &did2))
+      let session = tokio::task::spawn_blocking(move || crate::auth::session_set_doctor(&db2, &did))
         .await
         .map_err(err_string)?
         .map_err(err_string)?;
@@ -229,7 +290,7 @@ async fn doctor_account_update(
   password: Option<String>,
   is_admin: bool,
 ) -> Result<(), String> {
-  let _ = require_finance(&state).await?;
+  let _ = require_owner(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || crate::auth::doctor_account_update(&db, &doctor_id, password.as_deref(), is_admin))
     .await
@@ -241,14 +302,30 @@ async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind
   let s = state.auth.session().await;
   match s {
     SessionKind::None => Err("duhet te hysh per te vazhduar".to_string()),
-    _ => Ok(s),
+    _ => {
+      if !state.license.is_ok().await {
+        return Err("licenca skadoi ose eshte e bllokuar".to_string());
+      }
+      Ok(s)
+    }
   }
 }
 
 async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
   let s = require_login(state).await?;
   match &s {
-    SessionKind::User => Ok(s),
+    SessionKind::User { .. } => Ok(s),
+    SessionKind::Doctor { is_admin: true, .. } => Ok(s),
+    _ => Err("nuk ke akses per kete seksion".to_string()),
+  }
+}
+
+async fn require_owner(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
+  let s = require_login(state).await?;
+  match &s {
+    SessionKind::User {
+      role: crate::auth::UserRole::Owner,
+    } => Ok(s),
     SessionKind::Doctor { is_admin: true, .. } => Ok(s),
     _ => Err("nuk ke akses per kete seksion".to_string()),
   }
@@ -274,6 +351,8 @@ async fn settings_get_all(state: tauri::State<'_, AppState>) -> Result<HashMap<S
       "admin_hash",
       "user_salt",
       "user_hash",
+      "cashier_salt",
+      "cashier_hash",
       "user_logged_in",
       "session",
     ] {
@@ -302,6 +381,8 @@ async fn settings_set(state: tauri::State<'_, AppState>, key: String, value: Str
       | "admin_hash"
       | "user_salt"
       | "user_hash"
+      | "cashier_salt"
+      | "cashier_hash"
       | "user_logged_in"
       | "session"
   );
@@ -315,6 +396,74 @@ async fn settings_set(state: tauri::State<'_, AppState>, key: String, value: Str
 
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.setting_set(&k, &value))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+fn decode_base64_data(data: &str) -> anyhow::Result<Vec<u8>> {
+  use base64::{engine::general_purpose, Engine as _};
+  let s = data.trim();
+  let s = if let Some((_, b64)) = s.split_once(",") { b64 } else { s };
+  let bytes = general_purpose::STANDARD.decode(s)?;
+  Ok(bytes)
+}
+
+#[tauri::command]
+async fn clinic_asset_set_png(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, AppState>,
+  key: String,
+  base64_png: String,
+) -> Result<(), String> {
+  let _ = require_owner(&state).await?;
+  let k = key.trim().to_lowercase();
+  let (file_name, setting_key) = match k.as_str() {
+    "logo" => ("clinic_logo.png", "clinic_logo_path"),
+    "pdf_header" => ("pdf_header.png", "pdf_header_path"),
+    _ => return Err("key duhet te jete: logo ose pdf_header".to_string()),
+  };
+
+  let data_dir = app.path().app_data_dir().map_err(|e| anyhow::anyhow!(e)).map_err(err_string)?;
+  let assets_dir = data_dir.join("assets");
+  let out_path = assets_dir.join(file_name);
+  let rel = format!("assets/{}", file_name);
+  let db = state.db.clone();
+
+  tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    std::fs::create_dir_all(&assets_dir)?;
+    let bytes = decode_base64_data(&base64_png)?;
+    std::fs::write(&out_path, bytes)?;
+    db.setting_set(setting_key, &rel)?;
+    Ok(())
+  })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn clinic_asset_clear_png(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, AppState>,
+  key: String,
+) -> Result<(), String> {
+  let _ = require_owner(&state).await?;
+  let k = key.trim().to_lowercase();
+  let (file_name, setting_key) = match k.as_str() {
+    "logo" => ("clinic_logo.png", "clinic_logo_path"),
+    "pdf_header" => ("pdf_header.png", "pdf_header_path"),
+    _ => return Err("key duhet te jete: logo ose pdf_header".to_string()),
+  };
+  let data_dir = app.path().app_data_dir().map_err(|e| anyhow::anyhow!(e)).map_err(err_string)?;
+  let out_path = data_dir.join("assets").join(file_name);
+  let db = state.db.clone();
+
+  tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(&out_path);
+    db.setting_set(setting_key, "")?;
+    Ok(())
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -352,9 +501,14 @@ async fn clients_delete(state: tauri::State<'_, AppState>, id: String) -> Result
 
 #[tauri::command]
 async fn sales_list(state: tauri::State<'_, AppState>, filters: Option<SalesListFilters>) -> Result<Vec<Sale>, String> {
-  let _ = require_finance(&state).await?;
+  let session = require_finance(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.sales_list(filters))
+  tokio::task::spawn_blocking(move || match session {
+    SessionKind::User {
+      role: crate::auth::UserRole::Cashier,
+    } => db.sales_list_fiscal_only(filters),
+    _ => db.sales_list(filters),
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -362,9 +516,36 @@ async fn sales_list(state: tauri::State<'_, AppState>, filters: Option<SalesList
 
 #[tauri::command]
 async fn sales_daily_report(state: tauri::State<'_, AppState>, date: String) -> Result<DailySalesReport, String> {
-  let _ = require_finance(&state).await?;
+  let session = require_login(&state).await?;
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.sales_daily_report(&date))
+  tokio::task::spawn_blocking(move || match session {
+    SessionKind::User {
+      role: crate::auth::UserRole::Cashier,
+    } => {
+      // Cashier is fiscal-only: show only the fiscal portion (hide non-fiscal-only sales).
+      let mut rep = db.sales_daily_report(&date)?;
+      rep.rows.retain(|r| r.fiscal_total > 0.0);
+      for r in &mut rep.rows {
+        r.non_fiscal_total = 0.0;
+        r.total = r.fiscal_total;
+        r.classification = "fiscal".to_string();
+      }
+      let fiscal_total: f64 = rep.rows.iter().map(|r| r.fiscal_total).sum();
+      rep.total = fiscal_total;
+      rep.fiscal_total = fiscal_total;
+      rep.non_fiscal_total = 0.0;
+      rep.count_sales = rep.rows.len() as i64;
+      rep.count_fiscal_only = rep.count_sales;
+      rep.count_non_fiscal_only = 0;
+      rep.count_mixed = 0;
+      Ok(rep)
+    }
+    SessionKind::Doctor {
+      doctor_id,
+      is_admin: false,
+    } => db.sales_daily_report_for_doctor(&date, &doctor_id),
+    _ => db.sales_daily_report(&date),
+  })
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -441,7 +622,7 @@ async fn doctors_list(state: tauri::State<'_, AppState>, search: Option<String>)
 
 #[tauri::command]
 async fn doctors_upsert(state: tauri::State<'_, AppState>, doctor: DoctorUpsertInput) -> Result<Doctor, String> {
-  let _ = require_finance(&state).await?;
+  let _ = require_owner(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.doctors_upsert(doctor))
     .await
@@ -451,7 +632,7 @@ async fn doctors_upsert(state: tauri::State<'_, AppState>, doctor: DoctorUpsertI
 
 #[tauri::command]
 async fn doctors_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  let _ = require_finance(&state).await?;
+  let _ = require_owner(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.doctors_delete(&id))
     .await
@@ -471,7 +652,7 @@ async fn services_list(state: tauri::State<'_, AppState>, search: Option<String>
 
 #[tauri::command]
 async fn services_upsert(state: tauri::State<'_, AppState>, service: ServiceUpsertInput) -> Result<Service, String> {
-  let _ = require_finance(&state).await?;
+  let _ = require_owner(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.services_upsert(service))
     .await
@@ -481,7 +662,7 @@ async fn services_upsert(state: tauri::State<'_, AppState>, service: ServiceUpse
 
 #[tauri::command]
 async fn services_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  let _ = require_finance(&state).await?;
+  let _ = require_owner(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.services_delete(&id))
     .await
@@ -674,6 +855,14 @@ async fn visit_items_upsert(
   item: VisitItemUpsertInput,
 ) -> Result<VisitItem, String> {
   let session = require_login(&state).await?;
+  // Cashier role is fiscal-only.
+  let mut item = item;
+  if let SessionKind::User {
+    role: crate::auth::UserRole::Cashier,
+  } = &session
+  {
+    item.fiscal = Some(true);
+  }
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || {
     if let SessionKind::Doctor {
@@ -724,7 +913,7 @@ async fn visit_items_delete(state: tauri::State<'_, AppState>, id: String) -> Re
 
 #[tauri::command]
 async fn cash_list(state: tauri::State<'_, AppState>, filters: Option<CashListFilters>) -> Result<Vec<CashEntry>, String> {
-  let _ = require_finance(&state).await?;
+  let _ = require_owner(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.cash_list(filters))
     .await
@@ -734,7 +923,7 @@ async fn cash_list(state: tauri::State<'_, AppState>, filters: Option<CashListFi
 
 #[tauri::command]
 async fn cash_upsert(state: tauri::State<'_, AppState>, entry: CashEntryUpsertInput) -> Result<CashEntry, String> {
-  let _ = require_finance(&state).await?;
+  let _ = require_owner(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.cash_upsert(entry))
     .await
@@ -744,7 +933,7 @@ async fn cash_upsert(state: tauri::State<'_, AppState>, entry: CashEntryUpsertIn
 
 #[tauri::command]
 async fn cash_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-  let _ = require_finance(&state).await?;
+  let _ = require_owner(&state).await?;
   let db = state.db.clone();
   tokio::task::spawn_blocking(move || db.cash_delete(&id))
     .await
@@ -765,6 +954,18 @@ async fn updates_check_now(app: tauri::AppHandle, state: tauri::State<'_, AppSta
 }
 
 #[tauri::command]
+async fn desktop_updates_check_now(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<crate::desktop_updates::DesktopUpdateInfo, String> {
+  let _ = require_login(&state).await?;
+  crate::desktop_updates::check_now(&app).await.map_err(err_string)
+}
+
+#[tauri::command]
+async fn desktop_updates_open_download(state: tauri::State<'_, AppState>, url: String) -> Result<(), String> {
+  let _ = require_login(&state).await?;
+  crate::desktop_updates::open_external(&url).map_err(err_string)
+}
+
+#[tauri::command]
 async fn updates_apply_downloaded(app: tauri::AppHandle) -> Result<(), String> {
   // Switch the pointer (if a pending version exists) and reload.
   let _ = UpdatesEngine::apply_downloaded_now(&app).map_err(err_string)?;
@@ -780,14 +981,60 @@ async fn reload_ui(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn invoice_export_pdf(state: tauri::State<'_, AppState>, sale_id: String) -> Result<String, String> {
+async fn invoice_export_fiscal_inp(app: tauri::AppHandle, state: tauri::State<'_, AppState>, sale_id: String) -> Result<String, String> {
   let _ = require_finance(&state).await?;
   let sale_id = sale_id.trim().to_string();
   if sale_id.is_empty() {
     return Err("sale_id eshte i detyrueshem".to_string());
   }
 
+  let out_dir = app
+    .path()
+    .app_data_dir()
+    .map_err(|e| anyhow::anyhow!(e))
+    .map_err(err_string)?
+    .join("fiscal");
   let db = state.db.clone();
+  tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+    let p = db.fiscal_receipt_generate_inp(&sale_id, &out_dir)?;
+    Ok(p.display().to_string())
+  })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn admin_reset_clinic(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+  if !state.auth.is_admin_unlocked().await {
+    return Err("kjo veprim kerkon hyrje si admin".to_string());
+  }
+  let data_dir = app.path().app_data_dir().map_err(|e| anyhow::anyhow!(e)).map_err(err_string)?;
+  std::fs::create_dir_all(&data_dir).map_err(err_string)?;
+  std::fs::write(data_dir.join("reset.flag"), b"1").map_err(err_string)?;
+
+  // Restart the app so the DB connection can be safely recreated.
+  let exe = std::env::current_exe().map_err(err_string)?;
+  let _ = std::process::Command::new(exe).spawn().map_err(err_string)?;
+  std::process::exit(0);
+}
+
+#[tauri::command]
+async fn invoice_export_pdf(app: tauri::AppHandle, state: tauri::State<'_, AppState>, sale_id: String) -> Result<String, String> {
+  let session = require_finance(&state).await?;
+  let fiscal_only = matches!(
+    session,
+    SessionKind::User {
+      role: crate::auth::UserRole::Cashier
+    }
+  );
+  let sale_id = sale_id.trim().to_string();
+  if sale_id.is_empty() {
+    return Err("sale_id eshte i detyrueshem".to_string());
+  }
+
+  let db = state.db.clone();
+  let data_dir = app.path().app_data_dir().map_err(|e| anyhow::anyhow!(e)).map_err(err_string)?;
   tokio::task::spawn_blocking(move || {
     use base64::{engine::general_purpose, Engine as _};
 
@@ -795,6 +1042,18 @@ async fn invoice_export_pdf(state: tauri::State<'_, AppState>, sale_id: String) 
       .setting_get("clinic_name")
       .map_err(err_string)?
       .unwrap_or_else(|| "Klinika".to_string());
+
+    let header_png: Option<Vec<u8>> = db
+      .setting_get("pdf_header_path")
+      .ok()
+      .flatten()
+      .and_then(|rel| {
+        let rel = rel.trim().to_string();
+        if rel.is_empty() {
+          return None;
+        }
+        std::fs::read(data_dir.join(rel)).ok()
+      });
 
     let sale = db
       .sales_get(&sale_id)
@@ -812,7 +1071,7 @@ async fn invoice_export_pdf(state: tauri::State<'_, AppState>, sale_id: String) 
         include_deleted: Some(false),
       }))
       .map_err(err_string)?;
-    let lines: Vec<crate::invoice::InvoiceLine> = vis_items
+    let mut lines: Vec<crate::invoice::InvoiceLine> = vis_items
       .into_iter()
       .filter(|x| x.deleted == 0)
       .map(|it| crate::invoice::InvoiceLine {
@@ -821,8 +1080,17 @@ async fn invoice_export_pdf(state: tauri::State<'_, AppState>, sale_id: String) 
         qty: it.qty,
         unit_price: it.unit_price,
         fiscal: it.fiscal == 1,
+        vat_code: it.vat_code,
       })
       .collect();
+
+    if fiscal_only && !lines.is_empty() {
+      let before = lines.len();
+      lines.retain(|ln| ln.fiscal);
+      if before > 0 && lines.is_empty() {
+        return Err("kjo fature nuk ka pjese fiskale".to_string());
+      }
+    }
 
     let mut total = sale.total;
     let mut fiscal_total = sale.total;
@@ -844,9 +1112,14 @@ async fn invoice_export_pdf(state: tauri::State<'_, AppState>, sale_id: String) 
 
     let data = crate::invoice::InvoicePdfData {
       clinic_name,
+      header_png,
       invoice_id: sale.id.clone(),
       date: sale.date.clone(),
       client_name: client.name,
+      client_code: client.patient_code,
+      client_dob: client.dob,
+      client_address: client.address,
+      client_city: client.city,
       client_phone: client.phone,
       client_email: client.email,
       notes: sale.notes.clone(),
@@ -869,24 +1142,37 @@ fn main() {
     .setup(|app| {
       let handle = app.handle();
       let data_dir = handle.path().app_data_dir().map_err(|e| anyhow::anyhow!(e))?;
+
+      // Clinic reset is applied on startup (safe) so we can delete the SQLite file while it's closed.
+      let reset_flag = data_dir.join("reset.flag");
+      if reset_flag.exists() {
+        let _ = std::fs::remove_file(data_dir.join("mjeku.sqlite3"));
+        let _ = std::fs::remove_dir_all(data_dir.join("ui"));
+        let _ = std::fs::remove_dir_all(data_dir.join("fiscal"));
+        let _ = std::fs::remove_dir_all(data_dir.join("assets"));
+        let _ = std::fs::remove_file(&reset_flag);
+      }
       let db = Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?);
 
       let session = crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None);
       let auth = Arc::new(AuthState::new(session));
       let sync = Arc::new(SyncEngine::new(db.clone())?);
       let updates = Arc::new(UpdatesEngine::new(db.clone())?);
+      let license = Arc::new(LicenseEngine::new(db.clone())?);
 
       UpdatesEngine::apply_pending_on_startup(&handle)?;
       UpdatesEngine::ensure_seed_installed(&handle)?;
 
       sync.clone().spawn_background();
       updates.clone().spawn_background(handle.clone());
+      license.clone().spawn_background();
 
       app.manage(AppState {
         db,
         auth,
         sync,
         updates,
+        license,
       });
 
       // In dev, load the Vite dev server for fast iteration.
@@ -916,6 +1202,8 @@ fn main() {
       doctor_account_update,
       settings_get_all,
       settings_set,
+      clinic_asset_set_png,
+      clinic_asset_clear_png,
       clients_list,
       clients_upsert,
       clients_delete,
@@ -946,8 +1234,12 @@ fn main() {
       cash_delete,
       sync_now,
       updates_check_now,
+      desktop_updates_check_now,
+      desktop_updates_open_download,
       updates_apply_downloaded,
       reload_ui,
+      invoice_export_fiscal_inp,
+      admin_reset_clinic,
       invoice_export_pdf
     ])
     .run(tauri::generate_context!())

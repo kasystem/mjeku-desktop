@@ -18,6 +18,8 @@ set LIB=%VC_ROOT%\ATLMFC\lib\x64;%VC_ROOT%\lib\x64;%SDK_ROOT%\Lib\%SDK_VER%\um\x
 set INCLUDE=%VC_ROOT%\include;%VC_ROOT%\ATLMFC\include;%SDK_ROOT%\Include\%SDK_VER%\um;%SDK_ROOT%\Include\%SDK_VER%\shared;%SDK_ROOT%\Include\%SDK_VER%\ucrt;%SDK_ROOT%\Include\%SDK_VER%\winrt
 
 set NODE20=C:\Users\FATLIN~1\Desktop\Mjeku\.tools\node-v20.20.0-win-x64\node.exe
+rem Avoid "Access is denied" when a previous debug exe is still running/locked.
+set CARGO_TARGET_DIR=%CD%\src-tauri\target-dev
 
 echo [mjeku-desktop] Starting tauri dev...
 echo [mjeku-desktop] Using cargo:

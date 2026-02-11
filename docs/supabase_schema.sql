@@ -1,5 +1,5 @@
 -- Mjeku Supabase schema (run in Supabase SQL editor)
--- Tables: clients, sales, payments, doctors, services, appointments, visits, visit_items, cash_ledger
+-- Tables: clients, sales, payments, doctors, services, appointments, visits, visit_items, cash_ledger, app_license
 -- Notes:
 -- - This keeps `deleted` as an integer (0/1) to match the local SQLite schema.
 -- - You can either disable RLS (simplest for single-clinic project) or add permissive policies for anon.
@@ -12,6 +12,17 @@ create table if not exists public.clients (
   phone text,
   email text,
   notes text,
+  first_name text,
+  last_name text,
+  parent_name text,
+  dob date,
+  gender text,
+  city text,
+  address text,
+  allergies text,
+  weight_kg double precision,
+  height_cm double precision,
+  patient_code text,
   created_at timestamptz,
   updated_at timestamptz,
   deleted integer not null default 0
@@ -23,6 +34,8 @@ create table if not exists public.sales (
   date date,
   total double precision not null,
   notes text,
+  fiscalized integer not null default 0,
+  fiscalized_at timestamptz,
   created_at timestamptz,
   updated_at timestamptz,
   deleted integer not null default 0
@@ -43,7 +56,10 @@ create table if not exists public.payments (
 
 create table if not exists public.doctors (
   id uuid primary key,
+  code text,
   name text not null,
+  title text,
+  specialty text,
   phone text,
   email text,
   notes text,
@@ -52,10 +68,15 @@ create table if not exists public.doctors (
   deleted integer not null default 0
 );
 
+create unique index if not exists doctors_code_unique_idx
+  on public.doctors(code)
+  where code is not null and length(trim(code)) > 0;
+
 create table if not exists public.services (
   id uuid primary key,
   title text not null,
   default_price double precision not null,
+  vat_code text not null default 'C',
   notes text,
   created_at timestamptz,
   updated_at timestamptz,
@@ -96,6 +117,9 @@ create table if not exists public.visit_items (
   qty double precision not null,
   unit_price double precision not null,
   fiscal integer not null default 1,
+  vat_code text not null default 'C',
+  fiscalized integer not null default 0,
+  fiscalized_at timestamptz,
   notes text,
   created_at timestamptz,
   updated_at timestamptz,
@@ -113,6 +137,19 @@ create table if not exists public.cash_ledger (
   updated_at timestamptz,
   deleted integer not null default 0
 );
+
+-- License table (singleton row, editable by the vendor/admin)
+create table if not exists public.app_license (
+  singleton_id int primary key default 1,
+  active_until timestamptz,
+  disabled boolean not null default false,
+  updated_at timestamptz not null default now(),
+  constraint app_license_singleton check (singleton_id = 1)
+);
+
+insert into public.app_license (singleton_id, active_until, disabled, updated_at)
+values (1, now() + interval '30 days', false, now())
+on conflict (singleton_id) do nothing;
 
 create index if not exists clients_updated_at_idx on public.clients(updated_at);
 create index if not exists sales_client_id_idx on public.sales(client_id);
@@ -146,6 +183,8 @@ create index if not exists cash_ledger_type_idx on public.cash_ledger(type);
 create index if not exists cash_ledger_date_idx on public.cash_ledger(date);
 create index if not exists cash_ledger_updated_at_idx on public.cash_ledger(updated_at);
 
+create index if not exists app_license_updated_at_idx on public.app_license(updated_at);
+
 -- RLS guidance:
 -- Option A (simplest): disable RLS on these tables.
 --   alter table public.clients disable row level security;
@@ -157,6 +196,7 @@ create index if not exists cash_ledger_updated_at_idx on public.cash_ledger(upda
 --   alter table public.visits disable row level security;
 --   alter table public.visit_items disable row level security;
 --   alter table public.cash_ledger disable row level security;
+--   alter table public.app_license disable row level security;
 --
 -- Option B: enable RLS and allow anon read/write (only if this project is private to the clinic).
 --   alter table public.clients enable row level security;
@@ -177,3 +217,6 @@ create index if not exists cash_ledger_updated_at_idx on public.cash_ledger(upda
 --   create policy "anon_all_visit_items" on public.visit_items for all to anon using (true) with check (true);
 --   alter table public.cash_ledger enable row level security;
 --   create policy "anon_all_cash_ledger" on public.cash_ledger for all to anon using (true) with check (true);
+--   alter table public.app_license enable row level security;
+--   -- Only SELECT for license checks (do not allow anon writes).
+--   create policy "anon_select_license" on public.app_license for select to anon using (true);
