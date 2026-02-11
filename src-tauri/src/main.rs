@@ -1047,8 +1047,52 @@ async fn invoice_export_fiscal_inp(app: tauri::AppHandle, state: tauri::State<'_
 async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
   let _ = require_finance(&state).await?;
   tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-    let p = write_fiscal_temp_inp("x-raport", "X,1,______,_,__;")?;
-    Ok(p.display().to_string())
+    let mut files: Vec<String> = Vec::new();
+
+    let x1 = write_fiscal_temp_inp("x-raport", "X,1,______,_,__;")?;
+    files.push(x1.display().to_string());
+
+    let g1 = write_fiscal_temp_inp("x-status", "G,1,______,_,__;NoteStatus")?;
+    files.push(g1.display().to_string());
+    let g1_out = wait_out_text(&g1, Duration::from_secs(4));
+    let mut used_fallback = false;
+
+    if let Some(out) = g1_out.as_deref() {
+      if has_note_status_2(out) {
+        used_fallback = true;
+        let n = write_fiscal_temp_inp("x-close-open", "N,1,______,_,__;")?;
+        files.push(n.display().to_string());
+        let _ = wait_out_text(&n, Duration::from_secs(3));
+
+        let x2 = write_fiscal_temp_inp("x-raport-retry", "X,1,______,_,__;")?;
+        files.push(x2.display().to_string());
+        let _ = wait_out_text(&x2, Duration::from_secs(4));
+
+        let g2 = write_fiscal_temp_inp("x-status-after-retry", "G,1,______,_,__;NoteStatus")?;
+        files.push(g2.display().to_string());
+        let g2_out = wait_out_text(&g2, Duration::from_secs(4)).unwrap_or_default();
+
+        if has_note_status_2(&g2_out) {
+          bail!("X Raport nuk po ben: edhe pas N mbetet fature e hapur (NoteStatus;2).");
+        }
+      }
+    }
+
+    if used_fallback {
+      return Ok(format!(
+        "X Raport u dergua me fallback (G -> N -> X). Temp: {}",
+        files.join(" | ")
+      ));
+    }
+
+    if g1_out.is_none() {
+      return Ok(format!(
+        "X Raport u krijua ne Temp, por pa konfirmim nga pajisja fiskale. Temp: {}",
+        files.join(" | ")
+      ));
+    }
+
+    Ok(format!("X Raport u krijua ne Temp: {}", files.join(" | ")))
   })
     .await
     .map_err(err_string)?
