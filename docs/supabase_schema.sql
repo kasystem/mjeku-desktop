@@ -1,5 +1,5 @@
 -- Mjeku Supabase schema (run in Supabase SQL editor)
--- Tables: clients, sales, payments, doctors, services, appointments, visits, visit_items, cash_ledger, app_license
+-- Tables: clients, sales, payments, doctors, services, appointments, visits, visit_items, cash_ledger, app_license, clinic_registry
 -- Notes:
 -- - This keeps `deleted` as an integer (0/1) to match the local SQLite schema.
 -- - You can either disable RLS (simplest for single-clinic project) or add permissive policies for anon.
@@ -151,6 +151,21 @@ insert into public.app_license (singleton_id, active_until, disabled, updated_at
 values (1, now() + interval '30 days', false, now())
 on conflict (singleton_id) do nothing;
 
+-- Per-clinic approval, license and IP control (used by vendor web panel + desktop license engine).
+create table if not exists public.clinic_registry (
+  clinic_id uuid primary key,
+  clinic_name text,
+  approved boolean not null default false,
+  disabled boolean not null default false,
+  active_until timestamptz,
+  enforce_ip boolean not null default false,
+  allowed_ip_list text not null default '',
+  last_seen_ip text,
+  last_seen_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create index if not exists clients_updated_at_idx on public.clients(updated_at);
 create index if not exists sales_client_id_idx on public.sales(client_id);
 create index if not exists sales_date_idx on public.sales(date);
@@ -184,6 +199,9 @@ create index if not exists cash_ledger_date_idx on public.cash_ledger(date);
 create index if not exists cash_ledger_updated_at_idx on public.cash_ledger(updated_at);
 
 create index if not exists app_license_updated_at_idx on public.app_license(updated_at);
+create index if not exists clinic_registry_updated_at_idx on public.clinic_registry(updated_at);
+create index if not exists clinic_registry_approved_idx on public.clinic_registry(approved);
+create index if not exists clinic_registry_last_seen_at_idx on public.clinic_registry(last_seen_at);
 
 -- RLS guidance:
 -- Option A (simplest): disable RLS on these tables.
@@ -197,6 +215,7 @@ create index if not exists app_license_updated_at_idx on public.app_license(upda
 --   alter table public.visit_items disable row level security;
 --   alter table public.cash_ledger disable row level security;
 --   alter table public.app_license disable row level security;
+--   alter table public.clinic_registry disable row level security;
 --
 -- Option B: enable RLS and allow anon read/write (only if this project is private to the clinic).
 --   alter table public.clients enable row level security;
@@ -220,3 +239,8 @@ create index if not exists app_license_updated_at_idx on public.app_license(upda
 --   alter table public.app_license enable row level security;
 --   -- Only SELECT for license checks (do not allow anon writes).
 --   create policy "anon_select_license" on public.app_license for select to anon using (true);
+--   alter table public.clinic_registry enable row level security;
+--   -- Desktop clinics read/write only their own clinic_id rows.
+--   create policy "anon_select_clinic_registry" on public.clinic_registry for select to anon using (true);
+--   create policy "anon_upsert_clinic_registry" on public.clinic_registry for insert to anon with check (true);
+--   create policy "anon_update_clinic_registry" on public.clinic_registry for update to anon using (true) with check (true);
