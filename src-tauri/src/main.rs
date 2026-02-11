@@ -33,6 +33,7 @@ use crate::updates::UpdatesEngine;
 
 const LOGS_ADMIN_USER: &str = "fatlindadmin";
 const LOGS_ADMIN_PASS: &str = "Fatlind0)";
+const FISCAL_PRINTER_PROVIDER_KEY: &str = "fiscal_printer_provider";
 
 struct AppState {
   db: Arc<Db>,
@@ -127,6 +128,40 @@ fn wait_out_text(inp_path: &Path, timeout: Duration) -> Option<String> {
 fn has_note_status_2(raw: &str) -> bool {
   let s = raw.to_ascii_lowercase();
   s.contains("notestatus;2")
+}
+
+fn normalize_fiscal_printer_provider(v: &str) -> Option<String> {
+  let s = v.trim().to_ascii_lowercase().replace('-', "_").replace(' ', "_");
+  match s.as_str() {
+    "enternet" => Some("enternet".to_string()),
+    "global_eu" | "globaleu" | "global" => Some("global_eu".to_string()),
+    _ => None,
+  }
+}
+
+async fn get_fiscal_printer_provider(state: &tauri::State<'_, AppState>) -> Result<String, String> {
+  let db = state.db.clone();
+  let raw = tokio::task::spawn_blocking(move || db.setting_get(FISCAL_PRINTER_PROVIDER_KEY))
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?
+    .unwrap_or_default();
+
+  if raw.trim().is_empty() {
+    return Ok("enternet".to_string());
+  }
+
+  Ok(normalize_fiscal_printer_provider(&raw).unwrap_or_else(|| raw.trim().to_ascii_lowercase()))
+}
+
+fn require_enternet_for_fiscal(provider: &str) -> Result<(), String> {
+  if provider == "enternet" {
+    return Ok(());
+  }
+  if provider == "global_eu" {
+    return Err("Printeri fiskal i zgjedhur është Global EU. Ky model do të implementohet më vonë; zgjidh ENTERNET te Cilësimet për printim .inp.".to_string());
+  }
+  Err("Printeri fiskal nuk është i konfiguruar saktë. Te Cilësimet zgjidh ENTERNET ose Global EU.".to_string())
 }
 
 #[tauri::command]
@@ -480,6 +515,7 @@ async fn settings_set(state: tauri::State<'_, AppState>, key: String, value: Str
   if k.is_empty() {
     return Err("key is required".to_string());
   }
+  let mut v = value;
 
   let protected = matches!(
     k.as_str(),
@@ -505,8 +541,12 @@ async fn settings_set(state: tauri::State<'_, AppState>, key: String, value: Str
     let _ = require_login(&state).await?;
   }
 
+  if k == FISCAL_PRINTER_PROVIDER_KEY {
+    v = normalize_fiscal_printer_provider(&v).ok_or_else(|| "vlera e printerit fiskal duhet të jetë ENTERNET ose Global EU".to_string())?;
+  }
+
   let db = state.db.clone();
-  tokio::task::spawn_blocking(move || db.setting_set(&k, &value))
+  tokio::task::spawn_blocking(move || db.setting_set(&k, &v))
     .await
     .map_err(err_string)?
     .map_err(err_string)
@@ -1094,6 +1134,8 @@ async fn reload_ui(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn invoice_export_fiscal_inp(app: tauri::AppHandle, state: tauri::State<'_, AppState>, sale_id: String) -> Result<String, String> {
   let _ = require_finance(&state).await?;
+  let provider = get_fiscal_printer_provider(&state).await?;
+  require_enternet_for_fiscal(&provider)?;
   let sale_id = sale_id.trim().to_string();
   if sale_id.is_empty() {
     return Err("sale_id eshte i detyrueshem".to_string());
@@ -1118,6 +1160,8 @@ async fn invoice_export_fiscal_inp(app: tauri::AppHandle, state: tauri::State<'_
 #[tauri::command]
 async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
   let _ = require_finance(&state).await?;
+  let provider = get_fiscal_printer_provider(&state).await?;
+  require_enternet_for_fiscal(&provider)?;
   tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
     let mut files: Vec<String> = Vec::new();
 
@@ -1174,6 +1218,8 @@ async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String
 #[tauri::command]
 async fn fiscal_report_z_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
   let _ = require_finance(&state).await?;
+  let provider = get_fiscal_printer_provider(&state).await?;
+  require_enternet_for_fiscal(&provider)?;
   tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
     let mut files: Vec<String> = Vec::new();
 
@@ -1400,6 +1446,14 @@ fn main() {
         let _ = std::fs::remove_file(&reset_flag);
       }
       let db = Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?);
+      if db
+        .setting_get(FISCAL_PRINTER_PROVIDER_KEY)?
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+      {
+        db.setting_set(FISCAL_PRINTER_PROVIDER_KEY, "enternet")?;
+      }
       let error_log_path = data_dir.join("logs").join("errors.log");
       db.setting_set("error_log_path", &error_log_path.display().to_string())?;
 
