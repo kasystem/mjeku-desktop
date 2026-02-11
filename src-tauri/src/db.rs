@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -1137,6 +1138,87 @@ impl Db {
     Ok(())
   }
 
+  fn fiscal_vat_group_for_code(vat_code: &str, vat_e_group: i64) -> i64 {
+    match vat_code.trim().to_uppercase().as_str() {
+      "A" => 1,
+      "C" => 3,
+      "D" => 4,
+      "E" => vat_e_group,
+      _ => 3, // Default to C
+    }
+  }
+
+  fn fiscal_qty_str(qty: f64) -> String {
+    if (qty.round() - qty).abs() < 0.000_001 {
+      format!("{}", qty.round() as i64)
+    } else {
+      format!("{qty:.3}")
+    }
+  }
+
+  fn fiscal_sanitize_text(v: &str) -> String {
+    let mut s = v.replace('\r', " ").replace('\n', " ").replace(';', ",");
+    s = s.trim().to_string();
+    if s.is_empty() {
+      return "Sherbim".to_string();
+    }
+    if s.len() > 120 {
+      s.truncate(120);
+    }
+    s
+  }
+
+  fn fiscal_write_inp_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
+    let tmp_name = format!(
+      "{}.tmp-{}",
+      path.file_name().and_then(|x| x.to_str()).unwrap_or("fiscal.inp"),
+      &Uuid::new_v4().to_string()[..8]
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+
+    {
+      let mut f = fs::File::create(&tmp_path).with_context(|| format!("create tmp inp: {}", tmp_path.display()))?;
+      f.write_all(body.as_bytes())
+        .with_context(|| format!("write tmp inp: {}", tmp_path.display()))?;
+      f.flush().with_context(|| format!("flush tmp inp: {}", tmp_path.display()))?;
+      let _ = f.sync_all();
+    }
+
+    fs::rename(&tmp_path, path).with_context(|| format!("rename tmp->inp: {} -> {}", tmp_path.display(), path.display()))?;
+    Ok(())
+  }
+
+  fn fiscal_wait_out_text(inp_path: &Path, timeout: Duration) -> Option<String> {
+    let out_path = inp_path.with_extension("out");
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+      match fs::read_to_string(&out_path) {
+        Ok(x) => return Some(x),
+        Err(e) => {
+          if e.kind() != std::io::ErrorKind::NotFound {
+            return Some(format!("read_out_error: {}", e));
+          }
+        }
+      }
+      std::thread::sleep(Duration::from_millis(150));
+    }
+    None
+  }
+
+  fn fiscal_out_has_error(raw: &str) -> bool {
+    let s = raw.to_ascii_lowercase();
+    s.contains("error")
+      || s.contains("invalid")
+      || s.contains("syntax")
+      || s.contains("failed")
+      || s.contains("gabim")
+      || s.contains("not allowed")
+  }
+
+  fn fiscal_out_note_status_2(raw: &str) -> bool {
+    raw.to_ascii_lowercase().contains("notestatus;2")
+  }
+
   pub fn fiscal_receipt_generate_inp(&self, sale_id: &str, output_dir: &Path) -> anyhow::Result<PathBuf> {
     let sale_id = sale_id.trim();
     if sale_id.is_empty() {
@@ -1145,74 +1227,50 @@ impl Db {
 
     fs::create_dir_all(output_dir).with_context(|| format!("create fiscal dir: {}", output_dir.display()))?;
 
-    let now = now_iso();
-    let mut conn = self.conn()?;
-    let tx = conn.transaction()?;
+    let vat_e_group: i64 = self
+      .setting_get("fiscal_vat_e_group")?
+      .and_then(|v| v.trim().parse::<i64>().ok())
+      .filter(|v| *v == 2 || *v == 4 || *v == 5)
+      .unwrap_or(5);
 
-    let sale: Sale = tx
-      .query_row(
-        "SELECT id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted
-         FROM sales WHERE id=?1",
-        params![sale_id],
-        |row| {
-          Ok(Sale {
-            id: row.get(0)?,
-            client_id: row.get(1)?,
-            date: row.get(2)?,
-            total: row.get(3)?,
-            notes: row.get(4)?,
-            fiscalized: row.get(5)?,
-            fiscalized_at: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
-            deleted: row.get(9)?,
-          })
-        },
-      )
-      .optional()?
-      .ok_or_else(|| anyhow!("fatura nuk u gjet"))?;
-    if sale.deleted != 0 {
-      bail!("fatura eshte e fshire");
-    }
-
-    let client: Client = tx
-      .query_row(
-        "SELECT id, name, phone, email, notes,
-                first_name, last_name, parent_name, dob, gender, city, address, allergies, weight_kg, height_cm, patient_code,
-                created_at, updated_at, deleted
-         FROM clients WHERE id=?1",
-        params![&sale.client_id],
-        |row| {
-          Ok(Client {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            phone: row.get(2)?,
-            email: row.get(3)?,
-            notes: row.get(4)?,
-            first_name: row.get(5)?,
-            last_name: row.get(6)?,
-            parent_name: row.get(7)?,
-            dob: row.get(8)?,
-            gender: row.get(9)?,
-            city: row.get(10)?,
-            address: row.get(11)?,
-            allergies: row.get(12)?,
-            weight_kg: row.get(13)?,
-            height_cm: row.get(14)?,
-            patient_code: row.get(15)?,
-            created_at: row.get(16)?,
-            updated_at: row.get(17)?,
-            deleted: row.get(18)?,
-          })
-        },
-      )
-      .optional()?
-      .ok_or_else(|| anyhow!("pacienti nuk u gjet"))?;
-
-    // Only fiscal (kupon) rows that haven't been fiscalized yet.
+    let sale: Sale;
     let mut items: Vec<VisitItem> = Vec::new();
     {
-      let mut stmt = tx.prepare(
+      let conn = self.conn()?;
+      sale = conn
+        .query_row(
+          "SELECT id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted
+           FROM sales WHERE id=?1",
+          params![sale_id],
+          |row| {
+            Ok(Sale {
+              id: row.get(0)?,
+              client_id: row.get(1)?,
+              date: row.get(2)?,
+              total: row.get(3)?,
+              notes: row.get(4)?,
+              fiscalized: row.get(5)?,
+              fiscalized_at: row.get(6)?,
+              created_at: row.get(7)?,
+              updated_at: row.get(8)?,
+              deleted: row.get(9)?,
+            })
+          },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("fatura nuk u gjet"))?;
+      if sale.deleted != 0 {
+        bail!("fatura eshte e fshire");
+      }
+
+      let client_exists: Option<String> = conn
+        .query_row("SELECT id FROM clients WHERE id=?1", params![&sale.client_id], |row| row.get(0))
+        .optional()?;
+      if client_exists.is_none() {
+        bail!("pacienti nuk u gjet");
+      }
+
+      let mut stmt = conn.prepare(
         "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
          FROM visit_items
          WHERE visit_id=?1 AND deleted=0 AND fiscal=1 AND fiscalized=0
@@ -1245,34 +1303,80 @@ impl Db {
       bail!("nuk ka rreshta fiskal pa fiskalizuar");
     }
 
-    // Create the .inp file (generic text format; integrate with your fiscal printer software).
-    let file_name = format!("kupon-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]);
-    let path = output_dir.join(file_name);
-    let mut body = String::new();
-    body.push_str("MJEKU_FISCAL_INP\n");
-    body.push_str(&format!("sale_id={}\n", sale.id));
-    body.push_str(&format!("date={}\n", sale.date.clone().unwrap_or_default()));
-    body.push_str(&format!("client_name={}\n", client.name));
-    body.push_str(&format!("client_phone={}\n", client.phone.clone().unwrap_or_default()));
-    body.push_str("items:\n");
+    // Step A: check if there is an open note. If NoteStatus=2, close with N before real sale.
+    let g_path = output_dir.join(format!("status-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
+    Self::fiscal_write_inp_atomic(&g_path, "G,1,______,_,__;NoteStatus\n")?;
+    if let Some(out) = Self::fiscal_wait_out_text(&g_path, Duration::from_secs(4)) {
+      if Self::fiscal_out_note_status_2(&out) {
+        let n_path = output_dir.join(format!("cancel-open-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
+        Self::fiscal_write_inp_atomic(&n_path, "N,1,______,_,__;\n")?;
+        let _ = Self::fiscal_wait_out_text(&n_path, Duration::from_secs(3));
+      }
+    }
+
+    // Real sale lines: only actual sale items (no test rows).
+    let mut sale_body = String::new();
     let mut total = 0.0_f64;
-    for it in &items {
-      let sub = it.qty * it.unit_price;
+    for (idx, it) in items.iter().enumerate() {
+      let qty = if it.qty.is_finite() && it.qty > 0.0 { it.qty } else { 1.0 };
+      let unit_price = if it.unit_price.is_finite() && it.unit_price >= 0.0 {
+        it.unit_price
+      } else {
+        0.0
+      };
+      let sub = qty * unit_price;
       total += sub;
-      body.push_str(&format!(
-        "- tooth={} title={} qty={} unit_price={} total={} vat_code={}\n",
-        it.tooth.clone().unwrap_or_default(),
-        it.title.replace('\n', " ").replace('\r', " "),
-        it.qty,
-        it.unit_price,
-        sub,
-        it.vat_code
+
+      let desc = Self::fiscal_sanitize_text(&it.title);
+      let vat_group = Self::fiscal_vat_group_for_code(&it.vat_code, vat_e_group);
+      let item_code = 15001_i64 + idx as i64;
+      sale_body.push_str(&format!(
+        "S,1,______,_,__;{};{:.2};{};1;1;{};0;{};0;0\n",
+        desc,
+        unit_price,
+        Self::fiscal_qty_str(qty),
+        vat_group,
+        item_code
       ));
     }
-    body.push_str(&format!("TOTAL={}\n", total));
-    fs::write(&path, body.as_bytes()).with_context(|| format!("write inp: {}", path.display()))?;
+    sale_body.push_str("T,1,______,_,__;\n");
+
+    let primary_path = output_dir.join(format!("kupon-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
+    Self::fiscal_write_inp_atomic(&primary_path, &sale_body)?;
+    let primary_out = Self::fiscal_wait_out_text(&primary_path, Duration::from_secs(8));
+
+    // Step B: if S/T failed, fallback with K + real S/T.
+    let mut final_path = primary_path.clone();
+    let mut failed_after_fallback = false;
+    if let Some(out) = primary_out.as_deref() {
+      if Self::fiscal_out_has_error(out) {
+        let mut k_body = String::from("K,1,______,_,__;;1;0000;;;;;;1;\n");
+        k_body.push_str(&sale_body);
+        let k_path = output_dir.join(format!("kupon-k-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
+        Self::fiscal_write_inp_atomic(&k_path, &k_body)?;
+        final_path = k_path.clone();
+        let k_out = Self::fiscal_wait_out_text(&k_path, Duration::from_secs(8));
+        if let Some(k_out) = k_out.as_deref() {
+          if Self::fiscal_out_has_error(k_out) {
+            failed_after_fallback = true;
+          }
+        }
+      }
+    }
+
+    // Step C: if still failing, try forced close T(cash) and then N.
+    if failed_after_fallback {
+      let close_body = format!("T,1,______,_,__;0;{:.2};;;;\nN,1,______,_,__;\n", total);
+      let close_path = output_dir.join(format!("kupon-close-{}-{}.inp", sale.id, &Uuid::new_v4().to_string()[..8]));
+      Self::fiscal_write_inp_atomic(&close_path, &close_body)?;
+      let _ = Self::fiscal_wait_out_text(&close_path, Duration::from_secs(6));
+      bail!("fiskalizimi deshtoi edhe pas fallback (K dhe mbyllja T/N).");
+    }
 
     // Mark items as fiscalized and queue them for sync.
+    let now = now_iso();
+    let mut conn = self.conn()?;
+    let tx = conn.transaction()?;
     for it in &mut items {
       tx.execute(
         "UPDATE visit_items SET fiscalized=1, fiscalized_at=?2, updated_at=?2 WHERE id=?1",
@@ -1285,7 +1389,6 @@ impl Db {
       Self::queue_replace_pending_tx(&tx, "visit_items", &it.id, "upsert", &payload, &now)?;
     }
 
-    // Mark the sale as fiscalized (at least once). If more fiscal rows are added later, it can be fiscalized again.
     tx.execute(
       "UPDATE sales SET fiscalized=1, fiscalized_at=?2, updated_at=?2 WHERE id=?1",
       params![sale_id, &now],
@@ -1300,7 +1403,7 @@ impl Db {
     Self::queue_replace_pending_tx(&tx, "sales", &updated_sale.id, "upsert", &payload, &now)?;
 
     tx.commit()?;
-    Ok(path)
+    Ok(final_path)
   }
 
   pub fn payments_list(&self, filters: Option<PaymentsListFilters>) -> anyhow::Result<Vec<Payment>> {

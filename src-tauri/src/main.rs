@@ -85,7 +85,16 @@ fn write_fiscal_temp_inp(prefix: &str, body: &str) -> anyhow::Result<PathBuf> {
   let rnd = uuid::Uuid::new_v4().to_string();
   let name = format!("{}-{}-{}.inp", prefix, ts, &rnd[..8]);
   let path = dir.join(name);
-  std::fs::write(&path, body.as_bytes())?;
+  let tmp_name = format!("{}.tmp-{}", path.file_name().and_then(|x| x.to_str()).unwrap_or("fiscal.inp"), &rnd[..8]);
+  let tmp_path = path.with_file_name(tmp_name);
+  {
+    use std::io::Write;
+    let mut f = std::fs::File::create(&tmp_path)?;
+    f.write_all(body.as_bytes())?;
+    f.flush()?;
+    let _ = f.sync_all();
+  }
+  std::fs::rename(&tmp_path, &path)?;
   Ok(path)
 }
 
