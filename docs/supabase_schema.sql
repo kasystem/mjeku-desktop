@@ -213,6 +213,13 @@ on conflict (singleton_id) do nothing;
 create table if not exists public.clinic_registry (
   clinic_id uuid primary key,
   clinic_name text,
+  owner_name text,
+  contact_phone text,
+  contact_email text,
+  address text,
+  city text,
+  business_no text,
+  website text,
   approved boolean not null default false,
   disabled boolean not null default false,
   active_until timestamptz,
@@ -223,6 +230,14 @@ create table if not exists public.clinic_registry (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.clinic_registry add column if not exists owner_name text;
+alter table public.clinic_registry add column if not exists contact_phone text;
+alter table public.clinic_registry add column if not exists contact_email text;
+alter table public.clinic_registry add column if not exists address text;
+alter table public.clinic_registry add column if not exists city text;
+alter table public.clinic_registry add column if not exists business_no text;
+alter table public.clinic_registry add column if not exists website text;
 
 -- Onboarding tokens (vendor creates; desktop consumes once or multiple times).
 create table if not exists public.clinic_tokens (

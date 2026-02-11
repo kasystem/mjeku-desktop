@@ -14,6 +14,13 @@ const KEY_SUPABASE_API_KEY: &str = "supabase_api_key";
 
 const KEY_CLINIC_ID: &str = "clinic_id";
 const KEY_CLINIC_NAME: &str = "clinic_name";
+const KEY_CLINIC_OWNER_NAME: &str = "clinic_owner_name";
+const KEY_CLINIC_PHONE: &str = "clinic_phone";
+const KEY_CLINIC_EMAIL: &str = "clinic_email";
+const KEY_CLINIC_ADDRESS: &str = "clinic_address";
+const KEY_CLINIC_CITY: &str = "clinic_city";
+const KEY_CLINIC_BUSINESS_NO: &str = "clinic_business_no";
+const KEY_CLINIC_WEBSITE: &str = "clinic_website";
 
 const KEY_ERROR_LOG_PATH: &str = "error_log_path";
 
@@ -186,6 +193,25 @@ impl LicenseEngine {
       return Ok(());
     }
     let clinic_name = self.db.setting_get(KEY_CLINIC_NAME)?.unwrap_or_default();
+    let clinic_owner_name = self
+      .db
+      .setting_get(KEY_CLINIC_OWNER_NAME)?
+      .unwrap_or_default();
+    let clinic_phone = self.db.setting_get(KEY_CLINIC_PHONE)?.unwrap_or_default();
+    let clinic_email = self.db.setting_get(KEY_CLINIC_EMAIL)?.unwrap_or_default();
+    let clinic_address = self
+      .db
+      .setting_get(KEY_CLINIC_ADDRESS)?
+      .unwrap_or_default();
+    let clinic_city = self.db.setting_get(KEY_CLINIC_CITY)?.unwrap_or_default();
+    let clinic_business_no = self
+      .db
+      .setting_get(KEY_CLINIC_BUSINESS_NO)?
+      .unwrap_or_default();
+    let clinic_website = self
+      .db
+      .setting_get(KEY_CLINIC_WEBSITE)?
+      .unwrap_or_default();
 
     let base = supabase_url.unwrap().trim_end_matches('/').to_string();
     let api_key = api_key.unwrap();
@@ -235,6 +261,13 @@ impl LicenseEngine {
       let create_payload = serde_json::json!({
         "clinic_id": clinic_id.trim(),
         "clinic_name": clinic_name.trim(),
+        "owner_name": clinic_owner_name.trim(),
+        "contact_phone": clinic_phone.trim(),
+        "contact_email": clinic_email.trim(),
+        "address": clinic_address.trim(),
+        "city": clinic_city.trim(),
+        "business_no": clinic_business_no.trim(),
+        "website": clinic_website.trim(),
         "approved": false,
         "disabled": false,
         "active_until": serde_json::Value::Null,
@@ -301,6 +334,13 @@ impl LicenseEngine {
     // Heartbeat: update seen info; ignore errors.
     let heartbeat_payload = serde_json::json!({
       "clinic_name": clinic_name.trim(),
+      "owner_name": clinic_owner_name.trim(),
+      "contact_phone": clinic_phone.trim(),
+      "contact_email": clinic_email.trim(),
+      "address": clinic_address.trim(),
+      "city": clinic_city.trim(),
+      "business_no": clinic_business_no.trim(),
+      "website": clinic_website.trim(),
       "last_seen_at": now,
       "last_seen_ip": public_ip.clone().unwrap_or_default(),
       "updated_at": now
