@@ -54,8 +54,20 @@ fn vat_included_amount(gross: f64, rate: f64) -> f64 {
   if rate <= 0.0 {
     return 0.0;
   }
-  // If the price is VAT-inclusive: VAT = gross - gross/(1+rate)
   gross - (gross / (1.0 + rate))
+}
+
+fn clamp_text(s: &str, max: usize) -> String {
+  let t = s.trim();
+  if t.chars().count() <= max {
+    return t.to_string();
+  }
+  let mut out = String::new();
+  for ch in t.chars().take(max.saturating_sub(3)) {
+    out.push(ch);
+  }
+  out.push_str("...");
+  out
 }
 
 fn write_line_with_font(
@@ -93,11 +105,9 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
   let left = 14.0_f32;
   let right = 14.0_f32;
   let top = 12.0_f32;
-
-  let mut y = (page_h - top) as f32;
+  let mut y = page_h - top;
   let lh = 6.2_f32;
 
-  // Optional header image (PNG) set by the clinic.
   if let Some(bytes) = data.header_png.as_deref() {
     let mut cur = Cursor::new(bytes);
     let decoder = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur).context("decode header png")?;
@@ -106,46 +116,95 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
     let w_px = img.image.width.0 as f32;
     let h_px = img.image.height.0 as f32;
     if w_px > 0.0 && h_px > 0.0 {
-      let target_w_mm = page_w - left - right;
-      let header_h_mm = target_w_mm * (h_px / w_px);
-      let top_y = page_h - top;
-      let lower_y = top_y - header_h_mm;
+      let available_w = page_w - left - right;
+      let natural_h = available_w * (h_px / w_px);
+      let max_h = 85.0_f32;
+      let (draw_w, draw_h) = if natural_h <= max_h {
+        (available_w, natural_h)
+      } else {
+        (max_h * (w_px / h_px), max_h)
+      };
+      let x = left + ((available_w - draw_w) / 2.0);
+      let lower_y = page_h - top - draw_h;
 
-      // Fit to width, keep aspect ratio.
       let dpi: f32 = 300.0;
-      let scale: f32 = (target_w_mm as f32) * dpi / ((w_px as f32) * 25.4);
+      let scale_x: f32 = draw_w * dpi / (w_px * 25.4);
+      let scale_y: f32 = draw_h * dpi / (h_px * 25.4);
       img.add_to_layer(
         layer.clone(),
         ImageTransform {
-          translate_x: Some(Mm(left)),
+          translate_x: Some(Mm(x)),
           translate_y: Some(Mm(lower_y)),
           rotate: None,
-          scale_x: Some(scale),
-          scale_y: Some(scale),
+          scale_x: Some(scale_x),
+          scale_y: Some(scale_y),
           dpi: Some(dpi),
         },
       );
 
-      // Start text below the header.
-      y = (lower_y - 6.0) as f32;
+      y = lower_y - 8.0;
     }
   } else {
-    // Fallback without header image.
-    layer.use_text(data.clinic_name.clone(), 18.0, Mm(left), Mm(y), &font_b);
-    y -= lh + 2.0;
+    write_line_with_font(
+      &doc,
+      &mut page,
+      &mut layer,
+      &mut y,
+      left,
+      lh,
+      &font_b,
+      data.clinic_name.clone(),
+      18.0,
+    )?;
+    y -= 2.0;
   }
 
-  layer.use_text("Faturë (PDF)".to_string(), 12.0, Mm(left), Mm(y), &font_b);
-  y -= lh;
-  write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("ID: {}", data.invoice_id), 10.5)?;
-  if let Some(d) = data.date.as_deref().filter(|s| !s.trim().is_empty()) {
-    write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Data: {d}"), 10.5)?;
-  }
+  write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font_b, "FATURË".to_string(), 14.0)?;
+  let date_str = data
+    .date
+    .as_deref()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| "-".to_string());
+  write_line_with_font(
+    &doc,
+    &mut page,
+    &mut layer,
+    &mut y,
+    left,
+    lh,
+    &font,
+    format!("Nr: {}    Data: {}", data.invoice_id, date_str),
+    10.5,
+  )?;
   write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, "".to_string(), 10.0)?;
 
-  layer.use_text(format!("Pacienti: {}", data.client_name), 12.0, Mm(left), Mm(y), &font_b);
-  y -= lh;
-  if data.client_code.as_deref().unwrap_or("").trim().len() > 0 {
+  write_line_with_font(
+    &doc,
+    &mut page,
+    &mut layer,
+    &mut y,
+    left,
+    lh,
+    &font_b,
+    "Të dhënat e pacientit".to_string(),
+    11.5,
+  )?;
+  write_line_with_font(
+    &doc,
+    &mut page,
+    &mut layer,
+    &mut y,
+    left,
+    lh,
+    &font,
+    format!("Emri: {}", data.client_name),
+    10.5,
+  )?;
+  if let Some(v) = data.client_code.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Kodi: {v}"), 10.5)?;
+  }
+  if let Some(v) = data.client_dob.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
     write_line_with_font(
       &doc,
       &mut page,
@@ -154,73 +213,36 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
       left,
       lh,
       &font,
-      format!("Kodi: {}", data.client_code.as_deref().unwrap_or("")),
+      format!("Data e lindjes: {v}"),
       10.5,
     )?;
   }
-  if data.client_dob.as_deref().unwrap_or("").trim().len() > 0 {
-    write_line_with_font(
-      &doc,
-      &mut page,
-      &mut layer,
-      &mut y,
-      left,
-      lh,
-      &font,
-      format!("Data e lindjes: {}", data.client_dob.as_deref().unwrap_or("")),
-      10.5,
-    )?;
-  }
-  if data.client_address.as_deref().unwrap_or("").trim().len() > 0 || data.client_city.as_deref().unwrap_or("").trim().len() > 0 {
-    let addr = data.client_address.as_deref().unwrap_or("").trim();
-    let city = data.client_city.as_deref().unwrap_or("").trim();
-    let mut line = String::new();
+  let addr = data.client_address.as_deref().unwrap_or("").trim();
+  let city = data.client_city.as_deref().unwrap_or("").trim();
+  if !addr.is_empty() || !city.is_empty() {
+    let mut v = String::new();
     if !addr.is_empty() {
-      line.push_str(addr);
+      v.push_str(addr);
     }
     if !city.is_empty() {
-      if !line.is_empty() {
-        line.push_str(", ");
+      if !v.is_empty() {
+        v.push_str(", ");
       }
-      line.push_str(city);
+      v.push_str(city);
     }
-    if !line.is_empty() {
-      write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Adresa: {}", line), 10.5)?;
-    }
+    write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Adresa: {v}"), 10.5)?;
   }
-  if data.client_phone.as_deref().unwrap_or("").trim().len() > 0 {
-    write_line_with_font(
-      &doc,
-      &mut page,
-      &mut layer,
-      &mut y,
-      left,
-      lh,
-      &font,
-      format!("Tel: {}", data.client_phone.as_deref().unwrap_or("")),
-      10.5,
-    )?;
+  if let Some(v) = data.client_phone.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Tel: {v}"), 10.5)?;
   }
-  if data.client_email.as_deref().unwrap_or("").trim().len() > 0 {
-    write_line_with_font(
-      &doc,
-      &mut page,
-      &mut layer,
-      &mut y,
-      left,
-      lh,
-      &font,
-      format!("Email: {}", data.client_email.as_deref().unwrap_or("")),
-      10.5,
-    )?;
+  if let Some(v) = data.client_email.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Email: {v}"), 10.5)?;
   }
-  if let Some(n) = data.notes.as_deref().filter(|s| !s.trim().is_empty()) {
-    write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Shenime: {}", n.trim()), 10.5)?;
+  if let Some(v) = data.notes.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Shënime: {v}"), 10.5)?;
   }
 
   write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, "".to_string(), 10.0)?;
-  layer.use_text("Procedurat".to_string(), 12.0, Mm(left), Mm(y), &font_b);
-  y -= lh;
   write_line_with_font(
     &doc,
     &mut page,
@@ -228,9 +250,9 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
     &mut y,
     left,
     lh,
-    &font,
-    "Dh | Procedura                       | Sasia | Cmimi | Totali | F | TVSH".to_string(),
-    9.0,
+    &font_b,
+    "Nr | Përshkrimi                               | Sasia | Çmimi  | TVSH | Totali".to_string(),
+    9.2,
   )?;
   write_line_with_font(
     &doc,
@@ -240,47 +262,37 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
     left,
     lh,
     &font,
-    "-------------------------------------------------------------------------------".to_string(),
+    "--------------------------------------------------------------------------------".to_string(),
     9.0,
   )?;
+
+  let mut subtotal = 0.0_f64;
+  let mut vat8 = 0.0_f64;
+  let mut vat18 = 0.0_f64;
 
   if data.lines.is_empty() {
     write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, "(pa rreshta)".to_string(), 10.0)?;
   } else {
-    let mut vat8 = 0.0_f64;
-    let mut vat18 = 0.0_f64;
-    for ln in &data.lines {
-      let tooth = ln.tooth.clone().unwrap_or_else(|| "".to_string());
-      let title = if ln.title.len() > 32 {
-        format!("{}...", &ln.title[..29])
-      } else {
+    for (idx, ln) in data.lines.iter().enumerate() {
+      let tooth = ln.tooth.as_deref().unwrap_or("").trim();
+      let description = if tooth.is_empty() {
         ln.title.clone()
+      } else {
+        format!("Dh {} - {}", tooth, ln.title)
       };
+      let description = clamp_text(&description, 38);
+      let vat_code = ln.vat_code.trim().to_uppercase();
       let sub = ln.qty * ln.unit_price;
-      let rate = vat_rate_for(&ln.vat_code);
+      subtotal += sub;
+
+      let rate = vat_rate_for(&vat_code);
       let vat = vat_included_amount(sub, rate);
       if (rate - 0.08).abs() < 0.000_000_1 {
         vat8 += vat;
       } else if (rate - 0.18).abs() < 0.000_000_1 {
         vat18 += vat;
       }
-      let fiscal = if ln.fiscal { "Po" } else { "Jo" };
-      let line = format!(
-        "{:>2} | {:<30} | {:>4} | {:>5} | {:>6} | {} | {}",
-        tooth,
-        title,
-        money(ln.qty),
-        money(ln.unit_price),
-        money(sub),
-        fiscal,
-        ln.vat_code.trim().to_uppercase()
-      );
-      write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, line, 9.0)?;
-    }
 
-    // VAT summary (assuming prices are VAT-inclusive).
-    if vat8 > 0.0 || vat18 > 0.0 {
-      write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, "".to_string(), 10.0)?;
       write_line_with_font(
         &doc,
         &mut page,
@@ -289,16 +301,20 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
         left,
         lh,
         &font,
-        format!("TVSH (përfshirë në çmim): 8% = {} | 18% = {}", money(vat8), money(vat18)),
-        10.0,
+        format!(
+          "{:>2} | {:<38} | {:>5} | {:>6} | {:>4} | {:>7}",
+          idx + 1,
+          description,
+          money(ln.qty),
+          money(ln.unit_price),
+          vat_code,
+          money(sub)
+        ),
+        9.0,
       )?;
     }
   }
 
-  write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, "".to_string(), 10.0)?;
-  layer.use_text(format!("Totali: {}", money(data.total)), 12.0, Mm(left), Mm(y), &font_b);
-  y -= lh;
-  write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, format!("Fiskal: {}", money(data.fiscal_total)), 10.5)?;
   write_line_with_font(
     &doc,
     &mut page,
@@ -307,20 +323,7 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
     left,
     lh,
     &font,
-    format!("Jo-fiskal: {}", money(data.non_fiscal_total)),
-    10.5,
-  )?;
-
-  write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, "".to_string(), 10.0)?;
-  write_line_with_font(
-    &doc,
-    &mut page,
-    &mut layer,
-    &mut y,
-    left,
-    lh,
-    &font,
-    "Shënim: Ky PDF është gjeneruar nga aplikacioni Mjeku (offline-first).".to_string(),
+    "--------------------------------------------------------------------------------".to_string(),
     9.0,
   )?;
   write_line_with_font(
@@ -331,7 +334,64 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
     left,
     lh,
     &font,
-    "Kupon fiskal mund të jetë i ndarë sipas rreshtave (Fiskal: Po/Jo).".to_string(),
+    format!("Nëntotali: {}", money(subtotal)),
+    10.5,
+  )?;
+  if vat8 > 0.0 || vat18 > 0.0 {
+    write_line_with_font(
+      &doc,
+      &mut page,
+      &mut layer,
+      &mut y,
+      left,
+      lh,
+      &font,
+      format!("TVSH e përfshirë në çmim: 8% = {} | 18% = {}", money(vat8), money(vat18)),
+      10.0,
+    )?;
+  }
+
+  write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, "".to_string(), 10.0)?;
+  write_line_with_font(
+    &doc,
+    &mut page,
+    &mut layer,
+    &mut y,
+    left,
+    lh,
+    &font_b,
+    format!("Totali për pagesë: {}", money(data.total)),
+    12.0,
+  )?;
+
+  if data.fiscal_total > 0.0 && data.non_fiscal_total > 0.0 {
+    write_line_with_font(
+      &doc,
+      &mut page,
+      &mut layer,
+      &mut y,
+      left,
+      lh,
+      &font,
+      format!(
+        "Ndarje informative: fiskal {} | jo-fiskal {}",
+        money(data.fiscal_total),
+        money(data.non_fiscal_total)
+      ),
+      9.8,
+    )?;
+  }
+
+  write_line_with_font(&doc, &mut page, &mut layer, &mut y, left, lh, &font, "".to_string(), 10.0)?;
+  write_line_with_font(
+    &doc,
+    &mut page,
+    &mut layer,
+    &mut y,
+    left,
+    lh,
+    &font,
+    "Dokument PDF i gjeneruar nga aplikacioni Mjeku.".to_string(),
     9.0,
   )?;
 
@@ -340,3 +400,4 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
   let cursor = writer.into_inner().map_err(|e| anyhow!("save pdf: {e}"))?;
   Ok(cursor.into_inner())
 }
+
