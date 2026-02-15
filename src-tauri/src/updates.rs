@@ -29,477 +29,518 @@ const PENDING_PTR_FILENAME: &str = "pending";
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateManifest {
-  pub latest_version: String,
-  pub published_at: String,
-  pub sha256: String,
-  pub bundle_path: String,
+    pub latest_version: String,
+    pub published_at: String,
+    pub sha256: String,
+    pub bundle_path: String,
 }
 
 pub struct UpdatesEngine {
-  db: std::sync::Arc<Db>,
-  client: reqwest::Client,
-  lock: tokio::sync::Mutex<()>,
+    db: std::sync::Arc<Db>,
+    client: reqwest::Client,
+    lock: tokio::sync::Mutex<()>,
 }
 
 fn find_resource_file(app: &tauri::AppHandle, name: &str) -> anyhow::Result<PathBuf> {
-  let dir = app.path().resource_dir()?;
-  let mut tries: Vec<PathBuf> = Vec::new();
+    let dir = app.path().resource_dir()?;
+    let mut tries: Vec<PathBuf> = Vec::new();
 
-  // Typical layout in dev/release.
-  tries.push(dir.join(name));
-  tries.push(dir.join("resources").join(name));
+    // Typical layout in dev/release.
+    tries.push(dir.join(name));
+    tries.push(dir.join("resources").join(name));
 
-  // `tauri dev` can sometimes not copy resources into `resource_dir()` on Windows. Fall back to the
-  // source-tree `src-tauri/resources` by walking up from the executable:
-  //   .../src-tauri/target/debug/<exe>
-  if let Ok(exe) = std::env::current_exe() {
-    if let Some(src_tauri_dir) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-      tries.push(src_tauri_dir.join("resources").join(name));
+    // `tauri dev` can sometimes not copy resources into `resource_dir()` on Windows. Fall back to the
+    // source-tree `src-tauri/resources` by walking up from the executable:
+    //   .../src-tauri/target/debug/<exe>
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(src_tauri_dir) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            tries.push(src_tauri_dir.join("resources").join(name));
+        }
     }
-  }
 
-  // Also try relative to the current working directory (when running from the repo root).
-  if let Ok(cwd) = std::env::current_dir() {
-    tries.push(cwd.join("src-tauri").join("resources").join(name));
-    tries.push(cwd.join("resources").join(name));
-  }
-
-  for p in &tries {
-    if p.exists() {
-      return Ok(p.clone());
+    // Also try relative to the current working directory (when running from the repo root).
+    if let Ok(cwd) = std::env::current_dir() {
+        tries.push(cwd.join("src-tauri").join("resources").join(name));
+        tries.push(cwd.join("resources").join(name));
     }
-  }
 
-  bail!(
-    "missing resource: tried {}",
-    tries
-      .iter()
-      .map(|p| p.display().to_string())
-      .collect::<Vec<_>>()
-      .join(" | ")
-  )
+    for p in &tries {
+        if p.exists() {
+            return Ok(p.clone());
+        }
+    }
+
+    bail!(
+        "missing resource: tried {}",
+        tries
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    )
 }
 
 fn ui_bundle_looks_compatible(dir: &Path) -> bool {
-  // Compatibility guard: when the backend API changes, we must not keep an older UI bundle
-  // (even if it has index.html), otherwise the app breaks offline. We detect a compatible UI
-  // by checking for a few "needles" that are expected to exist in the built JS bundle.
-  let assets = dir.join("assets");
-  let rd = match fs::read_dir(&assets) {
-    Ok(r) => r,
-    Err(_) => return false,
-  };
+    // Compatibility guard: when the backend API changes, we must not keep an older UI bundle
+    // (even if it has index.html), otherwise the app breaks offline. We detect a compatible UI
+    // by checking for a few "needles" that are expected to exist in the built JS bundle.
+    let assets = dir.join("assets");
+    let rd = match fs::read_dir(&assets) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
 
-  let mut has_clinic_name = false;
-  let mut has_doctor_login = false;
-  let mut has_doctors_login_options = false;
-  let mut has_doctor_account_update = false;
-  let mut has_sales_daily_report = false;
+    let mut has_clinic_name = false;
+    let mut has_doctor_login = false;
+    let mut has_doctors_login_options = false;
+    let mut has_doctor_account_update = false;
+    let mut has_sales_daily_report = false;
 
-  for ent in rd.flatten() {
-    let p = ent.path();
-    if p.extension().and_then(|s| s.to_str()) != Some("js") {
-      continue;
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("js") {
+            continue;
+        }
+        if let Ok(bytes) = fs::read(&p) {
+            if !has_clinic_name
+                && bytes
+                    .windows(b"clinicName".len())
+                    .any(|w| w == b"clinicName")
+            {
+                has_clinic_name = true;
+            }
+            if !has_doctor_login
+                && bytes
+                    .windows(b"auth_doctor_login".len())
+                    .any(|w| w == b"auth_doctor_login")
+            {
+                has_doctor_login = true;
+            }
+            if !has_doctors_login_options
+                && bytes
+                    .windows(b"doctors_login_options".len())
+                    .any(|w| w == b"doctors_login_options")
+            {
+                has_doctors_login_options = true;
+            }
+            if !has_doctor_account_update
+                && bytes
+                    .windows(b"doctor_account_update".len())
+                    .any(|w| w == b"doctor_account_update")
+            {
+                has_doctor_account_update = true;
+            }
+            if !has_sales_daily_report
+                && bytes
+                    .windows(b"sales_daily_report".len())
+                    .any(|w| w == b"sales_daily_report")
+            {
+                has_sales_daily_report = true;
+            }
+
+            if has_clinic_name
+                && has_doctor_login
+                && has_doctors_login_options
+                && has_doctor_account_update
+                && has_sales_daily_report
+            {
+                return true;
+            }
+        }
     }
-    if let Ok(bytes) = fs::read(&p) {
-      if !has_clinic_name && bytes.windows(b"clinicName".len()).any(|w| w == b"clinicName") {
-        has_clinic_name = true;
-      }
-      if !has_doctor_login && bytes.windows(b"auth_doctor_login".len()).any(|w| w == b"auth_doctor_login") {
-        has_doctor_login = true;
-      }
-      if !has_doctors_login_options
-        && bytes
-          .windows(b"doctors_login_options".len())
-          .any(|w| w == b"doctors_login_options")
-      {
-        has_doctors_login_options = true;
-      }
-      if !has_doctor_account_update
-        && bytes
-          .windows(b"doctor_account_update".len())
-          .any(|w| w == b"doctor_account_update")
-      {
-        has_doctor_account_update = true;
-      }
-      if !has_sales_daily_report
-        && bytes
-          .windows(b"sales_daily_report".len())
-          .any(|w| w == b"sales_daily_report")
-      {
-        has_sales_daily_report = true;
-      }
-
-      if has_clinic_name
-        && has_doctor_login
-        && has_doctors_login_options
-        && has_doctor_account_update
-        && has_sales_daily_report
-      {
-        return true;
-      }
-    }
-  }
-  false
+    false
 }
 
 impl UpdatesEngine {
-  pub fn new(db: std::sync::Arc<Db>) -> anyhow::Result<Self> {
-    let client = reqwest::Client::builder()
-      .timeout(Duration::from_secs(20))
-      .build()
-      .context("build http client")?;
-    Ok(Self {
-      db,
-      client,
-      lock: tokio::sync::Mutex::new(()),
-    })
-  }
-
-  pub fn spawn_background(self: std::sync::Arc<Self>, app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
-      // Startup check.
-      let _ = self.check_now(&app).await;
-
-      let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
-      loop {
-        interval.tick().await;
-        let _ = self.check_now(&app).await;
-      }
-    });
-  }
-
-  pub async fn check_now(&self, app: &tauri::AppHandle) -> anyhow::Result<()> {
-    let _guard = self.lock.lock().await;
-
-    ensure_ui_dirs(app)?;
-
-    let base = self
-      .db
-      .setting_get(KEY_UPDATE_BASE_URL)?
-      .filter(|s| !s.trim().is_empty())
-      .unwrap_or_else(|| DEFAULT_UPDATE_BASE_URL.to_string());
-    let base = base.trim_end_matches('/').to_string();
-
-    let manifest_url = format!("{base}/manifest.json");
-    let resp = self.client.get(&manifest_url).send().await.context("fetch manifest")?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-      bail!("manifest fetch failed: {status} {body}");
-    }
-    let manifest: UpdateManifest = serde_json::from_str(&body).context("parse manifest.json")?;
-
-    let latest = manifest.latest_version.trim().to_string();
-    if latest.is_empty() {
-      bail!("manifest latestVersion is empty");
+    pub fn new(db: std::sync::Arc<Db>) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("build http client")?;
+        Ok(Self {
+            db,
+            client,
+            lock: tokio::sync::Mutex::new(()),
+        })
     }
 
-    if version_installed(app, &latest)? {
-      // Already downloaded; mark pending if not current.
-      let current = current_ui_version(app).unwrap_or_else(|_| "unknown".to_string());
-      if current != latest {
-        set_pointer_atomic(&pending_ptr_path(app)?, &latest)?;
-      }
-      prune_versions(app)?;
-      return Ok(());
+    pub fn spawn_background(self: std::sync::Arc<Self>, app: tauri::AppHandle) {
+        tauri::async_runtime::spawn(async move {
+            // Startup check.
+            let _ = self.check_now(&app).await;
+
+            let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+            loop {
+                interval.tick().await;
+                let _ = self.check_now(&app).await;
+            }
+        });
     }
 
-    // Download bundle.
-    let bundle_url = if manifest.bundle_path.starts_with('/') {
-      format!("{base}{}", manifest.bundle_path)
-    } else {
-      format!("{base}/{}", manifest.bundle_path)
-    };
+    pub async fn check_now(&self, app: &tauri::AppHandle) -> anyhow::Result<()> {
+        let _guard = self.lock.lock().await;
 
-    let bytes = self.client.get(&bundle_url).send().await.context("download bundle")?.bytes().await?;
-    let got = sha256_hex(bytes.as_ref());
-    if !eq_hex(&got, &manifest.sha256) {
-      bail!("sha256 mismatch: expected {}, got {}", manifest.sha256, got);
-    }
+        ensure_ui_dirs(app)?;
 
-    // Write to temp file.
-    let tmp_dir = tmp_dir(app)?;
-    fs::create_dir_all(&tmp_dir)?;
-    let tmp_zip = tmp_dir.join(format!("ui-{}.zip", Uuid::new_v4()));
-    fs::write(&tmp_zip, &bytes)?;
+        let base = self
+            .db
+            .setting_get(KEY_UPDATE_BASE_URL)?
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_UPDATE_BASE_URL.to_string());
+        let base = base.trim_end_matches('/').to_string();
 
-    // Extract into a temp folder and then rename into place.
-    let versions = versions_dir(app)?;
-    fs::create_dir_all(&versions)?;
-    let extracting_dir = versions.join(format!(".extracting-{}-{}", latest, Uuid::new_v4()));
-    fs::create_dir_all(&extracting_dir)?;
-    extract_zip(&tmp_zip, &extracting_dir)?;
+        let manifest_url = format!("{base}/manifest.json");
+        let resp = self
+            .client
+            .get(&manifest_url)
+            .send()
+            .await
+            .context("fetch manifest")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("manifest fetch failed: {status} {body}");
+        }
+        let manifest: UpdateManifest =
+            serde_json::from_str(&body).context("parse manifest.json")?;
 
-    // Basic validation.
-    let idx = extracting_dir.join("index.html");
-    if !idx.exists() {
-      bail!("bundle missing index.html after extraction");
-    }
-
-    let final_dir = versions.join(&latest);
-    if final_dir.exists() {
-      // If it appeared concurrently, keep it.
-      let _ = fs::remove_dir_all(&extracting_dir);
-    } else {
-      fs::rename(&extracting_dir, &final_dir)?;
-    }
-
-    // Mark pending and keep.
-    set_pointer_atomic(&pending_ptr_path(app)?, &latest)?;
-    prune_versions(app)?;
-
-    let _ = fs::remove_file(&tmp_zip);
-    Ok(())
-  }
-
-  pub fn apply_pending_on_startup(app: &tauri::AppHandle) -> anyhow::Result<()> {
-    ensure_ui_dirs(app)?;
-    let pending = pending_ui_version(app)?;
-    if let Some(v) = pending {
-      if version_installed(app, &v)? {
-        set_pointer_atomic(&current_ptr_path(app)?, &v)?;
-        clear_pending(app)?;
-      }
-    }
-    Ok(())
-  }
-
-  pub fn ensure_seed_installed(app: &tauri::AppHandle) -> anyhow::Result<()> {
-    ensure_ui_dirs(app)?;
-
-    // If current exists and looks compatible, keep it.
-    // If it exists but looks incompatible (older seed), prefer the packaged seed.
-    let current_dir = current_ui_dir(app).ok();
-    let current_has_index = current_dir.as_ref().is_some_and(|d| d.join("index.html").exists());
-    let current_looks_compatible = current_dir
-      .as_ref()
-      .is_some_and(|d| ui_bundle_looks_compatible(d));
-    if current_has_index && current_looks_compatible {
-      return Ok(());
-    }
-
-    // Install from packaged resources if present.
-    let seed_ver = read_resource_text(app, SEED_VER_RESOURCE).unwrap_or_else(|_| "seed".to_string());
-    let seed_ver = seed_ver.trim().to_string();
-    let seed_ver = if seed_ver.is_empty() { "seed".to_string() } else { seed_ver };
-
-    let versions = versions_dir(app)?;
-    fs::create_dir_all(&versions)?;
-    let seed_dir = versions.join(&seed_ver);
-    if seed_dir.join("index.html").exists() {
-      set_pointer_atomic(&current_ptr_path(app)?, &seed_ver)?;
-      return Ok(());
-    }
-
-    match extract_seed_resource(app, &seed_dir) {
-      Ok(()) => {
-        set_pointer_atomic(&current_ptr_path(app)?, &seed_ver)?;
-        Ok(())
-      }
-      Err(e) => {
-        // If we already have a current UI (even if it's incompatible), don't replace it with
-        // an error page. Keep the previous UI and allow an online update later.
-        if current_has_index {
-          return Ok(());
+        let latest = manifest.latest_version.trim().to_string();
+        if latest.is_empty() {
+            bail!("manifest latestVersion is empty");
         }
 
-        // Otherwise, fallback: create a tiny offline page so the app can still render.
-        fs::create_dir_all(&seed_dir)?;
-        fs::write(
-          seed_dir.join("index.html"),
-          format!(
+        if version_installed(app, &latest)? {
+            // Already downloaded; mark pending if not current.
+            let current = current_ui_version(app).unwrap_or_else(|_| "unknown".to_string());
+            if current != latest {
+                set_pointer_atomic(&pending_ptr_path(app)?, &latest)?;
+            }
+            prune_versions(app)?;
+            return Ok(());
+        }
+
+        // Download bundle.
+        let bundle_url = if manifest.bundle_path.starts_with('/') {
+            format!("{base}{}", manifest.bundle_path)
+        } else {
+            format!("{base}/{}", manifest.bundle_path)
+        };
+
+        let bytes = self
+            .client
+            .get(&bundle_url)
+            .send()
+            .await
+            .context("download bundle")?
+            .bytes()
+            .await?;
+        let got = sha256_hex(bytes.as_ref());
+        if !eq_hex(&got, &manifest.sha256) {
+            bail!("sha256 mismatch: expected {}, got {}", manifest.sha256, got);
+        }
+
+        // Write to temp file.
+        let tmp_dir = tmp_dir(app)?;
+        fs::create_dir_all(&tmp_dir)?;
+        let tmp_zip = tmp_dir.join(format!("ui-{}.zip", Uuid::new_v4()));
+        fs::write(&tmp_zip, &bytes)?;
+
+        // Extract into a temp folder and then rename into place.
+        let versions = versions_dir(app)?;
+        fs::create_dir_all(&versions)?;
+        let extracting_dir = versions.join(format!(".extracting-{}-{}", latest, Uuid::new_v4()));
+        fs::create_dir_all(&extracting_dir)?;
+        extract_zip(&tmp_zip, &extracting_dir)?;
+
+        // Basic validation.
+        let idx = extracting_dir.join("index.html");
+        if !idx.exists() {
+            bail!("bundle missing index.html after extraction");
+        }
+
+        let final_dir = versions.join(&latest);
+        if final_dir.exists() {
+            // If it appeared concurrently, keep it.
+            let _ = fs::remove_dir_all(&extracting_dir);
+        } else {
+            fs::rename(&extracting_dir, &final_dir)?;
+        }
+
+        // Mark pending and keep.
+        set_pointer_atomic(&pending_ptr_path(app)?, &latest)?;
+        prune_versions(app)?;
+
+        let _ = fs::remove_file(&tmp_zip);
+        Ok(())
+    }
+
+    pub fn apply_pending_on_startup(app: &tauri::AppHandle) -> anyhow::Result<()> {
+        ensure_ui_dirs(app)?;
+        let pending = pending_ui_version(app)?;
+        if let Some(v) = pending {
+            if version_installed(app, &v)? {
+                set_pointer_atomic(&current_ptr_path(app)?, &v)?;
+                clear_pending(app)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ensure_seed_installed(app: &tauri::AppHandle) -> anyhow::Result<()> {
+        ensure_ui_dirs(app)?;
+
+        // If current exists and looks compatible, keep it.
+        // If it exists but looks incompatible (older seed), prefer the packaged seed.
+        let current_dir = current_ui_dir(app).ok();
+        let current_has_index = current_dir
+            .as_ref()
+            .is_some_and(|d| d.join("index.html").exists());
+        let current_looks_compatible = current_dir
+            .as_ref()
+            .is_some_and(|d| ui_bundle_looks_compatible(d));
+        if current_has_index && current_looks_compatible {
+            return Ok(());
+        }
+
+        // Install from packaged resources if present.
+        let seed_ver =
+            read_resource_text(app, SEED_VER_RESOURCE).unwrap_or_else(|_| "seed".to_string());
+        let seed_ver = seed_ver.trim().to_string();
+        let seed_ver = if seed_ver.is_empty() {
+            "seed".to_string()
+        } else {
+            seed_ver
+        };
+
+        let versions = versions_dir(app)?;
+        fs::create_dir_all(&versions)?;
+        let seed_dir = versions.join(&seed_ver);
+        if seed_dir.join("index.html").exists() {
+            set_pointer_atomic(&current_ptr_path(app)?, &seed_ver)?;
+            return Ok(());
+        }
+
+        match extract_seed_resource(app, &seed_dir) {
+            Ok(()) => {
+                set_pointer_atomic(&current_ptr_path(app)?, &seed_ver)?;
+                Ok(())
+            }
+            Err(e) => {
+                // If we already have a current UI (even if it's incompatible), don't replace it with
+                // an error page. Keep the previous UI and allow an online update later.
+                if current_has_index {
+                    return Ok(());
+                }
+
+                // Otherwise, fallback: create a tiny offline page so the app can still render.
+                fs::create_dir_all(&seed_dir)?;
+                fs::write(
+                    seed_dir.join("index.html"),
+                    format!(
             "<!doctype html><html><body><h1>Mjeku UI not installed</h1><p>{}</p></body></html>",
             html_escape(&format!("{e}"))
           ),
-        )?;
-        set_pointer_atomic(&current_ptr_path(app)?, &seed_ver)?;
-        Ok(())
-      }
+                )?;
+                set_pointer_atomic(&current_ptr_path(app)?, &seed_ver)?;
+                Ok(())
+            }
+        }
     }
-  }
 
-  pub fn apply_downloaded_now(app: &tauri::AppHandle) -> anyhow::Result<bool> {
-    let pending = pending_ui_version(app)?;
-    if let Some(v) = pending {
-      if version_installed(app, &v)? {
-        set_pointer_atomic(&current_ptr_path(app)?, &v)?;
-        clear_pending(app)?;
-        return Ok(true);
-      }
+    pub fn apply_downloaded_now(app: &tauri::AppHandle) -> anyhow::Result<bool> {
+        let pending = pending_ui_version(app)?;
+        if let Some(v) = pending {
+            if version_installed(app, &v)? {
+                set_pointer_atomic(&current_ptr_path(app)?, &v)?;
+                clear_pending(app)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
-    Ok(false)
-  }
 }
 
 pub fn ui_root_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-  Ok(app.path().app_data_dir()?.join(UI_ROOT_DIRNAME))
+    Ok(app.path().app_data_dir()?.join(UI_ROOT_DIRNAME))
 }
 
 pub fn versions_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-  Ok(ui_root_dir(app)?.join(UI_VERSIONS_DIRNAME))
+    Ok(ui_root_dir(app)?.join(UI_VERSIONS_DIRNAME))
 }
 
 pub fn tmp_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-  Ok(ui_root_dir(app)?.join(UI_TMP_DIRNAME))
+    Ok(ui_root_dir(app)?.join(UI_TMP_DIRNAME))
 }
 
 pub fn current_ptr_path(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-  Ok(ui_root_dir(app)?.join(CURRENT_PTR_FILENAME))
+    Ok(ui_root_dir(app)?.join(CURRENT_PTR_FILENAME))
 }
 
 pub fn pending_ptr_path(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-  Ok(ui_root_dir(app)?.join(PENDING_PTR_FILENAME))
+    Ok(ui_root_dir(app)?.join(PENDING_PTR_FILENAME))
 }
 
 pub fn current_ui_version(app: &tauri::AppHandle) -> anyhow::Result<String> {
-  let p = current_ptr_path(app)?;
-  if !p.exists() {
-    return Ok("seed".to_string());
-  }
-  let v = fs::read_to_string(p)?.trim().to_string();
-  Ok(if v.is_empty() { "seed".to_string() } else { v })
+    let p = current_ptr_path(app)?;
+    if !p.exists() {
+        return Ok("seed".to_string());
+    }
+    let v = fs::read_to_string(p)?.trim().to_string();
+    Ok(if v.is_empty() { "seed".to_string() } else { v })
 }
 
 pub fn pending_ui_version(app: &tauri::AppHandle) -> anyhow::Result<Option<String>> {
-  let p = pending_ptr_path(app)?;
-  if !p.exists() {
-    return Ok(None);
-  }
-  let v = fs::read_to_string(p)?.trim().to_string();
-  if v.is_empty() {
-    Ok(None)
-  } else {
-    Ok(Some(v))
-  }
+    let p = pending_ptr_path(app)?;
+    if !p.exists() {
+        return Ok(None);
+    }
+    let v = fs::read_to_string(p)?.trim().to_string();
+    if v.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(v))
+    }
 }
 
 pub fn clear_pending(app: &tauri::AppHandle) -> anyhow::Result<()> {
-  let p = pending_ptr_path(app)?;
-  if p.exists() {
-    let _ = fs::remove_file(p);
-  }
-  Ok(())
+    let p = pending_ptr_path(app)?;
+    if p.exists() {
+        let _ = fs::remove_file(p);
+    }
+    Ok(())
 }
 
 pub fn current_ui_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-  let v = current_ui_version(app)?;
-  Ok(versions_dir(app)?.join(v))
+    let v = current_ui_version(app)?;
+    Ok(versions_dir(app)?.join(v))
 }
 
 pub fn ensure_ui_dirs(app: &tauri::AppHandle) -> anyhow::Result<()> {
-  fs::create_dir_all(versions_dir(app)?)?;
-  fs::create_dir_all(tmp_dir(app)?)?;
-  Ok(())
+    fs::create_dir_all(versions_dir(app)?)?;
+    fs::create_dir_all(tmp_dir(app)?)?;
+    Ok(())
 }
 
 fn version_installed(app: &tauri::AppHandle, v: &str) -> anyhow::Result<bool> {
-  Ok(versions_dir(app)?.join(v).join("index.html").exists())
+    Ok(versions_dir(app)?.join(v).join("index.html").exists())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-  let mut hasher = Sha256::new();
-  hasher.update(bytes);
-  hex::encode(hasher.finalize())
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn eq_hex(a: &str, b: &str) -> bool {
-  a.trim().eq_ignore_ascii_case(b.trim())
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 fn read_resource_text(app: &tauri::AppHandle, name: &str) -> anyhow::Result<String> {
-  let p = find_resource_file(app, name)?;
-  Ok(fs::read_to_string(p)?)
+    let p = find_resource_file(app, name)?;
+    Ok(fs::read_to_string(p)?)
 }
 
 fn extract_seed_resource(app: &tauri::AppHandle, dest: &Path) -> anyhow::Result<()> {
-  let zip_path = find_resource_file(app, SEED_ZIP_RESOURCE)?;
-  fs::create_dir_all(dest)?;
-  extract_zip(&zip_path, dest)?;
-  Ok(())
+    let zip_path = find_resource_file(app, SEED_ZIP_RESOURCE)?;
+    fs::create_dir_all(dest)?;
+    extract_zip(&zip_path, dest)?;
+    Ok(())
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> anyhow::Result<()> {
-  let f = fs::File::open(zip_path).with_context(|| format!("open zip: {}", zip_path.display()))?;
-  let mut archive = ZipArchive::new(f).context("read zip archive")?;
+    let f =
+        fs::File::open(zip_path).with_context(|| format!("open zip: {}", zip_path.display()))?;
+    let mut archive = ZipArchive::new(f).context("read zip archive")?;
 
-  for i in 0..archive.len() {
-    let mut file = archive.by_index(i)?;
-    let name = file.name().to_string();
-    let outpath = safe_zip_path(dest, &name)?;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let name = file.name().to_string();
+        let outpath = safe_zip_path(dest, &name)?;
 
-    if file.is_dir() {
-      fs::create_dir_all(&outpath)?;
-      continue;
+        if file.is_dir() {
+            fs::create_dir_all(&outpath)?;
+            continue;
+        }
+
+        if let Some(parent) = outpath.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut outfile = fs::File::create(&outpath)?;
+        std::io::copy(&mut file, &mut outfile)?;
+        outfile.flush()?;
     }
-
-    if let Some(parent) = outpath.parent() {
-      fs::create_dir_all(parent)?;
-    }
-
-    let mut outfile = fs::File::create(&outpath)?;
-    std::io::copy(&mut file, &mut outfile)?;
-    outfile.flush()?;
-  }
-  Ok(())
+    Ok(())
 }
 
 fn safe_zip_path(dest: &Path, name: &str) -> anyhow::Result<PathBuf> {
-  let rel = Path::new(name);
-  if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-    bail!("zip path traversal blocked: {name}");
-  }
-  Ok(dest.join(rel))
+    let rel = Path::new(name);
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("zip path traversal blocked: {name}");
+    }
+    Ok(dest.join(rel))
 }
 
 fn set_pointer_atomic(ptr: &Path, version: &str) -> anyhow::Result<()> {
-  let dir = ptr.parent().ok_or_else(|| anyhow!("pointer has no parent"))?;
-  fs::create_dir_all(dir)?;
-  let tmp = ptr.with_extension(format!("tmp-{}", Uuid::new_v4()));
-  fs::write(&tmp, format!("{version}\n"))?;
+    let dir = ptr
+        .parent()
+        .ok_or_else(|| anyhow!("pointer has no parent"))?;
+    fs::create_dir_all(dir)?;
+    let tmp = ptr.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    fs::write(&tmp, format!("{version}\n"))?;
 
-  // Windows doesn't allow renaming over an existing file; do a safe swap.
-  let bak = ptr.with_extension(format!("bak-{}", Uuid::new_v4()));
-  if ptr.exists() {
-    let _ = fs::rename(ptr, &bak);
-  }
-  fs::rename(&tmp, ptr)?;
-  let _ = fs::remove_file(bak);
-  Ok(())
+    // Windows doesn't allow renaming over an existing file; do a safe swap.
+    let bak = ptr.with_extension(format!("bak-{}", Uuid::new_v4()));
+    if ptr.exists() {
+        let _ = fs::rename(ptr, &bak);
+    }
+    fs::rename(&tmp, ptr)?;
+    let _ = fs::remove_file(bak);
+    Ok(())
 }
 
 fn prune_versions(app: &tauri::AppHandle) -> anyhow::Result<()> {
-  let versions = versions_dir(app)?;
-  let current = current_ui_version(app).unwrap_or_else(|_| "seed".to_string());
-  let pending = pending_ui_version(app).unwrap_or(None);
+    let versions = versions_dir(app)?;
+    let current = current_ui_version(app).unwrap_or_else(|_| "seed".to_string());
+    let pending = pending_ui_version(app).unwrap_or(None);
 
-  let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-  for ent in fs::read_dir(&versions)? {
-    let ent = ent?;
-    if !ent.file_type()?.is_dir() {
-      continue;
+    let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for ent in fs::read_dir(&versions)? {
+        let ent = ent?;
+        if !ent.file_type()?.is_dir() {
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name == current || pending.as_deref() == Some(&name) {
+            continue;
+        }
+        let m = ent
+            .metadata()?
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        dirs.push((ent.path(), m));
     }
-    let name = ent.file_name().to_string_lossy().to_string();
-    if name == current || pending.as_deref() == Some(&name) {
-      continue;
-    }
-    let m = ent.metadata()?.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    dirs.push((ent.path(), m));
-  }
 
-  // Keep 2 previous versions (besides current/pending).
-  dirs.sort_by_key(|(_, m)| *m);
-  while dirs.len() > 2 {
-    let (p, _) = dirs.remove(0);
-    let _ = fs::remove_dir_all(p);
-  }
-  Ok(())
+    // Keep 2 previous versions (besides current/pending).
+    dirs.sort_by_key(|(_, m)| *m);
+    while dirs.len() > 2 {
+        let (p, _) = dirs.remove(0);
+        let _ = fs::remove_dir_all(p);
+    }
+    Ok(())
 }
 
 fn html_escape(s: &str) -> String {
-  s.replace('&', "&amp;")
-    .replace('<', "&lt;")
-    .replace('>', "&gt;")
-    .replace('"', "&quot;")
-    .replace('\'', "&#39;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }

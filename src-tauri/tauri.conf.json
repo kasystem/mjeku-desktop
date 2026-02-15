@@ -19,6 +19,7 @@
         "title": "Mjeku",
         "width": 1100,
         "height": 720,
+        "maximized": true,
         "resizable": true,
         "url": "mjeku://localhost/index.html"
       }
