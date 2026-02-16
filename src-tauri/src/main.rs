@@ -1221,10 +1221,12 @@ async fn clients_upsert(
 ) -> Result<Client, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.clients_upsert(client))
+    let row = tokio::task::spawn_blocking(move || db.clients_upsert(client))
         .await
         .map_err(err_string)?
-        .map_err(err_string)
+        .map_err(err_string)?;
+    let _ = state.sync.sync_now().await;
+    Ok(row)
 }
 
 #[tauri::command]
@@ -1234,7 +1236,9 @@ async fn clients_delete(state: tauri::State<'_, AppState>, id: String) -> Result
     tokio::task::spawn_blocking(move || db.clients_delete(&id))
         .await
         .map_err(err_string)?
-        .map_err(err_string)
+        .map_err(err_string)?;
+    let _ = state.sync.sync_now().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2448,6 +2452,26 @@ fn main() {
             {
                 db.setting_set(FISCAL_PRINTER_PROVIDER_KEY, "enternet")?;
             }
+
+            // Auto-fix typoed URL if it was saved in DB from a previous run (startup check)
+            let current_db_url = db.setting_get(KEY_SUPABASE_URL)?.unwrap_or_default();
+            if current_db_url == "https://occzpryzxabajtmdaas.supabase.co" {
+                db.setting_set(KEY_SUPABASE_URL, DEFAULT_SUPABASE_URL)?;
+            }
+
+            // Auto-fix future timestamps (clock skew recovery)
+            // If the stored timestamp is way in the future (e.g. > 24h from now), reset it to allow re-check.
+            let now_utc = chrono::Utc::now();
+            for key in ["license_last_checked_at", "license_last_seen_device_time"] {
+                if let Ok(Some(val)) = db.setting_get(key) {
+                    if let Ok(ts_utc) = crate::util::parse_rfc3339_to_utc(&val) {
+                        if ts_utc > now_utc + ChronoDuration::days(1) {
+                            db.setting_set(key, "")?;
+                        }
+                    }
+                }
+            }
+
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_URL, DEFAULT_SUPABASE_URL)?;
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_API_KEY, DEFAULT_SUPABASE_API_KEY)?;
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_ANON_KEY, DEFAULT_SUPABASE_API_KEY)?;

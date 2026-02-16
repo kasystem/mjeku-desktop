@@ -110,7 +110,7 @@ pub async fn check_now(
         latest_version: Some(norm_ver(&current_version)),
         published_at: None,
         download_url: None,
-        notes: Some("Nuk ka release të publikuar (404). Publiko një GitHub Release ose konfiguro `desktop_update_api`.".to_string()),
+        notes: Some("Eshte ne versionin final, nuk ka update.".to_string()),
         forced: false,
         force_deadline_at: None,
         last_manual_check_at: None,

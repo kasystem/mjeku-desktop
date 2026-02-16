@@ -84,7 +84,7 @@ impl SyncEngine {
             // Startup sync.
             let _ = self.sync_now().await;
 
-            let mut interval = tokio::time::interval(Duration::from_secs(120));
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
                 let _ = self.sync_now().await;
@@ -100,9 +100,11 @@ impl SyncEngine {
             .db
             .setting_get(KEY_SUPABASE_API_KEY)?
             .or_else(|| self.db.setting_get(KEY_SUPABASE_ANON_KEY).ok().flatten());
+        let clinic_id = self.db.setting_get("clinic_id")?.unwrap_or_default();
 
         if supabase_url.as_deref().unwrap_or("").trim().is_empty()
             || api_key.as_deref().unwrap_or("").trim().is_empty()
+            || clinic_id.trim().is_empty()
         {
             self.set_status("pending", None).await;
             return Ok(());
@@ -119,7 +121,7 @@ impl SyncEngine {
 
         // Pull first (to avoid overwriting newer remote updates).
         if let Err(e) = self
-            .pull_updates(&supabase_url, &api_key, &last_sync_time)
+            .pull_updates(&supabase_url, &api_key, &last_sync_time, &clinic_id)
             .await
         {
             if contains_network_error(&e) {
@@ -134,7 +136,7 @@ impl SyncEngine {
         }
 
         // Push queue.
-        if let Err(e) = self.push_queue(&supabase_url, &api_key).await {
+        if let Err(e) = self.push_queue(&supabase_url, &api_key, &clinic_id).await {
             if contains_network_error(&e) {
                 append_sync_error(self.db.as_ref(), "sync_push", &format!("offline: {e}"));
                 self.set_status("pending", Some("offline".to_string()))
@@ -169,11 +171,12 @@ impl SyncEngine {
         supabase_url: &str,
         api_key: &str,
         last_sync_time: &str,
+        clinic_id: &str,
     ) -> anyhow::Result<()> {
         let base = supabase_url.trim_end_matches('/');
 
         let doctors: Vec<Doctor> = self
-            .fetch_table(base, api_key, "doctors", last_sync_time)
+            .fetch_table(base, api_key, "doctors", last_sync_time, clinic_id)
             .await
             .context("pull doctors")?;
         for d in doctors {
@@ -181,7 +184,7 @@ impl SyncEngine {
         }
 
         let services: Vec<Service> = self
-            .fetch_table(base, api_key, "services", last_sync_time)
+            .fetch_table(base, api_key, "services", last_sync_time, clinic_id)
             .await
             .context("pull services")?;
         for s in services {
@@ -189,7 +192,7 @@ impl SyncEngine {
         }
 
         let appointments: Vec<Appointment> = self
-            .fetch_table(base, api_key, "appointments", last_sync_time)
+            .fetch_table(base, api_key, "appointments", last_sync_time, clinic_id)
             .await
             .context("pull appointments")?;
         for a in appointments {
@@ -197,7 +200,7 @@ impl SyncEngine {
         }
 
         let clients: Vec<Client> = self
-            .fetch_table(base, api_key, "clients", last_sync_time)
+            .fetch_table(base, api_key, "clients", last_sync_time, clinic_id)
             .await
             .context("pull clients")?;
         for c in clients {
@@ -205,7 +208,7 @@ impl SyncEngine {
         }
 
         let sales: Vec<Sale> = self
-            .fetch_table(base, api_key, "sales", last_sync_time)
+            .fetch_table(base, api_key, "sales", last_sync_time, clinic_id)
             .await
             .context("pull sales")?;
         for s in sales {
@@ -213,7 +216,7 @@ impl SyncEngine {
         }
 
         let payments: Vec<Payment> = self
-            .fetch_table(base, api_key, "payments", last_sync_time)
+            .fetch_table(base, api_key, "payments", last_sync_time, clinic_id)
             .await
             .context("pull payments")?;
         for p in payments {
@@ -221,7 +224,7 @@ impl SyncEngine {
         }
 
         let visits: Vec<Visit> = self
-            .fetch_table(base, api_key, "visits", last_sync_time)
+            .fetch_table(base, api_key, "visits", last_sync_time, clinic_id)
             .await
             .context("pull visits")?;
         for v in visits {
@@ -229,7 +232,7 @@ impl SyncEngine {
         }
 
         let visit_items: Vec<VisitItem> = self
-            .fetch_table(base, api_key, "visit_items", last_sync_time)
+            .fetch_table(base, api_key, "visit_items", last_sync_time, clinic_id)
             .await
             .context("pull visit_items")?;
         for it in visit_items {
@@ -237,7 +240,7 @@ impl SyncEngine {
         }
 
         let cash: Vec<CashEntry> = self
-            .fetch_table(base, api_key, "cash_ledger", last_sync_time)
+            .fetch_table(base, api_key, "cash_ledger", last_sync_time, clinic_id)
             .await
             .context("pull cash_ledger")?;
         for c in cash {
@@ -371,11 +374,13 @@ impl SyncEngine {
         api_key: &str,
         table: &str,
         last_sync_time: &str,
+        clinic_id: &str,
     ) -> anyhow::Result<Vec<T>> {
         let url = format!("{base}/rest/v1/{table}");
         let resp = with_supabase_auth(self.client.get(&url), api_key)
             .query(&[
                 ("select", "*"),
+                ("clinic_id", &format!("eq.{}", clinic_id)),
                 ("updated_at", &format!("gt.{last_sync_time}")),
                 ("order", "updated_at.asc"),
             ])
@@ -395,7 +400,7 @@ impl SyncEngine {
         Ok(rows)
     }
 
-    async fn push_queue(&self, supabase_url: &str, api_key: &str) -> anyhow::Result<()> {
+    async fn push_queue(&self, supabase_url: &str, api_key: &str, clinic_id: &str) -> anyhow::Result<()> {
         let items = self.db.sync_queue_list_pending(200)?;
         if items.is_empty() {
             return Ok(());
@@ -425,6 +430,12 @@ impl SyncEngine {
                     }
                 }
             }
+
+            // Inject clinic_id into the payload for all upserts.
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("clinic_id".to_string(), Value::String(clinic_id.to_string()));
+            }
+
             normalize_sync_row_for_table(&it.table_name, &mut v);
             match it.op.as_str() {
                 "delete" => deletes.push((it, v)),
