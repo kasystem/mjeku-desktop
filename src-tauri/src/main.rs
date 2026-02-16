@@ -51,7 +51,7 @@ const KEY_DESKTOP_UPDATE_LATEST_VERSION: &str = "desktop_update_latest_version";
 const KEY_DESKTOP_UPDATE_AVAILABLE: &str = "desktop_update_available";
 const KEY_DESKTOP_UPDATE_FIRST_SEEN_AT: &str = "desktop_update_first_seen_at";
 const DESKTOP_UPDATE_FORCE_AFTER_DAYS: i64 = 7;
-const DEFAULT_SUPABASE_URL: &str = "https://occzpryzxabajtmdaas.supabase.co";
+const DEFAULT_SUPABASE_URL: &str = "https://occzpzryzxabajtmdaas.supabase.co";
 const DEFAULT_SUPABASE_API_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9jY3pwenJ5enhhYmFqdG1kYWFzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA2NTQxMjksImV4cCI6MjA4NjIzMDEyOX0.Fq2bTsVLPpRhoLe845Lf-kMsy8rmPF2ijMZCWBb1zHc";
 const DEFAULT_UPDATE_BASE_URL: &str = "https://mjeku-ui.vercel.app";
 
@@ -447,6 +447,10 @@ async fn provision_apply_token(
     let (supabase_url, api_key) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
             let mut supabase_url = db.setting_get(KEY_SUPABASE_URL)?.unwrap_or_default();
+            // Auto-fix typoed URL if it was saved in DB from a previous run
+            if supabase_url == "https://occzpryzxabajtmdaas.supabase.co" {
+                supabase_url = String::new();
+            }
             if supabase_url.trim().is_empty() && !DEFAULT_SUPABASE_URL.trim().is_empty() {
                 db.setting_set(KEY_SUPABASE_URL, DEFAULT_SUPABASE_URL)?;
                 supabase_url = DEFAULT_SUPABASE_URL.to_string();
