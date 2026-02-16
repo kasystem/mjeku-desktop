@@ -13,7 +13,7 @@ use crate::models::{
     Appointment, AppointmentUpsertInput, AppointmentsListFilters, CashEntry, CashEntryUpsertInput,
     CashListFilters, Client, ClientUpsertInput, Doctor, DoctorUpsertInput, Payment,
     PaymentUpsertInput, PaymentsListFilters, Sale, SaleUpsertInput, SalesListFilters, Service,
-    ServiceUpsertInput, SyncQueueItem, Visit, VisitItem, VisitItemUpsertInput,
+    ServiceUpsertInput, SyncQueueItem, Visit, VisitItem, VisitItemUpsertInput, DoctorAccount,
     VisitItemsListFilters, VisitUpsertInput, VisitsListFilters,
 };
 use crate::util::now_iso;
@@ -288,6 +288,11 @@ impl Db {
         // doctors
         for (col, ddl) in [("code", "TEXT"), ("title", "TEXT"), ("specialty", "TEXT")] {
             Self::add_column_if_missing(conn, "doctors", col, ddl)?;
+        }
+
+        // doctor_accounts (make syncable)
+        for (col, ddl) in [("clinic_id", "TEXT"), ("deleted", "INTEGER DEFAULT 0")] {
+            Self::add_column_if_missing(conn, "doctor_accounts", col, ddl)?;
         }
 
         // services
@@ -2628,26 +2633,64 @@ impl Db {
         is_admin: bool,
         now: &str,
     ) -> anyhow::Result<()> {
+        let clinic_id = self.setting_get("clinic_id")?.unwrap_or_default();
         let conn = self.conn()?;
-        conn.execute(
-      "INSERT INTO doctor_accounts (doctor_id, salt, password_hash, is_admin, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        let tx = conn.transaction()?;
+        tx.execute(
+      "INSERT INTO doctor_accounts (doctor_id, clinic_id, salt, password_hash, is_admin, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
        ON CONFLICT(doctor_id) DO UPDATE SET
+         clinic_id=excluded.clinic_id,
          salt=excluded.salt,
          password_hash=excluded.password_hash,
          is_admin=excluded.is_admin,
-         updated_at=excluded.updated_at",
-      params![doctor_id, salt, password_hash, if is_admin { 1 } else { 0 }, now, now],
+         updated_at=excluded.updated_at,
+         deleted=0",
+      params![doctor_id, &clinic_id, salt, password_hash, if is_admin { 1 } else { 0 }, now, now],
     )?;
+        let row = DoctorAccount {
+            doctor_id: doctor_id.to_string(),
+            clinic_id: Some(clinic_id),
+            salt: salt.to_string(),
+            password_hash: password_hash.to_string(),
+            is_admin: if is_admin { 1 } else { 0 },
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            deleted: 0,
+        };
+        let payload = serde_json::to_string(&row)?;
+        Self::queue_replace_pending_tx(&tx, "doctor_accounts", &row.doctor_id, "upsert", &payload, now)?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn doctor_account_delete(&self, doctor_id: &str) -> anyhow::Result<()> {
+        let now = now_iso();
         let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM doctor_accounts WHERE doctor_id=?1",
-            params![doctor_id],
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE doctor_accounts SET deleted=1, updated_at=?2 WHERE doctor_id=?1",
+            params![doctor_id, now],
         )?;
+        // Queue delete for sync
+        let row = tx.query_row(
+            "SELECT doctor_id, clinic_id, salt, password_hash, is_admin, created_at, updated_at, deleted FROM doctor_accounts WHERE doctor_id=?1",
+            params![doctor_id],
+            |r| Ok(DoctorAccount {
+                doctor_id: r.get(0)?,
+                clinic_id: r.get(1)?,
+                salt: r.get(2)?,
+                password_hash: r.get(3)?,
+                is_admin: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+                deleted: r.get(7)?,
+            })
+        ).optional()?.ok_or_else(|| anyhow!("doctor account not found"))?;
+        
+        let payload = serde_json::to_string(&row)?;
+        Self::queue_replace_pending_tx(&tx, "doctor_accounts", &row.doctor_id, "delete", &payload, &now)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2847,11 +2890,8 @@ impl Db {
             "UPDATE doctors SET deleted=1, updated_at=?2 WHERE id=?1",
             params![id, now],
         )?;
-        // Local-only: remove login credentials when a doctor is deleted.
-        let _ = tx.execute(
-            "DELETE FROM doctor_accounts WHERE doctor_id=?1",
-            params![id],
-        );
+        // Also soft-delete the account if it exists
+        let _ = tx.execute("UPDATE doctor_accounts SET deleted=1, updated_at=?2 WHERE doctor_id=?1", params![id, now]);
         let row = tx
       .query_row(
         "SELECT id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
@@ -4330,6 +4370,18 @@ impl Db {
             .flatten())
     }
 
+    pub fn doctor_accounts_updated_at(&self, doctor_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT updated_at FROM doctor_accounts WHERE doctor_id=?1",
+                params![doctor_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn services_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
         let conn = self.conn()?;
         Ok(conn
@@ -4497,6 +4549,33 @@ impl Db {
         row.amount,
         row.method,
         row.notes,
+        row.created_at,
+        row.updated_at,
+        row.deleted
+      ],
+    )?;
+        Ok(())
+    }
+
+    pub fn apply_remote_doctor_account(&self, row: &DoctorAccount) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+      "INSERT INTO doctor_accounts (doctor_id, clinic_id, salt, password_hash, is_admin, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+       ON CONFLICT(doctor_id) DO UPDATE SET
+         clinic_id=excluded.clinic_id,
+         salt=excluded.salt,
+         password_hash=excluded.password_hash,
+         is_admin=excluded.is_admin,
+         created_at=excluded.created_at,
+         updated_at=excluded.updated_at,
+         deleted=excluded.deleted",
+      params![
+        row.doctor_id,
+        row.clinic_id,
+        row.salt,
+        row.password_hash,
+        row.is_admin,
         row.created_at,
         row.updated_at,
         row.deleted

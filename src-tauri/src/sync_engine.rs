@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::db::Db;
 use crate::models::{
-    Appointment, CashEntry, Client, Doctor, Payment, Sale, Service, SyncQueueItem, Visit, VisitItem,
+    Appointment, CashEntry, Client, Doctor, Payment, Sale, Service, SyncQueueItem, Visit, VisitItem, DoctorAccount,
 };
 use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 
@@ -183,6 +183,14 @@ impl SyncEngine {
             self.apply_remote_row_doctors(&d)?;
         }
 
+        let doctor_accounts: Vec<DoctorAccount> = self
+            .fetch_table(base, api_key, "doctor_accounts", last_sync_time, clinic_id)
+            .await
+            .context("pull doctor_accounts")?;
+        for da in doctor_accounts {
+            self.apply_remote_row_doctor_accounts(&da)?;
+        }
+
         let services: Vec<Service> = self
             .fetch_table(base, api_key, "services", last_sync_time, clinic_id)
             .await
@@ -260,6 +268,18 @@ impl SyncEngine {
         self.db
             .sync_queue_drop_pending_for_row("doctors", &remote.id)?;
         self.db.apply_remote_doctor(remote)?;
+        Ok(())
+    }
+
+    fn apply_remote_row_doctor_accounts(&self, remote: &DoctorAccount) -> anyhow::Result<()> {
+        let local = self.db.doctor_accounts_updated_at(&remote.doctor_id)?;
+        if let Some(local_ts) = local {
+            if newer_or_equal(&local_ts, &remote.updated_at)? {
+                return Ok(());
+            }
+        }
+        self.db.sync_queue_drop_pending_for_row("doctor_accounts", &remote.doctor_id)?;
+        self.db.apply_remote_doctor_account(remote)?;
         Ok(())
     }
 
@@ -383,18 +403,24 @@ impl SyncEngine {
                 ("clinic_id", &format!("eq.{}", clinic_id)),
                 ("updated_at", &format!("gt.{last_sync_time}")),
                 ("order", "updated_at.asc"),
+                ("limit", "10000"),
             ])
             .send()
             .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let msg = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| body.clone());
+            let err_msg = format!("supabase pull failed {table}: {status} {msg}");
             append_sync_error(
                 self.db.as_ref(),
                 "sync_fetch_table",
-                &format!("supabase pull failed {table}: {status} {body}"),
+                &err_msg,
             );
-            bail!("supabase pull failed {table}: {status} {body}");
+            bail!("{err_msg}");
         }
         let rows: Vec<T> = serde_json::from_str(&body).context("decode json")?;
         Ok(rows)
@@ -455,7 +481,10 @@ impl SyncEngine {
                 let mut payload: Vec<Value> = batch.iter().map(|(_, v)| v.clone()).collect();
                 normalize_object_batch_keys(&mut payload);
                 normalize_table_batch_values(&table, &mut payload);
-                let url = format!("{base}/rest/v1/{table}?on_conflict=id");
+                
+                let conflict_col = if table == "doctor_accounts" { "doctor_id" } else { "id" };
+                let url = format!("{base}/rest/v1/{table}?on_conflict={conflict_col}");
+                
                 let resp = with_supabase_auth(self.client.post(&url), api_key)
                     .header("Prefer", "resolution=merge-duplicates,return=minimal")
                     .json(&payload)
@@ -464,7 +493,11 @@ impl SyncEngine {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    let msg = format!("supabase upsert failed {table}: {status} {body}");
+                    let json_msg = serde_json::from_str::<Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_else(|| body.clone());
+                    let msg = format!("supabase upsert failed {table}: {status} {json_msg}");
                     append_sync_error(self.db.as_ref(), "sync_upsert", &msg);
                     for (qid, _) in batch {
                         self.db.sync_queue_mark_failed(&qid, &msg)?;
@@ -479,10 +512,11 @@ impl SyncEngine {
 
         // Deletes individually (PATCH deleted=1).
         for (it, v) in deletes {
+            let pk_col = if it.table_name == "doctor_accounts" { "doctor_id" } else { "id" };
             let id = v
-                .get("id")
+                .get(pk_col)
                 .and_then(|x| x.as_str())
-                .ok_or_else(|| anyhow!("delete payload missing id"))?
+                .ok_or_else(|| anyhow!("delete payload missing pk"))?
                 .to_string();
             let updated_at = v
                 .get("updated_at")
@@ -491,8 +525,9 @@ impl SyncEngine {
                 .to_string();
 
             let url = format!(
-                "{base}/rest/v1/{}?id=eq.{}",
+                "{base}/rest/v1/{}?{}=eq.{}",
                 it.table_name,
+                pk_col,
                 urlencoding::encode(&id)
             );
             let body = serde_json::json!({ "deleted": 1, "updated_at": updated_at });

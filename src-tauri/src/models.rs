@@ -428,3 +428,15 @@ pub struct SyncQueueItem {
     pub status: String,
     pub last_error: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorAccount {
+    pub doctor_id: String,
+    pub clinic_id: Option<String>,
+    pub salt: String,
+    pub password_hash: String,
+    pub is_admin: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted: i64,
+}
