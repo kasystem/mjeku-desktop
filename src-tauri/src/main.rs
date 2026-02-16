@@ -477,6 +477,19 @@ async fn provision_apply_token(
         .build()
         .map_err(err_string)?;
     let base = supabase_url.trim_end_matches('/').to_string();
+    let parsed_base =
+        reqwest::Url::parse(&base).map_err(|e| format!("Supabase URL jo valid: {}", e))?;
+    let host = parsed_base.host_str().unwrap_or("").trim().to_string();
+    let port = parsed_base.port_or_known_default().unwrap_or(443);
+    if host.is_empty() {
+        return Err("Supabase URL jo valid: mungon host".to_string());
+    }
+    if format!("{}:{}", host, port).to_socket_addrs().is_err() {
+        return Err(format!(
+            "token check network error: DNS dështoi për host '{}'. Kontrollo internetin/DNS dhe Supabase URL.",
+            host
+        ));
+    }
     let token_url = format!("{base}/rest/v1/clinic_tokens");
     let now = crate::util::now_iso();
     let token_eq = format!("eq.{}", token_code);
@@ -500,13 +513,13 @@ async fn provision_apply_token(
                 break;
             }
             Err(e) => {
-                token_last_err = e.to_string();
+                token_last_err = crate::util::reqwest_error_detailed(&e);
                 if crate::util::is_network_error(&e) && attempt < 3 {
                     tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
                     continue;
                 }
                 return Err(format!(
-                    "token check network error: {}. Kontrollo internetin, daten/oren e Windows-it dhe Supabase URL/API key.",
+                    "token check network error: {}. Kontrollo internetin, daten/oren e Windows-it, firewall/proxy dhe Supabase URL/API key.",
                     token_last_err
                 ));
             }
@@ -514,7 +527,7 @@ async fn provision_apply_token(
     }
     let Some(resp) = token_resp_opt else {
         return Err(format!(
-            "token check network error: {}. Kontrollo internetin, daten/oren e Windows-it dhe Supabase URL/API key.",
+            "token check network error: {}. Kontrollo internetin, daten/oren e Windows-it, firewall/proxy dhe Supabase URL/API key.",
             token_last_err
         ));
     };
@@ -559,7 +572,11 @@ async fn provision_apply_token(
         let registry_url = format!("{base}/rest/v1/clinic_registry");
         let clinic_eq = format!("eq.{}", clinic_id);
         if let Ok(resp) = with_supabase_auth_request(client.get(&registry_url), &api_key)
-            .query(&[("select", "clinic_name"), ("clinic_id", &clinic_eq), ("limit", "1")])
+            .query(&[
+                ("select", "clinic_name"),
+                ("clinic_id", &clinic_eq),
+                ("limit", "1"),
+            ])
             .send()
             .await
         {
@@ -607,13 +624,13 @@ async fn provision_apply_token(
                 break;
             }
             Err(e) => {
-                patch_last_err = e.to_string();
+                patch_last_err = crate::util::reqwest_error_detailed(&e);
                 if crate::util::is_network_error(&e) && attempt < 3 {
                     tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
                     continue;
                 }
                 return Err(format!(
-                    "token update network error: {}. Kontrollo internetin dhe provo perseri.",
+                    "token update network error: {}. Kontrollo internetin, firewall/proxy dhe provo perseri.",
                     patch_last_err
                 ));
             }
@@ -621,7 +638,7 @@ async fn provision_apply_token(
     }
     let Some(patch_resp) = patch_resp_opt else {
         return Err(format!(
-            "token update network error: {}. Kontrollo internetin dhe provo perseri.",
+            "token update network error: {}. Kontrollo internetin, firewall/proxy dhe provo perseri.",
             patch_last_err
         ));
     };
@@ -2419,23 +2436,23 @@ fn main() {
                 let _ = std::fs::remove_file(&reset_flag);
             }
             let db = Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?);
-        if db
-            .setting_get(FISCAL_PRINTER_PROVIDER_KEY)?
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
+            if db
+                .setting_get(FISCAL_PRINTER_PROVIDER_KEY)?
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
             {
                 db.setting_set(FISCAL_PRINTER_PROVIDER_KEY, "enternet")?;
             }
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_URL, DEFAULT_SUPABASE_URL)?;
-        ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_API_KEY, DEFAULT_SUPABASE_API_KEY)?;
-        ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_ANON_KEY, DEFAULT_SUPABASE_API_KEY)?;
-        ensure_setting_if_empty(db.as_ref(), "update_base_url", DEFAULT_UPDATE_BASE_URL)?;
-        if let Err(e) = db.fiscal_clear_article_on_app_open() {
-            eprintln!("startup clear article failed: {e}");
-        }
-        let error_log_path = data_dir.join("logs").join("errors.log");
-        db.setting_set("error_log_path", &error_log_path.display().to_string())?;
+            ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_API_KEY, DEFAULT_SUPABASE_API_KEY)?;
+            ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_ANON_KEY, DEFAULT_SUPABASE_API_KEY)?;
+            ensure_setting_if_empty(db.as_ref(), "update_base_url", DEFAULT_UPDATE_BASE_URL)?;
+            if let Err(e) = db.fiscal_clear_article_on_app_open() {
+                eprintln!("startup clear article failed: {e}");
+            }
+            let error_log_path = data_dir.join("logs").join("errors.log");
+            db.setting_set("error_log_path", &error_log_path.display().to_string())?;
             let has_visit_service = db.services_list(None)?.into_iter().any(|s| {
                 let t = s.title.trim().to_ascii_lowercase().replace('ë', "e");
                 t == "vizite" || t == "vizita"
