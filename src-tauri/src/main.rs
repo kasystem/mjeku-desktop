@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
+use chrono::Utc;
 use chrono::Duration as ChronoDuration;
 use tauri::Manager;
 
@@ -1221,12 +1222,10 @@ async fn clients_upsert(
 ) -> Result<Client, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
-    let row = tokio::task::spawn_blocking(move || db.clients_upsert(client))
+    tokio::task::spawn_blocking(move || db.clients_upsert(client))
         .await
         .map_err(err_string)?
-        .map_err(err_string)?;
-    let _ = state.sync.sync_now().await;
-    Ok(row)
+        .map_err(err_string)
 }
 
 #[tauri::command]
@@ -1236,9 +1235,7 @@ async fn clients_delete(state: tauri::State<'_, AppState>, id: String) -> Result
     tokio::task::spawn_blocking(move || db.clients_delete(&id))
         .await
         .map_err(err_string)?
-        .map_err(err_string)?;
-    let _ = state.sync.sync_now().await;
-    Ok(())
+        .map_err(err_string)
 }
 
 #[tauri::command]
@@ -2461,7 +2458,7 @@ fn main() {
 
             // Auto-fix future timestamps (clock skew recovery)
             // If the stored timestamp is way in the future (e.g. > 24h from now), reset it to allow re-check.
-            let now_utc = chrono::Utc::now();
+            let now_utc = Utc::now();
             for key in ["license_last_checked_at", "license_last_seen_device_time"] {
                 if let Ok(Some(val)) = db.setting_get(key) {
                     if let Ok(ts_utc) = crate::util::parse_rfc3339_to_utc(&val) {
