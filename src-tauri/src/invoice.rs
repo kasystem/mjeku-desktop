@@ -1,10 +1,13 @@
 use std::io::{BufWriter, Cursor};
 
 use anyhow::{anyhow, Context};
+use printpdf::path::{PaintMode, WindingOrder};
 use printpdf::{
-    BuiltinFont, Image, ImageTransform, IndirectFontRef, Mm, PdfDocument, PdfDocumentReference,
-    PdfLayerReference, PdfPageIndex,
+    BuiltinFont, Color, Image, ImageTransform, IndirectFontRef, Line, Mm, PdfDocument,
+    PdfDocumentReference, PdfLayerReference, PdfPageIndex, Point, Polygon, Rgb,
 };
+
+// ─── Data structures ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct InvoiceLine {
@@ -86,10 +89,44 @@ pub struct VisitPdfData {
     pub total: f64,
 }
 
+// ─── Layout constants (f32 — printpdf Mm(pub f32)) ───────────────────────────
+
+const PAGE_W: f32 = 210.0;
+const PAGE_H: f32 = 297.0;
+const ML: f32 = 14.0;        // left margin mm
+const MR: f32 = 14.0;        // right margin mm
+const CR: f32 = PAGE_W - MR; // content right edge = 196 mm
+const CW: f32 = CR - ML;     // content width = 182 mm
+const LH: f32 = 6.0;         // standard line height mm
+
+// Invoice table column edges (mm from page left)
+const T_NR_R: f32    = 23.0;
+const T_DESC_L: f32  = 25.0;
+const T_QTY_R: f32   = 130.0;
+const T_PRICE_R: f32 = 152.0;
+const T_VAT_L: f32   = 154.0;
+const T_VAT_R: f32   = 167.0;
+const T_TOT_R: f32   = 196.0;
+
+// ─── Colors ───────────────────────────────────────────────────────────────────
+
+fn c_navy()       -> Color { Color::Rgb(Rgb::new(0.14, 0.28, 0.52, None)) }
+fn c_navy_mid()   -> Color { Color::Rgb(Rgb::new(0.22, 0.40, 0.68, None)) }
+fn c_navy_pale()  -> Color { Color::Rgb(Rgb::new(0.78, 0.86, 0.96, None)) }
+fn c_white()      -> Color { Color::Rgb(Rgb::new(1.00, 1.00, 1.00, None)) }
+fn c_row_alt()    -> Color { Color::Rgb(Rgb::new(0.96, 0.97, 0.99, None)) }
+fn c_hdr_row()    -> Color { Color::Rgb(Rgb::new(0.91, 0.93, 0.97, None)) }
+fn c_total_box()  -> Color { Color::Rgb(Rgb::new(0.93, 0.95, 0.98, None)) }
+fn c_gray_mid()   -> Color { Color::Rgb(Rgb::new(0.70, 0.70, 0.70, None)) }
+fn c_gray_light() -> Color { Color::Rgb(Rgb::new(0.88, 0.88, 0.88, None)) }
+fn c_gray_text()  -> Color { Color::Rgb(Rgb::new(0.45, 0.45, 0.45, None)) }
+fn c_label()      -> Color { Color::Rgb(Rgb::new(0.40, 0.40, 0.40, None)) }
+fn c_navy_text()  -> Color { Color::Rgb(Rgb::new(0.10, 0.22, 0.46, None)) }
+
+// ─── Utility helpers ──────────────────────────────────────────────────────────
+
 fn money(n: f64) -> String {
-    if !n.is_finite() {
-        return "0.00".to_string();
-    }
+    if !n.is_finite() { return "0.00".to_string(); }
     format!("{:.2}", n)
 }
 
@@ -101,1093 +138,783 @@ fn vat_rate_for(code: &str) -> f64 {
     }
 }
 
-fn vat_included_amount(gross: f64, rate: f64) -> f64 {
-    if rate <= 0.0 {
-        return 0.0;
-    }
+fn vat_included(gross: f64, rate: f64) -> f64 {
+    if rate <= 0.0 { return 0.0; }
     gross - (gross / (1.0 + rate))
 }
 
 fn clamp_text(s: &str, max: usize) -> String {
     let t = s.trim();
-    if t.chars().count() <= max {
-        return t.to_string();
-    }
+    if t.chars().count() <= max { return t.to_string(); }
     let mut out = String::new();
-    for ch in t.chars().take(max.saturating_sub(3)) {
-        out.push(ch);
-    }
+    for ch in t.chars().take(max.saturating_sub(3)) { out.push(ch); }
     out.push_str("...");
     out
 }
 
-fn estimate_text_width_mm(text: &str, font_size: f32) -> f32 {
-    // Rough width estimate for Helvetica in mm (good enough for footer centering).
-    text.chars().count() as f32 * font_size * 0.17
+/// Rough text width in mm (monospace approximation).
+fn est_w(text: &str, size_pt: f32) -> f32 {
+    text.chars().count() as f32 * size_pt * 0.17
 }
 
-fn draw_footer_centered(
-    layer: &PdfLayerReference,
-    font: &IndirectFontRef,
-    page_w: f32,
-    y: f32,
-    text: &str,
-    size: f32,
-) {
-    let w = estimate_text_width_mm(text, size);
-    let mut x = (page_w - w) / 2.0;
-    if x < 10.0 {
-        x = 10.0;
+/// Kosovo date: "2026-06-27" → "27.06.2026"
+fn fmt_date(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() || s == "-" { return "-".to_string(); }
+    let date = s.split(|c: char| c == 'T' || c == ' ').next().unwrap_or(s);
+    let p: Vec<&str> = date.split('-').collect();
+    if p.len() == 3 && p[0].len() == 4 { return format!("{}.{}.{}", p[2], p[1], p[0]); }
+    s.to_string()
+}
+
+fn opt(v: &Option<String>) -> &str {
+    v.as_deref().map(str::trim).unwrap_or("")
+}
+
+// ─── Drawing primitives ───────────────────────────────────────────────────────
+
+fn fill_rect(layer: &PdfLayerReference, x: f32, y_bot: f32, w: f32, h: f32, color: Color) {
+    layer.save_graphics_state();
+    layer.set_fill_color(color.clone());
+    layer.set_outline_color(color);
+    layer.set_outline_thickness(0.0_f32);
+    layer.add_polygon(Polygon {
+        rings: vec![vec![
+            (Point::new(Mm(x),     Mm(y_bot)),     false),
+            (Point::new(Mm(x + w), Mm(y_bot)),     false),
+            (Point::new(Mm(x + w), Mm(y_bot + h)), false),
+            (Point::new(Mm(x),     Mm(y_bot + h)), false),
+        ]],
+        mode: PaintMode::Fill,
+        winding_order: WindingOrder::NonZero,
+    });
+    layer.restore_graphics_state();
+}
+
+fn hline(layer: &PdfLayerReference, x1: f32, x2: f32, y: f32, thickness: f32, color: Color) {
+    layer.save_graphics_state();
+    layer.set_outline_color(color);
+    layer.set_outline_thickness(thickness);
+    layer.add_line(Line {
+        points: vec![
+            (Point::new(Mm(x1), Mm(y)), false),
+            (Point::new(Mm(x2), Mm(y)), false),
+        ],
+        is_closed: false,
+    });
+    layer.restore_graphics_state();
+}
+
+fn txt_l(layer: &PdfLayerReference, font: &IndirectFontRef, x: f32, y: f32, text: &str, sz: f32) {
+    if !text.is_empty() {
+        layer.use_text(text.to_string(), sz, Mm(x), Mm(y), font);
     }
-    layer.use_text(text.to_string(), size, Mm(x), Mm(y), font);
 }
 
-fn write_line_with_font(
+fn txt_r(layer: &PdfLayerReference, font: &IndirectFontRef, x_r: f32, y: f32, text: &str, sz: f32) {
+    if !text.is_empty() {
+        let x = (x_r - est_w(text, sz)).max(ML);
+        layer.use_text(text.to_string(), sz, Mm(x), Mm(y), font);
+    }
+}
+
+fn txt_c(layer: &PdfLayerReference, font: &IndirectFontRef, xl: f32, xr: f32, y: f32, text: &str, sz: f32) {
+    if !text.is_empty() {
+        let x = (xl + (xr - xl - est_w(text, sz)) / 2.0).max(xl);
+        layer.use_text(text.to_string(), sz, Mm(x), Mm(y), font);
+    }
+}
+
+fn ctxt_l(layer: &PdfLayerReference, font: &IndirectFontRef, x: f32, y: f32, text: &str, sz: f32, color: Color) {
+    layer.save_graphics_state();
+    layer.set_fill_color(color);
+    txt_l(layer, font, x, y, text, sz);
+    layer.restore_graphics_state();
+}
+
+fn ctxt_r(layer: &PdfLayerReference, font: &IndirectFontRef, x_r: f32, y: f32, text: &str, sz: f32, color: Color) {
+    layer.save_graphics_state();
+    layer.set_fill_color(color);
+    txt_r(layer, font, x_r, y, text, sz);
+    layer.restore_graphics_state();
+}
+
+fn ctxt_c(layer: &PdfLayerReference, font: &IndirectFontRef, xl: f32, xr: f32, y: f32, text: &str, sz: f32, color: Color) {
+    layer.save_graphics_state();
+    layer.set_fill_color(color);
+    txt_c(layer, font, xl, xr, y, text, sz);
+    layer.restore_graphics_state();
+}
+
+// ─── Page overflow guard ──────────────────────────────────────────────────────
+
+fn check_y(
     doc: &PdfDocumentReference,
-    page: &mut PdfPageIndex,
+    cur_page: &mut PdfPageIndex,
     layer: &mut PdfLayerReference,
     y: &mut f32,
-    left: f32,
-    lh: f32,
-    font: &IndirectFontRef,
-    text: String,
-    size: f32,
-) -> anyhow::Result<()> {
-    if *y < 18.0 {
-        let (p, l) = doc.add_page(Mm(210.0), Mm(297.0), "Layer");
-        *page = p;
-        *layer = doc.get_page(*page).get_layer(l);
-        *y = 286.0;
+    needed: f32,
+) {
+    if *y < needed + 20.0 {
+        let (p, l) = doc.add_page(Mm(PAGE_W), Mm(PAGE_H), "Layer");
+        *cur_page = p;
+        *layer = doc.get_page(p).get_layer(l);
+        *y = PAGE_H - 14.0;
     }
-    layer.use_text(text, size, Mm(left), Mm(*y), font);
-    *y -= lh;
-    Ok(())
 }
+
+// ─── PNG placement helper ─────────────────────────────────────────────────────
+
+fn place_png(layer: &PdfLayerReference, bytes: &[u8], x: f32, y_bot: f32, max_w: f32, max_h: f32) {
+    let mut cur = Cursor::new(bytes);
+    let decoder = match printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur) {
+        Ok(d) => d, Err(_) => return,
+    };
+    let img = match Image::try_from(decoder) {
+        Ok(i) => i, Err(_) => return,
+    };
+    let w_px = img.image.width.0 as f32;
+    let h_px = img.image.height.0 as f32;
+    if w_px == 0.0 || h_px == 0.0 { return; }
+    let mut dw = max_w;
+    let mut dh = max_w * (h_px / w_px);
+    if dh > max_h { dh = max_h; dw = max_h * (w_px / h_px); }
+    let cx = x + (max_w - dw) / 2.0;
+    let dpi = 300.0_f32;
+    img.add_to_layer(layer.clone(), ImageTransform {
+        translate_x: Some(Mm(cx)),
+        translate_y: Some(Mm(y_bot)),
+        rotate: None,
+        scale_x: Some(dw * dpi / (w_px * 25.4)),
+        scale_y: Some(dh * dpi / (h_px * 25.4)),
+        dpi: Some(dpi),
+    });
+}
+
+// ─── Shared header renderer ───────────────────────────────────────────────────
+
+fn render_header(
+    layer: &PdfLayerReference,
+    font: &IndirectFontRef,
+    font_b: &IndirectFontRef,
+    title: &str,
+    subtitle: &str,
+    meta_line1: &str,
+    meta_line2: &str,
+    header_png: Option<&[u8]>,
+    logo_png: Option<&[u8]>,
+) -> f32 {
+    if let Some(bytes) = header_png {
+        let mut cur = Cursor::new(bytes);
+        if let Ok(decoder) = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur) {
+            if let Ok(img) = Image::try_from(decoder) {
+                let w_px = img.image.width.0 as f32;
+                let h_px = img.image.height.0 as f32;
+                if w_px > 0.0 && h_px > 0.0 {
+                    let aw = CW;
+                    let nat_h = aw * (h_px / w_px);
+                    let max_h = 55.0_f32;
+                    let (dw, dh) = if nat_h <= max_h { (aw, nat_h) } else { (max_h * (w_px / h_px), max_h) };
+                    let lx = ML + (aw - dw) / 2.0;
+                    let img_y = PAGE_H - 10.0 - dh;
+                    let dpi = 300.0_f32;
+                    img.add_to_layer(layer.clone(), ImageTransform {
+                        translate_x: Some(Mm(lx)),
+                        translate_y: Some(Mm(img_y)),
+                        rotate: None,
+                        scale_x: Some(dw * dpi / (w_px * 25.4)),
+                        scale_y: Some(dh * dpi / (h_px * 25.4)),
+                        dpi: Some(dpi),
+                    });
+                    let bar_y = img_y - 10.0;
+                    fill_rect(layer, 0.0, bar_y, PAGE_W, 10.0, c_navy());
+                    ctxt_l(layer, font_b, ML + 2.0, bar_y + 3.0, title,      11.0, c_white());
+                    ctxt_r(layer, font,   CR - 2.0, bar_y + 6.0, meta_line1, 8.0,  c_white());
+                    ctxt_r(layer, font,   CR - 2.0, bar_y + 2.0, meta_line2, 8.0,  c_white());
+                    hline(layer, 0.0, PAGE_W, bar_y, 1.5, c_navy_mid());
+                    return bar_y - 6.0;
+                }
+            }
+        }
+    }
+
+    // Solid navy header block
+    let hdr_h   = 25.0_f32;
+    let hdr_bot = PAGE_H - hdr_h;
+
+    fill_rect(layer, 0.0, hdr_bot, PAGE_W, hdr_h, c_navy());
+
+    if let Some(lb) = logo_png {
+        place_png(layer, lb, CR - 28.0, hdr_bot + 2.5, 26.0, 18.0);
+    }
+
+    ctxt_l(layer, font_b, ML + 2.0, hdr_bot + 16.0, title,    16.0, c_white());
+    if !subtitle.is_empty() {
+        ctxt_l(layer, font, ML + 2.0, hdr_bot + 9.0, subtitle, 8.5, c_navy_pale());
+    }
+    ctxt_r(layer, font_b, CR - 2.0, hdr_bot + 16.5, meta_line1, 9.0, c_white());
+    ctxt_r(layer, font,   CR - 2.0, hdr_bot + 9.0,  meta_line2, 8.5, c_white());
+
+    hline(layer, 0.0, PAGE_W, hdr_bot, 1.5, c_navy_mid());
+
+    hdr_bot - 6.0
+}
+
+// ─── Label + value row helper ─────────────────────────────────────────────────
+
+fn info_row(layer: &PdfLayerReference, font: &IndirectFontRef, x: f32, y: f32, label: &str, value: &str, lw: f32) {
+    ctxt_l(layer, font, x,      y, &format!("{}:", label), 8.5, c_label());
+    txt_l (layer, font, x + lw, y, value,                  8.5);
+}
+
+// ─── Invoice PDF ──────────────────────────────────────────────────────────────
 
 pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
-    let (doc, page1, layer1) = PdfDocument::new("Fature", Mm(210.0), Mm(297.0), "Layer 1");
-    let font = doc
-        .add_builtin_font(BuiltinFont::Helvetica)
-        .context("add font")?;
-    let font_b = doc
-        .add_builtin_font(BuiltinFont::HelveticaBold)
-        .context("add bold font")?;
+    let (doc, page1, layer1) = PdfDocument::new("Fature", Mm(PAGE_W), Mm(PAGE_H), "Layer 1");
+    let font   = doc.add_builtin_font(BuiltinFont::Helvetica).context("font")?;
+    let font_b = doc.add_builtin_font(BuiltinFont::HelveticaBold).context("font bold")?;
 
-    let mut page = page1;
+    let mut page  = page1;
     let mut layer = doc.get_page(page).get_layer(layer1);
 
-    let page_w = 210.0_f32;
-    let page_h = 297.0_f32;
-    let left = 14.0_f32;
-    let right = 14.0_f32;
-    let top = 12.0_f32;
-    let mut y = page_h - top;
-    let lh = 6.2_f32;
+    let date_str = fmt_date(opt(&data.date));
+    let id_disp  = clamp_text(&data.invoice_id, 16);
 
-    if let Some(bytes) = data.header_png.as_deref() {
-        let mut cur = Cursor::new(bytes);
-        if let Ok(decoder) = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur) {
-            if let Ok(img) = Image::try_from(decoder) {
-                let w_px = img.image.width.0 as f32;
-                let h_px = img.image.height.0 as f32;
-                if w_px > 0.0 && h_px > 0.0 {
-                    let available_w = page_w - left - right;
-                    let natural_h = available_w * (h_px / w_px);
-                    let max_h = 85.0_f32;
-                    let (draw_w, draw_h) = if natural_h <= max_h {
-                        (available_w, natural_h)
-                    } else {
-                        (max_h * (w_px / h_px), max_h)
-                    };
-                    let x = left + ((available_w - draw_w) / 2.0);
-                    let lower_y = page_h - top - draw_h;
+    let mut y = render_header(
+        &layer, &font, &font_b,
+        "FATURE", &data.clinic_name,
+        &format!("Nr. {}", id_disp),
+        &format!("Data: {}", date_str),
+        data.header_png.as_deref(), data.logo_png.as_deref(),
+    );
 
-                    let dpi: f32 = 300.0;
-                    let scale_x: f32 = draw_w * dpi / (w_px * 25.4);
-                    let scale_y: f32 = draw_h * dpi / (h_px * 25.4);
-                    img.add_to_layer(
-                        layer.clone(),
-                        ImageTransform {
-                            translate_x: Some(Mm(x)),
-                            translate_y: Some(Mm(lower_y)),
-                            rotate: None,
-                            scale_x: Some(scale_x),
-                            scale_y: Some(scale_y),
-                            dpi: Some(dpi),
-                        },
-                    );
+    // ── Two-column info section ────────────────────────────────────────────
+    let mid = ML + CW * 0.52;
 
-                    y = lower_y - 8.0;
-                }
-            }
+    ctxt_l(&layer, &font_b, ML,  y, "Te dhenat e pacientit", 9.5, c_navy_text());
+    ctxt_l(&layer, &font_b, mid, y, "Detajet eatures",      9.5, c_navy_text());
+    y -= LH;
+
+    let mut left_y  = y;
+    let mut right_y = y;
+
+    // Left: patient info
+    {
+        let addr = opt(&data.client_address);
+        let city = opt(&data.client_city);
+        let combined = if addr.is_empty() { city.to_string() }
+            else if city.is_empty() { addr.to_string() }
+            else { format!("{}, {}", addr, city) };
+        if !combined.is_empty() {
+            info_row(&layer, &font, ML, left_y, "Adresa", &clamp_text(&combined, 34), 17.0);
+            left_y -= LH - 0.5;
         }
     }
-
-    if let Some(bytes) = data.logo_png.as_deref() {
-        let mut cur = Cursor::new(bytes);
-        if let Ok(decoder) = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur) {
-            if let Ok(img) = Image::try_from(decoder) {
-                let w_px = img.image.width.0 as f32;
-                let h_px = img.image.height.0 as f32;
-                if w_px > 0.0 && h_px > 0.0 {
-                    let max_w = 28.0_f32;
-                    let max_h = 18.0_f32;
-                    let mut draw_w = max_w;
-                    let mut draw_h = max_w * (h_px / w_px);
-                    if draw_h > max_h {
-                        draw_h = max_h;
-                        draw_w = max_h * (w_px / h_px);
-                    }
-                    let x = page_w - right - draw_w;
-                    let lower_y = page_h - top - draw_h;
-                    let dpi: f32 = 300.0;
-                    let scale_x: f32 = draw_w * dpi / (w_px * 25.4);
-                    let scale_y: f32 = draw_h * dpi / (h_px * 25.4);
-                    img.add_to_layer(
-                        layer.clone(),
-                        ImageTransform {
-                            translate_x: Some(Mm(x)),
-                            translate_y: Some(Mm(lower_y)),
-                            rotate: None,
-                            scale_x: Some(scale_x),
-                            scale_y: Some(scale_y),
-                            dpi: Some(dpi),
-                        },
-                    );
-                    if y > (lower_y - 4.0) {
-                        y = lower_y - 4.0;
-                    }
-                }
-            }
-        }
+    for (label, value) in &[
+        ("Emri",   data.client_name.as_str()),
+        ("Kodi",   opt(&data.client_code)),
+        ("Lindje", &fmt_date(opt(&data.client_dob))),
+        ("Tel",    opt(&data.client_phone)),
+        ("Email",  opt(&data.client_email)),
+    ] {
+        if value.is_empty() || *value == "-" { continue; }
+        info_row(&layer, &font, ML, left_y, label, value, 17.0);
+        left_y -= LH - 0.5;
+    }
+    if !opt(&data.notes).is_empty() {
+        info_row(&layer, &font, ML, left_y, "Shenime", &clamp_text(opt(&data.notes), 32), 17.0);
+        left_y -= LH - 0.5;
     }
 
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font_b,
-        "FATURË".to_string(),
-        14.0,
-    )?;
-    let date_str = data
-        .date
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "-".to_string());
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        format!("Nr: {}    Data: {}", data.invoice_id, date_str),
-        10.5,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        "".to_string(),
-        10.0,
-    )?;
-
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font_b,
-        "Të dhënat e pacientit".to_string(),
-        11.5,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        format!("Emri: {}", data.client_name),
-        10.5,
-    )?;
-    if let Some(v) = data
-        .client_code
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Kodi: {v}"),
-            10.5,
-        )?;
-    }
-    if let Some(v) = data
-        .client_dob
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Data e lindjes: {v}"),
-            10.5,
-        )?;
-    }
-    let addr = data.client_address.as_deref().unwrap_or("").trim();
-    let city = data.client_city.as_deref().unwrap_or("").trim();
-    if !addr.is_empty() || !city.is_empty() {
-        let mut v = String::new();
-        if !addr.is_empty() {
-            v.push_str(addr);
-        }
-        if !city.is_empty() {
-            if !v.is_empty() {
-                v.push_str(", ");
-            }
-            v.push_str(city);
-        }
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Adresa: {v}"),
-            10.5,
-        )?;
-    }
-    if let Some(v) = data
-        .client_phone
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Tel: {v}"),
-            10.5,
-        )?;
-    }
-    if let Some(v) = data
-        .client_email
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Email: {v}"),
-            10.5,
-        )?;
-    }
-    if let Some(v) = data
-        .notes
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Shënime: {v}"),
-            10.5,
-        )?;
+    // Right: invoice meta
+    for (label, value) in &[
+        ("Nr. Fatures", id_disp.as_str()),
+        ("Data",        date_str.as_str()),
+        ("Klinika",     data.clinic_name.as_str()),
+    ] {
+        info_row(&layer, &font, mid, right_y, label, value, 23.0);
+        right_y -= LH - 0.5;
     }
 
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        "".to_string(),
-        10.0,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font_b,
-        "Nr | Përshkrimi                               | Sasia | Çmimi  | TVSH | Totali"
-            .to_string(),
-        9.2,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        "--------------------------------------------------------------------------------"
-            .to_string(),
-        9.0,
-    )?;
+    y = left_y.min(right_y) - 5.0;
 
+    // Navy divider
+    hline(&layer, ML, CR, y, 1.2, c_navy());
+    y -= 8.0;
+
+    // ── Table header row ───────────────────────────────────────────────────
+    let row_h = 7.5_f32;
+    fill_rect(&layer, ML, y, CW, row_h, c_hdr_row());
+    hline(&layer, ML, CR, y + row_h, 0.5, c_gray_mid());
+
+    let th_y = y + 2.2;
+    ctxt_r(&layer, &font_b, T_NR_R,    th_y, "Nr",                      8.5, c_navy_text());
+    ctxt_l(&layer, &font_b, T_DESC_L,  th_y, "Sherbimi / Pershkrimi",   8.5, c_navy_text());
+    ctxt_r(&layer, &font_b, T_QTY_R,   th_y, "Sasia",                   8.5, c_navy_text());
+    ctxt_r(&layer, &font_b, T_PRICE_R, th_y, "Cmimi",                   8.5, c_navy_text());
+    ctxt_c(&layer, &font_b, T_VAT_L, T_VAT_R, th_y, "TVSH",            8.5, c_navy_text());
+    ctxt_r(&layer, &font_b, T_TOT_R,   th_y, "Totali",                  8.5, c_navy_text());
+
+    y -= 1.5;
+
+    // ── Table rows ─────────────────────────────────────────────────────────
     let mut subtotal = 0.0_f64;
-    let mut vat8 = 0.0_f64;
-    let mut vat18 = 0.0_f64;
+    let mut vat8     = 0.0_f64;
+    let mut vat18    = 0.0_f64;
 
     if data.lines.is_empty() {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            "(pa rreshta)".to_string(),
-            10.0,
-        )?;
+        check_y(&doc, &mut page, &mut layer, &mut y, LH + 4.0);
+        y -= LH;
+        ctxt_l(&layer, &font, T_DESC_L, y, "(pa procedura)", 9.0, c_gray_text());
+        y -= 2.0;
     } else {
         for (idx, ln) in data.lines.iter().enumerate() {
-            let tooth = ln.tooth.as_deref().unwrap_or("").trim();
-            let description = if tooth.is_empty() {
-                ln.title.clone()
-            } else {
-                format!("Dh {} - {}", tooth, ln.title)
-            };
-            let description = clamp_text(&description, 38);
-            let vat_code = ln.vat_code.trim().to_uppercase();
-            let sub = ln.qty * ln.unit_price;
-            subtotal += sub;
+            check_y(&doc, &mut page, &mut layer, &mut y, LH + 4.0);
+            y -= LH;
 
+            let tooth = ln.tooth.as_deref().unwrap_or("").trim();
+            let desc = if tooth.is_empty() {
+                clamp_text(&ln.title, 50)
+            } else {
+                clamp_text(&format!("Dh.{} - {}", tooth, ln.title), 50)
+            };
+            let vat_code = ln.vat_code.trim().to_uppercase();
+            let sub  = ln.qty * ln.unit_price;
+            subtotal += sub;
             let rate = vat_rate_for(&vat_code);
-            let vat = vat_included_amount(sub, rate);
-            if (rate - 0.08).abs() < 0.000_000_1 {
-                vat8 += vat;
-            } else if (rate - 0.18).abs() < 0.000_000_1 {
-                vat18 += vat;
+            let vat  = vat_included(sub, rate);
+            if (rate - 0.08).abs() < 1e-7 { vat8  += vat; }
+            if (rate - 0.18).abs() < 1e-7 { vat18 += vat; }
+
+            if idx % 2 == 1 {
+                fill_rect(&layer, ML, y - 1.5, CW, LH, c_row_alt());
             }
 
-            write_line_with_font(
-                &doc,
-                &mut page,
-                &mut layer,
-                &mut y,
-                left,
-                lh,
-                &font,
-                format!(
-                    "{:>2} | {:<38} | {:>5} | {:>6} | {:>4} | {:>7}",
-                    idx + 1,
-                    description,
-                    money(ln.qty),
-                    money(ln.unit_price),
-                    vat_code,
-                    money(sub)
-                ),
-                9.0,
-            )?;
+            txt_r(&layer, &font, T_NR_R,    y, &(idx + 1).to_string(),           9.0);
+            txt_l(&layer, &font, T_DESC_L,  y, &desc,                            9.0);
+            txt_r(&layer, &font, T_QTY_R,   y, &money(ln.qty),                   9.0);
+            txt_r(&layer, &font, T_PRICE_R, y, &money(ln.unit_price),            9.0);
+            txt_c(&layer, &font, T_VAT_L, T_VAT_R, y, &vat_code,                9.0);
+            txt_r(&layer, &font, T_TOT_R,   y, &format!("{} EUR", money(sub)),   9.0);
+
+            hline(&layer, ML, CR, y - 2.0, 0.2, c_gray_light());
         }
     }
 
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        "--------------------------------------------------------------------------------"
-            .to_string(),
-        9.0,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        format!("Nëntotali: {}", money(subtotal)),
-        10.5,
-    )?;
+    y -= 5.0;
+    check_y(&doc, &mut page, &mut layer, &mut y, 45.0);
+
+    // ── Totals section ─────────────────────────────────────────────────────
+    hline(&layer, ML, CR, y, 1.2, c_navy());
+    y -= LH + 1.0;
+
+    if vat8 > 0.0 {
+        ctxt_l(&layer, &font, ML, y, "TVSH 8% e perfshire:", 8.5, c_gray_text());
+        ctxt_r(&layer, &font, CR, y, &format!("{} EUR", money(vat8)), 8.5, c_gray_text());
+        y -= LH - 0.5;
+    }
+    if vat18 > 0.0 {
+        ctxt_l(&layer, &font, ML, y, "TVSH 18% e perfshire:", 8.5, c_gray_text());
+        ctxt_r(&layer, &font, CR, y, &format!("{} EUR", money(vat18)), 8.5, c_gray_text());
+        y -= LH - 0.5;
+    }
     if vat8 > 0.0 || vat18 > 0.0 {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!(
-                "TVSH e përfshirë në çmim: 8% = {} | 18% = {}",
-                money(vat8),
-                money(vat18)
-            ),
-            10.0,
-        )?;
+        let net = subtotal - vat8 - vat18;
+        ctxt_l(&layer, &font, ML, y, "Nentotali (pa TVSH):", 8.5, c_gray_text());
+        ctxt_r(&layer, &font, CR, y, &format!("{} EUR", money(net)), 8.5, c_gray_text());
+        y -= 3.0;
+        hline(&layer, ML, CR, y, 0.4, c_gray_mid());
+        y -= 3.0;
     }
 
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        "".to_string(),
-        10.0,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font_b,
-        format!("Totali për pagesë: {}", money(data.total)),
-        12.0,
-    )?;
+    // Total highlight box
+    let box_h = 11.0_f32;
+    fill_rect(&layer, ML, y - box_h + 3.5, CW, box_h, c_navy());
+    ctxt_l(&layer, &font_b, ML + 4.0, y - box_h + 7.0, "TOTALI PER PAGESE",          10.5, c_white());
+    ctxt_r(&layer, &font_b, CR - 4.0, y - box_h + 6.5, &format!("{} EUR", money(data.total)), 12.5, c_white());
+    y -= box_h + 2.0;
 
+    // Fiscal/non-fiscal note
     if data.fiscal_total > 0.0 && data.non_fiscal_total > 0.0 {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!(
-                "Ndarje informative: fiskal {} | jo-fiskal {}",
-                money(data.fiscal_total),
-                money(data.non_fiscal_total)
-            ),
-            9.8,
-        )?;
+        check_y(&doc, &mut page, &mut layer, &mut y, LH + 2.0);
+        y -= LH;
+        ctxt_l(&layer, &font, ML, y,
+            &format!("Fiskal: {} EUR    |    Jo-fiskal: {} EUR",
+                money(data.fiscal_total), money(data.non_fiscal_total)),
+            8.0, c_gray_text());
     }
 
-    let footer = "Dokument PDF i gjeneruar nga aplikacioni Mjeku.";
-    draw_footer_centered(&layer, &font, page_w, 8.5, footer, 9.0);
+    // ── Footer ─────────────────────────────────────────────────────────────
+    hline(&layer, ML, CR, 17.5, 0.4, c_gray_light());
+    ctxt_c(&layer, &font, ML, CR, 12.0,
+        &format!("Mjeku  |  {}  |  Dokument i gjeneruar automatikisht", date_str),
+        7.5, c_gray_text());
 
+    save_pdf(doc)
+}
+
+// ─── Visit PDF ────────────────────────────────────────────────────────────────
+
+pub fn render_visit_pdf(data: &VisitPdfData) -> anyhow::Result<Vec<u8>> {
+    let (doc, page1, layer1) = PdfDocument::new("Vizite", Mm(PAGE_W), Mm(PAGE_H), "Layer 1");
+    let font   = doc.add_builtin_font(BuiltinFont::Helvetica).context("font")?;
+    let font_b = doc.add_builtin_font(BuiltinFont::HelveticaBold).context("font bold")?;
+
+    let mut page  = page1;
+    let mut layer = doc.get_page(page).get_layer(layer1);
+
+    let date_str = fmt_date(opt(&data.date));
+    let time_str = opt(&data.visit_time).to_string();
+    let id_disp  = clamp_text(&data.visit_id, 14);
+    let meta2    = if time_str.is_empty() {
+        format!("Data: {}", date_str)
+    } else {
+        format!("Data: {}  {}", date_str, time_str)
+    };
+    let doc_name = opt(&data.doctor_name);
+    let subtitle = if doc_name.is_empty() {
+        data.clinic_name.clone()
+    } else {
+        format!("{}  |  Dr. {}", data.clinic_name, doc_name)
+    };
+
+    let mut y = render_header(
+        &layer, &font, &font_b,
+        "RAPORT VIZITE", &subtitle,
+        &format!("Nr. {}", id_disp), &meta2,
+        data.header_png.as_deref(), data.logo_png.as_deref(),
+    );
+
+    // ── Two-column: patient + visit meta ───────────────────────────────────
+    let mid = ML + CW * 0.52;
+
+    ctxt_l(&layer, &font_b, ML,  y, "Te dhenat e pacientit", 9.5, c_navy_text());
+    ctxt_l(&layer, &font_b, mid, y, "Detajet e vizites",     9.5, c_navy_text());
+    y -= LH;
+
+    let mut left_y  = y;
+    let mut right_y = y;
+
+    {
+        let addr = opt(&data.client_address);
+        let city = opt(&data.client_city);
+        let combined = if addr.is_empty() { city.to_string() }
+            else if city.is_empty() { addr.to_string() }
+            else { format!("{}, {}", addr, city) };
+        if !combined.is_empty() {
+            info_row(&layer, &font, ML, left_y, "Adresa", &clamp_text(&combined, 32), 17.0);
+            left_y -= LH - 0.5;
+        }
+    }
+    for (label, value) in &[
+        ("Emri",   data.client_name.as_str()),
+        ("Kodi",   opt(&data.client_code)),
+        ("Lindje", &fmt_date(opt(&data.client_dob))),
+        ("Tel",    opt(&data.client_phone)),
+        ("Email",  opt(&data.client_email)),
+    ] {
+        if value.is_empty() || *value == "-" { continue; }
+        info_row(&layer, &font, ML, left_y, label, value, 17.0);
+        left_y -= LH - 0.5;
+    }
+
+    for (label, value) in &[
+        ("Nr. Vizites", id_disp.as_str()),
+        ("Data",        date_str.as_str()),
+        ("Ora",         time_str.as_str()),
+        ("Statusi",     data.status.as_str()),
+        ("Mjeku",       opt(&data.doctor_name)),
+        ("Klinika",     data.clinic_name.as_str()),
+    ] {
+        if value.is_empty() { continue; }
+        info_row(&layer, &font, mid, right_y, label, value, 23.0);
+        right_y -= LH - 0.5;
+    }
+
+    y = left_y.min(right_y) - 5.0;
+
+    // ── Vital signs ────────────────────────────────────────────────────────
+    let mut vital_pairs: Vec<(String, String)> = Vec::new();
+    for (label, val_opt, unit_opt) in &[
+        ("Pesha",             &data.body_weight,        &data.body_weight_unit),
+        ("Gjatesia",          &data.body_height,        &data.body_height_unit),
+        ("Perimetri i kokes", &data.head_circumference, &data.head_circumference_unit),
+        ("Temperatura",       &data.body_temperature,   &data.body_temperature_unit),
+        ("Oksigjeni",         &data.blood_oxygen,       &data.blood_oxygen_unit),
+        ("Glicemia",          &data.glycemia,           &data.glycemia_unit),
+        ("Pulsi",             &data.pulse,              &data.pulse_unit),
+    ] {
+        let v = opt(val_opt).trim();
+        if v.is_empty() { continue; }
+        let u = opt(unit_opt).trim();
+        vital_pairs.push((label.to_string(), if u.is_empty() { v.to_string() } else { format!("{} {}", v, u) }));
+    }
+    if let Some(bmi) = &data.bmi { let b = bmi.trim(); if !b.is_empty() { vital_pairs.push(("BMI".to_string(), b.to_string())); } }
+    {
+        let bp_s = opt(&data.blood_pressure_systolic);
+        let bp_d = opt(&data.blood_pressure_diastolic);
+        if !bp_s.is_empty() || !bp_d.is_empty() {
+            let mut v = format!("{}/{}", if bp_s.is_empty() { "-" } else { bp_s }, if bp_d.is_empty() { "-" } else { bp_d });
+            let u = opt(&data.blood_pressure_unit);
+            if !u.is_empty() { v.push(' '); v.push_str(u); }
+            vital_pairs.push(("Tensioni arterial".to_string(), v));
+        }
+    }
+
+    if !vital_pairs.is_empty() {
+        check_y(&doc, &mut page, &mut layer, &mut y, LH * 3.0);
+        hline(&layer, ML, CR, y, 1.2, c_navy());
+        y -= LH + 1.0;
+        ctxt_l(&layer, &font_b, ML, y, "Parametrat klinike", 9.5, c_navy_text());
+        y -= LH;
+
+        let col_x = [ML, mid];
+        let mut ys = [y, y];
+        let mut col = 0usize;
+        for (label, value) in &vital_pairs {
+            check_y(&doc, &mut page, &mut layer, &mut ys[col], LH);
+            ctxt_l(&layer, &font, col_x[col],        ys[col], &format!("{}:", label), 8.5, c_label());
+            txt_l (&layer, &font, col_x[col] + 28.0, ys[col], value, 8.5);
+            ys[col] -= LH - 0.5;
+            col = 1 - col;
+        }
+        y = ys[0].min(ys[1]) - 3.0;
+    }
+
+    // ── Clinical text sections ─────────────────────────────────────────────
+    let sections: Vec<(&str, &Option<String>)> = vec![
+        ("Ankesat",          &data.complaints),
+        ("Shenime shtese",   &data.additional_notes),
+        ("Kontrollat",       &data.controls),
+        ("Verejtjet",        &data.remarks),
+        ("Analizat",         &data.analyses),
+        ("Keshillat",        &data.advice),
+        ("Terapite",         &data.therapies),
+        ("Diagnoza",         &data.diagnosis),
+        ("Ekzaminimet",      &data.examinations),
+        ("Shenime vizite",   &data.notes),
+    ];
+
+    let has_sections = sections.iter().any(|(_, v)| !opt(v).is_empty());
+
+    if has_sections {
+        check_y(&doc, &mut page, &mut layer, &mut y, LH * 2.0);
+        hline(&layer, ML, CR, y, 1.2, c_navy());
+        y -= LH + 1.0;
+        ctxt_l(&layer, &font_b, ML, y, "Informacioni klinik", 9.5, c_navy_text());
+        y -= LH;
+    }
+
+    for (title, content) in &sections {
+        let text = opt(content);
+        if text.is_empty() { continue; }
+
+        check_y(&doc, &mut page, &mut layer, &mut y, LH * 2.5);
+        fill_rect(&layer, ML, y - 1.2, CW, LH, c_total_box());
+        ctxt_l(&layer, &font_b, ML + 2.0, y + 0.8, title, 9.0, c_navy_text());
+        y -= LH + 1.0;
+
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() { continue; }
+            check_y(&doc, &mut page, &mut layer, &mut y, LH);
+            txt_l(&layer, &font, ML + 3.0, y, t, 9.0);
+            y -= LH - 0.5;
+        }
+        y -= 2.0;
+    }
+
+    // ── Procedures table ───────────────────────────────────────────────────
+    if !data.lines.is_empty() {
+        check_y(&doc, &mut page, &mut layer, &mut y, LH * 5.0);
+        hline(&layer, ML, CR, y, 1.2, c_navy());
+        y -= LH + 1.0;
+        ctxt_l(&layer, &font_b, ML, y, "Procedurat e vizites", 9.5, c_navy_text());
+        y -= LH + 1.0;
+
+        let row_h = 7.5_f32;
+        fill_rect(&layer, ML, y, CW, row_h, c_hdr_row());
+        hline(&layer, ML, CR, y + row_h, 0.5, c_gray_mid());
+        let th_y = y + 2.2;
+        ctxt_r(&layer, &font_b, T_NR_R,    th_y, "Nr",        8.5, c_navy_text());
+        ctxt_l(&layer, &font_b, T_DESC_L,  th_y, "Procedura", 8.5, c_navy_text());
+        ctxt_r(&layer, &font_b, T_QTY_R,   th_y, "Sasia",     8.5, c_navy_text());
+        ctxt_r(&layer, &font_b, T_PRICE_R, th_y, "Cmimi",     8.5, c_navy_text());
+        ctxt_c(&layer, &font_b, T_VAT_L, T_VAT_R, th_y, "Fiskal", 8.5, c_navy_text());
+        ctxt_r(&layer, &font_b, T_TOT_R,   th_y, "Totali",    8.5, c_navy_text());
+        y -= 1.5;
+
+        let mut total = 0.0_f64;
+        for (idx, ln) in data.lines.iter().enumerate() {
+            check_y(&doc, &mut page, &mut layer, &mut y, LH + 4.0);
+            y -= LH;
+            let tooth = ln.tooth.as_deref().unwrap_or("").trim();
+            let desc = if tooth.is_empty() {
+                clamp_text(&ln.title, 50)
+            } else {
+                clamp_text(&format!("Dh.{} - {}", tooth, ln.title), 50)
+            };
+            let sub = ln.qty * ln.unit_price;
+            total += sub;
+            if idx % 2 == 1 { fill_rect(&layer, ML, y - 1.5, CW, LH, c_row_alt()); }
+            txt_r(&layer, &font, T_NR_R,    y, &(idx + 1).to_string(),            9.0);
+            txt_l(&layer, &font, T_DESC_L,  y, &desc,                             9.0);
+            txt_r(&layer, &font, T_QTY_R,   y, &money(ln.qty),                    9.0);
+            txt_r(&layer, &font, T_PRICE_R, y, &money(ln.unit_price),             9.0);
+            txt_c(&layer, &font, T_VAT_L, T_VAT_R, y, if ln.fiscal { "Po" } else { "Jo" }, 9.0);
+            txt_r(&layer, &font, T_TOT_R,   y, &format!("{} EUR", money(sub)),    9.0);
+            hline(&layer, ML, CR, y - 2.0, 0.2, c_gray_light());
+        }
+
+        y -= 5.0;
+        check_y(&doc, &mut page, &mut layer, &mut y, 20.0);
+        hline(&layer, ML, CR, y, 1.2, c_navy());
+        y -= LH + 1.0;
+
+        let box_h = 11.0_f32;
+        fill_rect(&layer, ML, y - box_h + 3.5, CW, box_h, c_navy());
+        ctxt_l(&layer, &font_b, ML + 4.0, y - box_h + 7.0, "TOTALI I PROCEDURAVE",         10.0, c_white());
+        ctxt_r(&layer, &font_b, CR - 4.0, y - box_h + 6.5, &format!("{} EUR", money(total)), 12.5, c_white());
+    }
+
+    // ── Footer ─────────────────────────────────────────────────────────────
+    hline(&layer, ML, CR, 17.5, 0.4, c_gray_light());
+    ctxt_c(&layer, &font, ML, CR, 12.0,
+        &format!("Mjeku  |  {}  |  Raport i gjeneruar automatikisht", date_str),
+        7.5, c_gray_text());
+
+    save_pdf(doc)
+}
+
+// ─── PDF serializer ───────────────────────────────────────────────────────────
+
+fn save_pdf(doc: printpdf::PdfDocumentReference) -> anyhow::Result<Vec<u8>> {
     let mut writer = BufWriter::new(Cursor::new(Vec::<u8>::new()));
-    doc.save(&mut writer)
-        .map_err(|e| anyhow!("save pdf: {e}"))?;
-    let cursor = writer.into_inner().map_err(|e| anyhow!("save pdf: {e}"))?;
+    doc.save(&mut writer).map_err(|e| anyhow!("save pdf: {e}"))?;
+    let cursor = writer.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
     Ok(cursor.into_inner())
 }
 
-pub fn render_visit_pdf(data: &VisitPdfData) -> anyhow::Result<Vec<u8>> {
-    let (doc, page1, layer1) = PdfDocument::new("Vizite", Mm(210.0), Mm(297.0), "Layer 1");
-    let font = doc
-        .add_builtin_font(BuiltinFont::Helvetica)
-        .context("add font")?;
-    let font_b = doc
-        .add_builtin_font(BuiltinFont::HelveticaBold)
-        .context("add bold font")?;
+// ─── Sample generation (tests only) ──────────────────────────────────────────
 
-    let mut page = page1;
-    let mut layer = doc.get_page(page).get_layer(layer1);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let page_w = 210.0_f32;
-    let page_h = 297.0_f32;
-    let left = 14.0_f32;
-    let right = 14.0_f32;
-    let top = 12.0_f32;
-    let mut y = page_h - top;
-    let lh = 6.2_f32;
-
-    if let Some(bytes) = data.header_png.as_deref() {
-        let mut cur = Cursor::new(bytes);
-        if let Ok(decoder) = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur) {
-            if let Ok(img) = Image::try_from(decoder) {
-                let w_px = img.image.width.0 as f32;
-                let h_px = img.image.height.0 as f32;
-                if w_px > 0.0 && h_px > 0.0 {
-                    let available_w = page_w - left - right;
-                    let natural_h = available_w * (h_px / w_px);
-                    let max_h = 85.0_f32;
-                    let (draw_w, draw_h) = if natural_h <= max_h {
-                        (available_w, natural_h)
-                    } else {
-                        (max_h * (w_px / h_px), max_h)
-                    };
-                    let x = left + ((available_w - draw_w) / 2.0);
-                    let lower_y = page_h - top - draw_h;
-
-                    let dpi: f32 = 300.0;
-                    let scale_x: f32 = draw_w * dpi / (w_px * 25.4);
-                    let scale_y: f32 = draw_h * dpi / (h_px * 25.4);
-                    img.add_to_layer(
-                        layer.clone(),
-                        ImageTransform {
-                            translate_x: Some(Mm(x)),
-                            translate_y: Some(Mm(lower_y)),
-                            rotate: None,
-                            scale_x: Some(scale_x),
-                            scale_y: Some(scale_y),
-                            dpi: Some(dpi),
-                        },
-                    );
-                    y = lower_y - 8.0;
-                }
-            }
-        }
-    }
-
-    if let Some(bytes) = data.logo_png.as_deref() {
-        let mut cur = Cursor::new(bytes);
-        if let Ok(decoder) = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cur) {
-            if let Ok(img) = Image::try_from(decoder) {
-                let w_px = img.image.width.0 as f32;
-                let h_px = img.image.height.0 as f32;
-                if w_px > 0.0 && h_px > 0.0 {
-                    let max_w = 28.0_f32;
-                    let max_h = 18.0_f32;
-                    let mut draw_w = max_w;
-                    let mut draw_h = max_w * (h_px / w_px);
-                    if draw_h > max_h {
-                        draw_h = max_h;
-                        draw_w = max_h * (w_px / h_px);
-                    }
-                    let x = page_w - right - draw_w;
-                    let lower_y = page_h - top - draw_h;
-                    let dpi: f32 = 300.0;
-                    let scale_x: f32 = draw_w * dpi / (w_px * 25.4);
-                    let scale_y: f32 = draw_h * dpi / (h_px * 25.4);
-                    img.add_to_layer(
-                        layer.clone(),
-                        ImageTransform {
-                            translate_x: Some(Mm(x)),
-                            translate_y: Some(Mm(lower_y)),
-                            rotate: None,
-                            scale_x: Some(scale_x),
-                            scale_y: Some(scale_y),
-                            dpi: Some(dpi),
-                        },
-                    );
-                    if y > (lower_y - 4.0) {
-                        y = lower_y - 4.0;
-                    }
-                }
-            }
-        }
-    }
-
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font_b,
-        "RAPORTI I VIZITËS".to_string(),
-        14.0,
-    )?;
-    let date_str = data
-        .date
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "-".to_string());
-    let time_str = data
-        .visit_time
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "-".to_string());
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        format!(
-            "Nr: {}    Data: {} {}    Status: {}",
-            data.visit_id, date_str, time_str, data.status
-        ),
-        10.5,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        format!("Klinika: {}", data.clinic_name),
-        10.5,
-    )?;
-    if let Some(v) = data
-        .doctor_name
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Mjeku: {v}"),
-            10.5,
-        )?;
-    }
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        "".to_string(),
-        10.0,
-    )?;
-
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font_b,
-        "Të dhënat e pacientit".to_string(),
-        11.5,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        format!("Emri: {}", data.client_name),
-        10.5,
-    )?;
-    if let Some(v) = data
-        .client_code
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Kodi: {v}"),
-            10.5,
-        )?;
-    }
-    if let Some(v) = data
-        .client_dob
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Data e lindjes: {v}"),
-            10.5,
-        )?;
-    }
-    let addr = data.client_address.as_deref().unwrap_or("").trim();
-    let city = data.client_city.as_deref().unwrap_or("").trim();
-    if !addr.is_empty() || !city.is_empty() {
-        let mut v = String::new();
-        if !addr.is_empty() {
-            v.push_str(addr);
-        }
-        if !city.is_empty() {
-            if !v.is_empty() {
-                v.push_str(", ");
-            }
-            v.push_str(city);
-        }
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Adresa: {v}"),
-            10.5,
-        )?;
-    }
-    if let Some(v) = data
-        .client_phone
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Tel: {v}"),
-            10.5,
-        )?;
-    }
-    if let Some(v) = data
-        .client_email
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Email: {v}"),
-            10.5,
-        )?;
-    }
-
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font,
-        "".to_string(),
-        10.0,
-    )?;
-    write_line_with_font(
-        &doc,
-        &mut page,
-        &mut layer,
-        &mut y,
-        left,
-        lh,
-        &font_b,
-        "Parametrat e vizitës".to_string(),
-        11.5,
-    )?;
-
-    let mut metric_line =
-        |label: &str, value: Option<&str>, unit: Option<&str>| -> anyhow::Result<()> {
-            let v = value
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty());
-            if let Some(v) = v {
-                let u = unit.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
-                let line = match u {
-                    Some(u) => format!("{label}: {v} {u}"),
-                    None => format!("{label}: {v}"),
-                };
-                write_line_with_font(
-                    &doc, &mut page, &mut layer, &mut y, left, lh, &font, line, 10.2,
-                )?;
-            }
-            Ok(())
+    #[test]
+    fn generate_sample_invoice_pdf() {
+        let data = InvoicePdfData {
+            clinic_name: "Klinika Dentare Smile".to_string(),
+            header_png: None,
+            logo_png: None,
+            invoice_id: "F-2026-0042".to_string(),
+            date: Some("2026-06-27".to_string()),
+            client_name: "Gentiana Berisha".to_string(),
+            client_code: Some("KB-00142".to_string()),
+            client_dob: Some("1985-03-14".to_string()),
+            client_address: Some("Rr. Nene Tereza, Nr. 24".to_string()),
+            client_city: Some("Prishtine".to_string()),
+            client_phone: Some("+383 44 123 456".to_string()),
+            client_email: Some("gberisha@email.com".to_string()),
+            notes: None,
+            lines: vec![
+                InvoiceLine {
+                    tooth: Some("11".to_string()),
+                    title: "Ekzaminim dhe konsulte dentare".to_string(),
+                    qty: 1.0, unit_price: 20.0, fiscal: true, vat_code: "C".to_string(),
+                },
+                InvoiceLine {
+                    tooth: Some("21".to_string()),
+                    title: "Mbushje kompozite klase II".to_string(),
+                    qty: 1.0, unit_price: 75.0, fiscal: true, vat_code: "C".to_string(),
+                },
+                InvoiceLine {
+                    tooth: Some("22".to_string()),
+                    title: "Mbushje kompozite klase II".to_string(),
+                    qty: 1.0, unit_price: 75.0, fiscal: true, vat_code: "C".to_string(),
+                },
+                InvoiceLine {
+                    tooth: None,
+                    title: "Radiografi periapikale".to_string(),
+                    qty: 2.0, unit_price: 15.0, fiscal: true, vat_code: "E".to_string(),
+                },
+                InvoiceLine {
+                    tooth: None,
+                    title: "Pastrim profesional (profilaksi)".to_string(),
+                    qty: 1.0, unit_price: 40.0, fiscal: false, vat_code: "A".to_string(),
+                },
+            ],
+            total: 225.0,
+            fiscal_total: 185.0,
+            non_fiscal_total: 40.0,
         };
-    metric_line(
-        "Pesha",
-        data.body_weight.as_deref(),
-        data.body_weight_unit.as_deref(),
-    )?;
-    metric_line(
-        "Gjatesia",
-        data.body_height.as_deref(),
-        data.body_height_unit.as_deref(),
-    )?;
-    metric_line(
-        "Perimetri i kokës",
-        data.head_circumference.as_deref(),
-        data.head_circumference_unit.as_deref(),
-    )?;
-    metric_line(
-        "Temperatura",
-        data.body_temperature.as_deref(),
-        data.body_temperature_unit.as_deref(),
-    )?;
-    metric_line(
-        "Oksigjeni në gjak",
-        data.blood_oxygen.as_deref(),
-        data.blood_oxygen_unit.as_deref(),
-    )?;
-    metric_line(
-        "Glicemia",
-        data.glycemia.as_deref(),
-        data.glycemia_unit.as_deref(),
-    )?;
-    metric_line("Pulsi", data.pulse.as_deref(), data.pulse_unit.as_deref())?;
-    metric_line("BMI", data.bmi.as_deref(), None)?;
-    let bp_s = data
-        .blood_pressure_systolic
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let bp_d = data
-        .blood_pressure_diastolic
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if bp_s.is_some() || bp_d.is_some() {
-        let mut bp = format!(
-            "{}/{}",
-            bp_s.unwrap_or_else(|| "-".to_string()),
-            bp_d.unwrap_or_else(|| "-".to_string())
-        );
-        if let Some(u) = data
-            .blood_pressure_unit
-            .as_deref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            bp.push(' ');
-            bp.push_str(&u);
-        }
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            format!("Tensioni arterial: {bp}"),
-            10.2,
-        )?;
+        let pdf = render_invoice_pdf(&data).expect("render invoice");
+        let path = "C:/Users/Fatlind Mazreku/Desktop/sample_fature.pdf";
+        std::fs::write(path, &pdf).expect("write pdf");
+        println!("Saved {} bytes to {}", pdf.len(), path);
     }
 
-    let mut section_line = |label: &str, value: Option<&str>| -> anyhow::Result<()> {
-        if let Some(v) = value
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            write_line_with_font(
-                &doc,
-                &mut page,
-                &mut layer,
-                &mut y,
-                left,
-                lh,
-                &font_b,
-                format!("{label}:"),
-                10.5,
-            )?;
-            for part in v.lines() {
-                let txt = part.trim();
-                if txt.is_empty() {
-                    continue;
-                }
-                write_line_with_font(
-                    &doc,
-                    &mut page,
-                    &mut layer,
-                    &mut y,
-                    left + 2.0,
-                    lh,
-                    &font,
-                    txt.to_string(),
-                    10.2,
-                )?;
-            }
-        }
-        Ok(())
-    };
-
-    section_line("Ankesat", data.complaints.as_deref())?;
-    section_line("Shënime shtesë", data.additional_notes.as_deref())?;
-    section_line("Kontrollat", data.controls.as_deref())?;
-    section_line("Vërejtjet", data.remarks.as_deref())?;
-    section_line("Analizat dhe ekzaminimet", data.analyses.as_deref())?;
-    section_line("Këshillat", data.advice.as_deref())?;
-    section_line("Terapitë", data.therapies.as_deref())?;
-    section_line("Diagnozat", data.diagnosis.as_deref())?;
-    section_line("Ekzaminimet", data.examinations.as_deref())?;
-    section_line("Shënime", data.notes.as_deref())?;
-
-    if !data.lines.is_empty() {
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            "".to_string(),
-            10.0,
-        )?;
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font_b,
-            "Procedurat e vizitës".to_string(),
-            11.5,
-        )?;
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font_b,
-            "Nr | Përshkrimi                               | Sasia | Çmimi  | Fiskal | Totali"
-                .to_string(),
-            9.2,
-        )?;
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            "--------------------------------------------------------------------------------"
-                .to_string(),
-            9.0,
-        )?;
-
-        for (idx, ln) in data.lines.iter().enumerate() {
-            let tooth = ln.tooth.as_deref().unwrap_or("").trim();
-            let description = if tooth.is_empty() {
-                ln.title.clone()
-            } else {
-                format!("Dh {} - {}", tooth, ln.title)
-            };
-            let description = clamp_text(&description, 38);
-            let sub = ln.qty * ln.unit_price;
-            write_line_with_font(
-                &doc,
-                &mut page,
-                &mut layer,
-                &mut y,
-                left,
-                lh,
-                &font,
-                format!(
-                    "{:>2} | {:<38} | {:>5} | {:>6} | {:>6} | {:>7}",
-                    idx + 1,
-                    description,
-                    money(ln.qty),
-                    money(ln.unit_price),
-                    if ln.fiscal { "Po" } else { "Jo" },
-                    money(sub)
-                ),
-                9.0,
-            )?;
-        }
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font,
-            "--------------------------------------------------------------------------------"
-                .to_string(),
-            9.0,
-        )?;
-        write_line_with_font(
-            &doc,
-            &mut page,
-            &mut layer,
-            &mut y,
-            left,
-            lh,
-            &font_b,
-            format!("Totali i procedurave: {}", money(data.total)),
-            11.0,
-        )?;
+    #[test]
+    fn generate_sample_visit_pdf() {
+        let data = VisitPdfData {
+            clinic_name: "Klinika Dentare Smile".to_string(),
+            header_png: None,
+            logo_png: None,
+            visit_id: "V-2026-0198".to_string(),
+            date: Some("2026-06-27".to_string()),
+            visit_time: Some("10:30".to_string()),
+            status: "Final".to_string(),
+            doctor_name: Some("Artan Krasniqi".to_string()),
+            client_name: "Gentiana Berisha".to_string(),
+            client_code: Some("KB-00142".to_string()),
+            client_dob: Some("1985-03-14".to_string()),
+            client_address: Some("Rr. Nene Tereza, Nr. 24".to_string()),
+            client_city: Some("Prishtine".to_string()),
+            client_phone: Some("+383 44 123 456".to_string()),
+            client_email: Some("gberisha@email.com".to_string()),
+            notes: None,
+            body_weight: Some("68".to_string()),
+            body_weight_unit: Some("kg".to_string()),
+            body_height: Some("167".to_string()),
+            body_height_unit: Some("cm".to_string()),
+            head_circumference: None, head_circumference_unit: None,
+            body_temperature: Some("36.7".to_string()),
+            body_temperature_unit: Some("C".to_string()),
+            blood_oxygen: Some("98".to_string()),
+            blood_oxygen_unit: Some("%".to_string()),
+            glycemia: None, glycemia_unit: None,
+            pulse: Some("72".to_string()),
+            pulse_unit: Some("bpm".to_string()),
+            bmi: Some("24.4".to_string()),
+            blood_pressure_systolic: Some("120".to_string()),
+            blood_pressure_diastolic: Some("80".to_string()),
+            blood_pressure_unit: Some("mmHg".to_string()),
+            complaints: Some("Pacientja ankohet per dhembje te lehte ne dhembin 21 gjate kafshimit. Dhembja ka filluar para 5 ditesh.".to_string()),
+            additional_notes: Some("Historia dentare: mbushje te medha ne sektoren posteriore. Pacientja nuk ka alergji te njohura ndaj anestetikeve.".to_string()),
+            controls: Some("Kontroll i rekomandueshme pas 2 javesh.".to_string()),
+            remarks: None,
+            analyses: None,
+            advice: Some("Evitoni ushqimet e ftohta dhe te ngrohta per 48 ore. Perdorni paste me fluoride.".to_string()),
+            therapies: Some("Aplikuar anestezi lokale. Heqja e mbushjes se vjeter dhe ri-mbushja me kompozit.".to_string()),
+            diagnosis: Some("Karies sekondar dhembit 21, klase II sipas Black.".to_string()),
+            examinations: Some("Ekzaminim klinik dhe radiografik. Testi i vitalitetit pozitiv.".to_string()),
+            lines: vec![
+                InvoiceLine {
+                    tooth: Some("21".to_string()),
+                    title: "Mbushje kompozite klase II".to_string(),
+                    qty: 1.0, unit_price: 75.0, fiscal: true, vat_code: "C".to_string(),
+                },
+                InvoiceLine {
+                    tooth: None,
+                    title: "Radiografi periapikale".to_string(),
+                    qty: 1.0, unit_price: 15.0, fiscal: true, vat_code: "E".to_string(),
+                },
+            ],
+            total: 90.0,
+        };
+        let pdf = render_visit_pdf(&data).expect("render visit");
+        let path = "C:/Users/Fatlind Mazreku/Desktop/sample_vizite.pdf";
+        std::fs::write(path, &pdf).expect("write pdf");
+        println!("Saved {} bytes to {}", pdf.len(), path);
     }
-
-    let footer = "Dokument PDF i gjeneruar nga aplikacioni Mjeku.";
-    draw_footer_centered(&layer, &font, page_w, 8.5, footer, 9.0);
-
-    let mut writer = BufWriter::new(Cursor::new(Vec::<u8>::new()));
-    doc.save(&mut writer)
-        .map_err(|e| anyhow!("save pdf: {e}"))?;
-    let cursor = writer.into_inner().map_err(|e| anyhow!("save pdf: {e}"))?;
-    Ok(cursor.into_inner())
 }

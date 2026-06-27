@@ -398,6 +398,7 @@ impl SyncEngine {
     ) -> anyhow::Result<Vec<T>> {
         let url = format!("{base}/rest/v1/{table}");
         let resp = with_supabase_auth(self.client.get(&url), api_key)
+            .header("clinic_id", clinic_id)
             .query(&[
                 ("select", "*"),
                 ("clinic_id", &format!("eq.{}", clinic_id)),
@@ -487,6 +488,7 @@ impl SyncEngine {
                 
                 let resp = with_supabase_auth(self.client.post(&url), api_key)
                     .header("Prefer", "resolution=merge-duplicates,return=minimal")
+                    .header("clinic_id", clinic_id)
                     .json(&payload)
                     .send()
                     .await?;
@@ -533,6 +535,7 @@ impl SyncEngine {
             let body = serde_json::json!({ "deleted": 1, "updated_at": updated_at });
             let resp = with_supabase_auth(self.client.patch(&url), api_key)
                 .header("Prefer", "return=minimal")
+                .header("clinic_id", clinic_id)
                 .json(&body)
                 .send()
                 .await?;

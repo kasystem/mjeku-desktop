@@ -2634,7 +2634,7 @@ impl Db {
         now: &str,
     ) -> anyhow::Result<()> {
         let clinic_id = self.setting_get("clinic_id")?.unwrap_or_default();
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
       "INSERT INTO doctor_accounts (doctor_id, clinic_id, salt, password_hash, is_admin, created_at, updated_at, deleted)
@@ -2666,7 +2666,7 @@ impl Db {
 
     pub fn doctor_account_delete(&self, doctor_id: &str) -> anyhow::Result<()> {
         let now = now_iso();
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE doctor_accounts SET deleted=1, updated_at=?2 WHERE doctor_id=?1",
@@ -2890,8 +2890,27 @@ impl Db {
             "UPDATE doctors SET deleted=1, updated_at=?2 WHERE id=?1",
             params![id, now],
         )?;
-        // Also soft-delete the account if it exists
-        let _ = tx.execute("UPDATE doctor_accounts SET deleted=1, updated_at=?2 WHERE doctor_id=?1", params![id, now]);
+        // Also soft-delete the account if it exists AND queue for sync
+        if let Some(mut row) = tx.query_row(
+            "SELECT doctor_id, clinic_id, salt, password_hash, is_admin, created_at, updated_at, deleted FROM doctor_accounts WHERE doctor_id=?1 AND deleted = 0",
+            params![id],
+            |r| Ok(DoctorAccount {
+                doctor_id: r.get(0)?,
+                clinic_id: r.get(1)?,
+                salt: r.get(2)?,
+                password_hash: r.get(3)?,
+                is_admin: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+                deleted: r.get(7)?,
+            })
+        ).optional()? {
+            tx.execute("UPDATE doctor_accounts SET deleted=1, updated_at=?2 WHERE doctor_id=?1", params![id, now])?;
+            row.deleted = 1;
+            row.updated_at = now.to_string();
+            let payload = serde_json::to_string(&row)?;
+            Self::queue_replace_pending_tx(&tx, "doctor_accounts", &row.doctor_id, "delete", &payload, &now)?;
+        }
         let row = tx
       .query_row(
         "SELECT id, code, name, title, specialty, phone, email, notes, created_at, updated_at, deleted FROM doctors WHERE id=?1",
