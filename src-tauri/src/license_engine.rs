@@ -32,6 +32,7 @@ const KEY_LICENSE_ALLOWED_IP_LIST: &str = "license_allowed_ip_list";
 const KEY_LICENSE_LAST_PUBLIC_IP: &str = "license_last_public_ip";
 const KEY_LICENSE_LAST_CHECKED_AT: &str = "license_last_checked_at";
 const KEY_LICENSE_LAST_SEEN_DEVICE_TIME: &str = "license_last_seen_device_time";
+const KEY_LICENSED_DEPARTMENTS: &str = "licensed_departments";
 
 const GRACE_DAYS: i64 = 7;
 const CLOCK_BACKWARD_TOLERANCE_SECS: i64 = 5 * 60;
@@ -97,6 +98,7 @@ struct ClinicRegistryRow {
     pub enforce_ip: Option<bool>,
     pub allowed_ip_list: Option<String>,
     pub updated_at: Option<String>,
+    pub departments: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,7 +243,7 @@ impl LicenseEngine {
       .query(&[
         (
           "select",
-          "clinic_id,clinic_name,approved,disabled,active_until,enforce_ip,allowed_ip_list,updated_at",
+          "clinic_id,clinic_name,approved,disabled,active_until,enforce_ip,allowed_ip_list,updated_at,departments",
         ),
         ("clinic_id", &format!("eq.{}", clinic_id.trim())),
         ("limit", "1"),
@@ -415,6 +417,11 @@ impl LicenseEngine {
             active_until.as_deref().unwrap_or(""),
         )?;
         self.db.setting_set(KEY_LICENSE_LAST_CHECKED_AT, &now)?;
+
+        // Save departments from registry (comma-separated or JSON, default to stomatologji)
+        let depts = row.departments.as_deref().unwrap_or("stomatologji").trim().to_string();
+        let depts = if depts.is_empty() { "stomatologji".to_string() } else { depts };
+        self.db.setting_set(KEY_LICENSED_DEPARTMENTS, &depts)?;
 
         let mut ok = true;
         let mut st = "ok".to_string();

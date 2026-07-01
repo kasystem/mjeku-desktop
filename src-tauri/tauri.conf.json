@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
   "productName": "Mjeku",
-  "version": "0.2.0",
+  "version": "0.4.8",
   "identifier": "com.mjeku.desktop",
   "build": {
     "devUrl": "http://127.0.0.1:5173",
@@ -29,6 +29,19 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
-    "resources": ["resources/ui-seed.zip", "resources/ui-seed-version.txt"]
+    "resources": ["resources/ui-seed.zip", "resources/ui-seed-version.txt"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIzQTAwMTY5N0ExRkIzN0MKUldSOHN4OTZhUUdnSStZMzZiZ09IY3NQSXNNUVZrbnBOZjdqNWFLbDgvNEZCTjNVSFpjNlhBQ0IK",
+      "endpoints": ["https://mjeku-ui.vercel.app/desktop-update.json"],
+      "dialog": false
+    }
   }
 }
+
