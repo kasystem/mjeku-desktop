@@ -34,6 +34,7 @@ pub struct InvoicePdfData {
     pub client_phone: Option<String>,
     pub client_email: Option<String>,
     pub notes: Option<String>,
+    pub bank_account: Option<String>,
     pub lines: Vec<InvoiceLine>,
     pub total: f64,
     pub fiscal_total: f64,
@@ -108,20 +109,20 @@ const T_VAT_L: f32   = 154.0;
 const T_VAT_R: f32   = 167.0;
 const T_TOT_R: f32   = 196.0;
 
-// ─── Colors ───────────────────────────────────────────────────────────────────
+// ─── Colors — warm forest-green palette ──────────────────────────────────────
 
-fn c_navy()       -> Color { Color::Rgb(Rgb::new(0.14, 0.28, 0.52, None)) }
-fn c_navy_mid()   -> Color { Color::Rgb(Rgb::new(0.22, 0.40, 0.68, None)) }
-fn c_navy_pale()  -> Color { Color::Rgb(Rgb::new(0.78, 0.86, 0.96, None)) }
+fn c_navy()       -> Color { Color::Rgb(Rgb::new(0.12, 0.32, 0.22, None)) } // deep forest green
+fn c_navy_mid()   -> Color { Color::Rgb(Rgb::new(0.20, 0.45, 0.32, None)) } // medium green
+fn c_navy_pale()  -> Color { Color::Rgb(Rgb::new(0.75, 0.88, 0.80, None)) } // pale sage
 fn c_white()      -> Color { Color::Rgb(Rgb::new(1.00, 1.00, 1.00, None)) }
-fn c_row_alt()    -> Color { Color::Rgb(Rgb::new(0.96, 0.97, 0.99, None)) }
-fn c_hdr_row()    -> Color { Color::Rgb(Rgb::new(0.91, 0.93, 0.97, None)) }
-fn c_total_box()  -> Color { Color::Rgb(Rgb::new(0.93, 0.95, 0.98, None)) }
+fn c_row_alt()    -> Color { Color::Rgb(Rgb::new(0.98, 0.97, 0.94, None)) } // warm ivory
+fn c_hdr_row()    -> Color { Color::Rgb(Rgb::new(0.90, 0.94, 0.91, None)) } // light sage
+fn c_total_box()  -> Color { Color::Rgb(Rgb::new(0.94, 0.97, 0.95, None)) } // very pale sage
 fn c_gray_mid()   -> Color { Color::Rgb(Rgb::new(0.70, 0.70, 0.70, None)) }
 fn c_gray_light() -> Color { Color::Rgb(Rgb::new(0.88, 0.88, 0.88, None)) }
 fn c_gray_text()  -> Color { Color::Rgb(Rgb::new(0.45, 0.45, 0.45, None)) }
 fn c_label()      -> Color { Color::Rgb(Rgb::new(0.40, 0.40, 0.40, None)) }
-fn c_navy_text()  -> Color { Color::Rgb(Rgb::new(0.10, 0.22, 0.46, None)) }
+fn c_navy_text()  -> Color { Color::Rgb(Rgb::new(0.08, 0.25, 0.17, None)) } // dark forest green
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────
 
@@ -392,7 +393,7 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
     let mid = ML + CW * 0.52;
 
     ctxt_l(&layer, &font_b, ML,  y, "Te dhenat e pacientit", 9.5, c_navy_text());
-    ctxt_l(&layer, &font_b, mid, y, "Detajet eatures",      9.5, c_navy_text());
+    ctxt_l(&layer, &font_b, mid, y, "Detajet e fatures",    9.5, c_navy_text());
     y -= LH;
 
     let mut left_y  = y;
@@ -544,10 +545,21 @@ pub fn render_invoice_pdf(data: &InvoicePdfData) -> anyhow::Result<Vec<u8>> {
             8.0, c_gray_text());
     }
 
+    // Bank account / payment info
+    if let Some(ref ba) = data.bank_account {
+        let ba = ba.trim();
+        if !ba.is_empty() {
+            check_y(&doc, &mut page, &mut layer, &mut y, LH + 2.0);
+            y -= LH;
+            ctxt_l(&layer, &font_b, ML, y, "Xhirollogaria:", 8.5, c_label());
+            ctxt_l(&layer, &font, ML + 29.0, y, ba, 8.5, c_gray_text());
+        }
+    }
+
     // ── Footer ─────────────────────────────────────────────────────────────
     hline(&layer, ML, CR, 17.5, 0.4, c_gray_light());
     ctxt_c(&layer, &font, ML, CR, 12.0,
-        &format!("Mjeku  |  {}  |  Dokument i gjeneruar automatikisht", date_str),
+        &format!("Mjeku  |  {}  |  PROGRAMERI MJEKU  www.programeri.net", date_str),
         7.5, c_gray_text());
 
     save_pdf(doc)
@@ -780,7 +792,216 @@ pub fn render_visit_pdf(data: &VisitPdfData) -> anyhow::Result<Vec<u8>> {
     // ── Footer ─────────────────────────────────────────────────────────────
     hline(&layer, ML, CR, 17.5, 0.4, c_gray_light());
     ctxt_c(&layer, &font, ML, CR, 12.0,
-        &format!("Mjeku  |  {}  |  Raport i gjeneruar automatikisht", date_str),
+        &format!("Mjeku  |  {}  |  PROGRAMERI MJEKU  www.programeri.net", date_str),
+        7.5, c_gray_text());
+
+    save_pdf(doc)
+}
+
+// ─── Offer PDF ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct OfferPdfData {
+    pub clinic_name: String,
+    pub clinic_address: Option<String>,
+    pub clinic_phone: Option<String>,
+    pub header_png: Option<Vec<u8>>,
+    pub logo_png: Option<Vec<u8>>,
+    pub offer_number: String,
+    pub date: String,
+    pub valid_until: Option<String>,
+    pub client_name: String,
+    pub client_phone: Option<String>,
+    pub client_email: Option<String>,
+    pub notes: Option<String>,
+    pub lines: Vec<OfferPdfLine>,
+    pub vat_pct: f64,
+    pub subtotal: f64,
+    pub vat_amount: f64,
+    pub total: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OfferPdfLine {
+    pub description: String,
+    pub qty: f64,
+    pub unit_price: f64,
+    pub discount_pct: f64,
+    pub line_total: f64,
+}
+
+// Offer table columns (mm from page left)
+const O_NR_R: f32    = 23.0;
+const O_DESC_L: f32  = 25.0;
+const O_QTY_R: f32   = 115.0;
+const O_PRICE_R: f32 = 140.0;
+const O_DISC_R: f32  = 158.0;
+const O_TOT_R: f32   = 196.0;
+
+pub fn generate_offer_pdf(data: &OfferPdfData) -> anyhow::Result<Vec<u8>> {
+    let (doc, page1, layer1) = PdfDocument::new("Oferte", Mm(PAGE_W), Mm(PAGE_H), "Layer 1");
+    let font   = doc.add_builtin_font(BuiltinFont::Helvetica).context("font")?;
+    let font_b = doc.add_builtin_font(BuiltinFont::HelveticaBold).context("font bold")?;
+
+    let mut page  = page1;
+    let mut layer = doc.get_page(page).get_layer(layer1);
+
+    let date_str    = fmt_date(&data.date);
+    let valid_str   = data.valid_until.as_deref().map(fmt_date).unwrap_or_else(|| "-".to_string());
+    let nr_display  = clamp_text(&data.offer_number, 20);
+
+    let mut y = render_header(
+        &layer, &font, &font_b,
+        "OFERTE", &data.clinic_name,
+        &format!("Nr. {}", nr_display),
+        &format!("Data: {}", date_str),
+        data.header_png.as_deref(), data.logo_png.as_deref(),
+    );
+
+    // ── Clinic address / phone row ─────────────────────────────────────────
+    let addr = opt(&data.clinic_address);
+    let phone = opt(&data.clinic_phone);
+    if !addr.is_empty() || !phone.is_empty() {
+        let combined = if !addr.is_empty() && !phone.is_empty() {
+            format!("{}  |  Tel: {}", addr, phone)
+        } else if !addr.is_empty() {
+            addr.to_string()
+        } else {
+            format!("Tel: {}", phone)
+        };
+        ctxt_l(&layer, &font, ML, y, &clamp_text(&combined, 60), 8.0, c_gray_text());
+        y -= LH;
+    }
+
+    // ── Two-column: client + offer meta ───────────────────────────────────
+    let mid = ML + CW * 0.52;
+
+    ctxt_l(&layer, &font_b, ML,  y, "Te dhenat e klientit", 9.5, c_navy_text());
+    ctxt_l(&layer, &font_b, mid, y, "Detajet e ofertes",    9.5, c_navy_text());
+    y -= LH;
+
+    let mut left_y  = y;
+    let mut right_y = y;
+
+    // Left: client info
+    for (label, value) in &[
+        ("Emri",  data.client_name.as_str()),
+        ("Tel",   opt(&data.client_phone)),
+        ("Email", opt(&data.client_email)),
+    ] {
+        if value.is_empty() { continue; }
+        info_row(&layer, &font, ML, left_y, label, value, 17.0);
+        left_y -= LH - 0.5;
+    }
+
+    // Right: offer meta
+    for (label, value) in &[
+        ("Nr. Ofertes", nr_display.as_str()),
+        ("Data",        date_str.as_str()),
+        ("Vlefshmeria", valid_str.as_str()),
+        ("Klinika",     data.clinic_name.as_str()),
+    ] {
+        if value.is_empty() { continue; }
+        info_row(&layer, &font, mid, right_y, label, value, 23.0);
+        right_y -= LH - 0.5;
+    }
+
+    y = left_y.min(right_y) - 5.0;
+
+    // Notes
+    if !opt(&data.notes).is_empty() {
+        ctxt_l(&layer, &font, ML, y, &format!("Shenime: {}", clamp_text(opt(&data.notes), 70)), 8.5, c_gray_text());
+        y -= LH;
+    }
+
+    // Navy divider
+    hline(&layer, ML, CR, y, 1.2, c_navy());
+    y -= 8.0;
+
+    // ── Table header row ───────────────────────────────────────────────────
+    let row_h = 7.5_f32;
+    fill_rect(&layer, ML, y, CW, row_h, c_hdr_row());
+    hline(&layer, ML, CR, y + row_h, 0.5, c_gray_mid());
+
+    let th_y = y + 2.2;
+    ctxt_r(&layer, &font_b, O_NR_R,    th_y, "Nr",               8.5, c_navy_text());
+    ctxt_l(&layer, &font_b, O_DESC_L,  th_y, "Sherbimi",          8.5, c_navy_text());
+    ctxt_r(&layer, &font_b, O_QTY_R,   th_y, "Sasia",             8.5, c_navy_text());
+    ctxt_r(&layer, &font_b, O_PRICE_R, th_y, "Cmimi/njesi",       8.5, c_navy_text());
+    ctxt_r(&layer, &font_b, O_DISC_R,  th_y, "Zb.%",              8.5, c_navy_text());
+    ctxt_r(&layer, &font_b, O_TOT_R,   th_y, "Totali",            8.5, c_navy_text());
+
+    y -= 1.5;
+
+    // ── Table rows ─────────────────────────────────────────────────────────
+    if data.lines.is_empty() {
+        check_y(&doc, &mut page, &mut layer, &mut y, LH + 4.0);
+        y -= LH;
+        ctxt_l(&layer, &font, O_DESC_L, y, "(pa sherbime)", 9.0, c_gray_text());
+        y -= 2.0;
+    } else {
+        for (idx, ln) in data.lines.iter().enumerate() {
+            check_y(&doc, &mut page, &mut layer, &mut y, LH + 4.0);
+            y -= LH;
+
+            let desc = clamp_text(&ln.description, 45);
+
+            if idx % 2 == 1 {
+                fill_rect(&layer, ML, y - 1.5, CW, LH, c_row_alt());
+            }
+
+            txt_r(&layer, &font, O_NR_R,    y, &(idx + 1).to_string(),               9.0);
+            txt_l(&layer, &font, O_DESC_L,  y, &desc,                                9.0);
+            txt_r(&layer, &font, O_QTY_R,   y, &money(ln.qty),                       9.0);
+            txt_r(&layer, &font, O_PRICE_R, y, &money(ln.unit_price),                9.0);
+            txt_r(&layer, &font, O_DISC_R,  y, &format!("{}%", money(ln.discount_pct)), 9.0);
+            txt_r(&layer, &font, O_TOT_R,   y, &format!("{} EUR", money(ln.line_total)), 9.0);
+
+            hline(&layer, ML, CR, y - 2.0, 0.2, c_gray_light());
+        }
+    }
+
+    y -= 5.0;
+    check_y(&doc, &mut page, &mut layer, &mut y, 50.0);
+
+    // ── Totals section ─────────────────────────────────────────────────────
+    hline(&layer, ML, CR, y, 1.2, c_navy());
+    y -= LH + 1.0;
+
+    // Subtotal line
+    ctxt_l(&layer, &font, ML, y, "Nentotali:", 8.5, c_gray_text());
+    ctxt_r(&layer, &font, CR, y, &format!("{} EUR", money(data.subtotal)), 8.5, c_gray_text());
+    y -= LH - 0.5;
+
+    // VAT line (only if > 0)
+    if data.vat_amount > 0.0 {
+        ctxt_l(&layer, &font, ML, y, &format!("TVSH ({}%):", money(data.vat_pct)), 8.5, c_gray_text());
+        ctxt_r(&layer, &font, CR, y, &format!("{} EUR", money(data.vat_amount)), 8.5, c_gray_text());
+        y -= 3.0;
+        hline(&layer, ML, CR, y, 0.4, c_gray_mid());
+        y -= 3.0;
+    }
+
+    // Total highlight box
+    let box_h = 11.0_f32;
+    fill_rect(&layer, ML, y - box_h + 3.5, CW, box_h, c_navy());
+    ctxt_l(&layer, &font_b, ML + 4.0, y - box_h + 7.0, "TOTALI",                              10.5, c_white());
+    ctxt_r(&layer, &font_b, CR - 4.0, y - box_h + 6.5, &format!("{} EUR", money(data.total)), 12.5, c_white());
+    y -= box_h + 4.0;
+
+    // Validity note footer
+    if data.valid_until.is_some() {
+        check_y(&doc, &mut page, &mut layer, &mut y, LH + 2.0);
+        y -= LH;
+        ctxt_l(&layer, &font, ML, y,
+            &format!("* Kjo oferte vlen deri me {}", valid_str),
+            8.0, c_gray_text());
+    }
+
+    // ── Footer ─────────────────────────────────────────────────────────────
+    hline(&layer, ML, CR, 17.5, 0.4, c_gray_light());
+    ctxt_c(&layer, &font, ML, CR, 12.0,
+        &format!("Mjeku  |  {}  |  PROGRAMERI MJEKU  www.programeri.net", date_str),
         7.5, c_gray_text());
 
     save_pdf(doc)
@@ -817,6 +1038,7 @@ mod tests {
             client_phone: Some("+383 44 123 456".to_string()),
             client_email: Some("gberisha@email.com".to_string()),
             notes: None,
+            bank_account: Some("NL91 ABNA 0417 1643 00".to_string()),
             lines: vec![
                 InvoiceLine {
                     tooth: Some("11".to_string()),

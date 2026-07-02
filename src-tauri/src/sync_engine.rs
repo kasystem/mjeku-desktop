@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::db::Db;
 use crate::models::{
-    Appointment, CashEntry, Client, Doctor, Payment, Sale, Service, SyncQueueItem, Visit, VisitItem, DoctorAccount,
+    Appointment, CashEntry, Client, Doctor, Offer, OfferItem, Payment, Sale, Service, SyncQueueItem, Visit, VisitItem, DoctorAccount,
 };
 use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 
@@ -148,6 +148,9 @@ impl SyncEngine {
             return Err(e);
         }
 
+        // Sync clinic-level settings (bank account) — non-fatal.
+        let _ = self.sync_clinic_settings(&supabase_url, &api_key, &clinic_id).await;
+
         // Mark successful sync time.
         self.db.set_last_sync_time(&sync_started_at)?;
 
@@ -253,6 +256,22 @@ impl SyncEngine {
             .context("pull cash_ledger")?;
         for c in cash {
             self.apply_remote_row_cash(&c)?;
+        }
+
+        let offers: Vec<Offer> = self
+            .fetch_table(base, api_key, "offers", last_sync_time, clinic_id)
+            .await
+            .context("pull offers")?;
+        for o in offers {
+            self.apply_remote_row_offers(&o)?;
+        }
+
+        let offer_items: Vec<OfferItem> = self
+            .fetch_table(base, api_key, "offer_items", last_sync_time, clinic_id)
+            .await
+            .context("pull offer_items")?;
+        for it in offer_items {
+            self.apply_remote_row_offer_items(&it)?;
         }
 
         Ok(())
@@ -385,6 +404,30 @@ impl SyncEngine {
         self.db
             .sync_queue_drop_pending_for_row("cash_ledger", &remote.id)?;
         self.db.apply_remote_cash_entry(remote)?;
+        Ok(())
+    }
+
+    fn apply_remote_row_offers(&self, remote: &Offer) -> anyhow::Result<()> {
+        let local = self.db.offer_updated_at(&remote.id)?;
+        if let Some(local_ts) = local {
+            if newer_or_equal(&local_ts, &remote.updated_at)? {
+                return Ok(());
+            }
+        }
+        self.db.sync_queue_drop_pending_for_row("offers", &remote.id)?;
+        self.db.apply_remote_offer(remote)?;
+        Ok(())
+    }
+
+    fn apply_remote_row_offer_items(&self, remote: &OfferItem) -> anyhow::Result<()> {
+        let local = self.db.offer_items_updated_at(&remote.id)?;
+        if let Some(local_ts) = local {
+            if newer_or_equal(&local_ts, &remote.updated_at)? {
+                return Ok(());
+            }
+        }
+        self.db.sync_queue_drop_pending_for_row("offer_items", &remote.id)?;
+        self.db.apply_remote_offer_item(remote)?;
         Ok(())
     }
 
@@ -551,6 +594,52 @@ impl SyncEngine {
         }
 
         Ok(())
+    }
+
+    async fn sync_clinic_settings(&self, supabase_url: &str, api_key: &str, clinic_id: &str) {
+        let local_bank = self
+            .db
+            .setting_get("clinic_bank_account")
+            .unwrap_or(None)
+            .unwrap_or_default();
+
+        let base = supabase_url.trim_end_matches('/');
+
+        // Push local value to clinic_registry if set.
+        if !local_bank.trim().is_empty() {
+            let url = format!("{base}/rest/v1/clinic_registry?on_conflict=clinic_id");
+            let body = serde_json::json!([{ "clinic_id": clinic_id, "bank_account": local_bank.trim() }]);
+            let _ = with_supabase_auth(self.client.post(&url), api_key)
+                .header("Prefer", "resolution=merge-duplicates,return=minimal")
+                .header("clinic_id", clinic_id)
+                .json(&body)
+                .send()
+                .await;
+        }
+
+        // Pull remote value; update local if remote differs and local is empty.
+        let url = format!("{base}/rest/v1/clinic_registry?clinic_id=eq.{clinic_id}&select=bank_account");
+        if let Ok(resp) = with_supabase_auth(self.client.get(&url), api_key)
+            .header("clinic_id", clinic_id)
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(rows) = resp.json::<Vec<serde_json::Value>>().await {
+                    if let Some(remote_ba) = rows
+                        .first()
+                        .and_then(|r| r.get("bank_account"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if local_bank.trim().is_empty() {
+                            let _ = self.db.setting_set("clinic_bank_account", remote_ba);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

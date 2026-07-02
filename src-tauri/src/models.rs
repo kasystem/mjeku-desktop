@@ -440,3 +440,132 @@ pub struct DoctorAccount {
     pub updated_at: String,
     pub deleted: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegularInvoice {
+    pub id: String,
+    pub sale_id: String,
+    pub invoice_number: Option<String>,
+    pub client_id: Option<String>,
+    pub client_name: Option<String>,
+    pub date: Option<String>,
+    pub total: f64,
+    pub pdf_filename: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonthlyReportRow {
+    pub month: String,
+    pub total: f64,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StockSupplier {
+    pub id: String,
+    pub name: String,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub address: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StockItem {
+    pub id: String,
+    pub name: String,
+    pub unit: Option<String>,
+    pub category: Option<String>,
+    pub supplier_id: Option<String>,
+    pub min_quantity: f64,
+    #[serde(default)]
+    pub sale_price: f64,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub supplier_name: Option<String>,
+    #[serde(default)]
+    pub current_quantity: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaleItem {
+    pub id: String,
+    pub sale_id: String,
+    pub item_type: String, // "service" | "product"
+    pub ref_id: Option<String>,
+    pub title: String,
+    pub qty: f64,
+    pub unit_price: f64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaleItemInput {
+    pub item_type: String,
+    pub ref_id: Option<String>,
+    pub title: String,
+    pub qty: f64,
+    pub unit_price: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StockMovement {
+    pub id: String,
+    pub item_id: String,
+    pub movement_type: String,
+    pub quantity: f64,
+    pub price_per_unit: Option<f64>,
+    pub notes: Option<String>,
+    pub date: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Offer {
+    pub id: String,
+    pub clinic_id: String,
+    pub client_id: String,
+    pub offer_number: String,
+    pub status: String, // draft|sent|accepted|rejected|invoiced
+    pub valid_until: Option<String>, // YYYY-MM-DD
+    pub notes: Option<String>,
+    pub vat_pct: f64,
+    pub subtotal: f64,
+    pub vat_amount: f64,
+    pub total: f64,
+    pub invoice_id: Option<String>,
+    pub source_offer_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferItem {
+    pub id: String,
+    pub offer_id: String,
+    pub clinic_id: String,
+    pub description: String,
+    pub qty: f64,
+    pub unit_price: f64,
+    pub discount_pct: f64,
+    pub line_total: f64,
+    pub sort_order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferItemInput {
+    pub id: Option<String>,
+    pub description: String,
+    pub qty: f64,
+    pub unit_price: f64,
+    pub discount_pct: f64,
+}

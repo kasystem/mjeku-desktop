@@ -204,6 +204,99 @@ CREATE TABLE IF NOT EXISTS cash_ledger (
   updated_at TEXT,
   deleted INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS regular_invoices (
+  id TEXT PRIMARY KEY,
+  sale_id TEXT NOT NULL,
+  invoice_number TEXT,
+  client_id TEXT,
+  client_name TEXT,
+  date TEXT,
+  total REAL NOT NULL DEFAULT 0,
+  pdf_filename TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stock_suppliers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  phone TEXT,
+  email TEXT,
+  address TEXT,
+  notes TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS stock_items (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  unit TEXT,
+  category TEXT,
+  supplier_id TEXT,
+  min_quantity REAL NOT NULL DEFAULT 0,
+  notes TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS stock_movements (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL,
+  movement_type TEXT NOT NULL,
+  quantity REAL NOT NULL,
+  price_per_unit REAL,
+  notes TEXT,
+  date TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sale_items (
+  id TEXT PRIMARY KEY,
+  sale_id TEXT NOT NULL,
+  item_type TEXT NOT NULL,
+  ref_id TEXT,
+  title TEXT NOT NULL,
+  qty REAL NOT NULL,
+  unit_price REAL NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS offers (
+  id TEXT PRIMARY KEY,
+  clinic_id TEXT NOT NULL DEFAULT '',
+  client_id TEXT NOT NULL DEFAULT '',
+  offer_number TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft',
+  valid_until TEXT,
+  notes TEXT,
+  vat_pct REAL NOT NULL DEFAULT 18,
+  subtotal REAL NOT NULL DEFAULT 0,
+  vat_amount REAL NOT NULL DEFAULT 0,
+  total REAL NOT NULL DEFAULT 0,
+  invoice_id TEXT,
+  source_offer_id TEXT,
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS offer_items (
+  id TEXT PRIMARY KEY,
+  offer_id TEXT NOT NULL DEFAULT '',
+  clinic_id TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  qty REAL NOT NULL DEFAULT 1,
+  unit_price REAL NOT NULL DEFAULT 0,
+  discount_pct REAL NOT NULL DEFAULT 0,
+  line_total REAL NOT NULL DEFAULT 0,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT
+);
 "#;
 
 pub struct Db {
@@ -341,6 +434,9 @@ impl Db {
             Self::add_column_if_missing(conn, "visits", col, ddl)?;
         }
 
+        // stock_items
+        Self::add_column_if_missing(conn, "stock_items", "sale_price", "REAL NOT NULL DEFAULT 0")?;
+
         // visit_items
         Self::add_column_if_missing(conn, "visit_items", "vat_code", "TEXT NOT NULL DEFAULT 'C'")?;
         Self::add_column_if_missing(
@@ -411,6 +507,17 @@ impl Db {
       CREATE INDEX IF NOT EXISTS idx_cash_ledger_type ON cash_ledger(type);
       CREATE INDEX IF NOT EXISTS idx_cash_ledger_date ON cash_ledger(date);
       CREATE INDEX IF NOT EXISTS idx_cash_ledger_updated_at ON cash_ledger(updated_at);
+
+      CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items(sale_id);
+
+      CREATE INDEX IF NOT EXISTS idx_offers_clinic_id ON offers(clinic_id);
+      CREATE INDEX IF NOT EXISTS idx_offers_client_id ON offers(client_id);
+      CREATE INDEX IF NOT EXISTS idx_offers_updated_at ON offers(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_offers_status ON offers(status);
+
+      CREATE INDEX IF NOT EXISTS idx_offer_items_offer_id ON offer_items(offer_id);
+      CREATE INDEX IF NOT EXISTS idx_offer_items_clinic_id ON offer_items(clinic_id);
+      CREATE INDEX IF NOT EXISTS idx_offer_items_updated_at ON offer_items(updated_at);
       "#,
     )?;
 
@@ -4870,6 +4977,441 @@ impl Db {
         row.deleted
       ],
     )?;
+        Ok(())
+    }
+
+    pub fn regular_invoice_insert(
+        &self,
+        id: &str,
+        sale_id: &str,
+        invoice_number: Option<&str>,
+        client_id: Option<&str>,
+        client_name: Option<&str>,
+        date: Option<&str>,
+        total: f64,
+        pdf_filename: Option<&str>,
+        created_at: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO regular_invoices
+             (id, sale_id, invoice_number, client_id, client_name, date, total, pdf_filename, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, sale_id, invoice_number, client_id, client_name, date, total, pdf_filename, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn regular_invoices_list(
+        &self,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::models::RegularInvoice>> {
+        let conn = self.conn()?;
+        let mut sql = String::from(
+            "SELECT id, sale_id, invoice_number, client_id, client_name, date, total, pdf_filename, created_at
+             FROM regular_invoices WHERE 1=1",
+        );
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(d) = date_from.filter(|x| !x.trim().is_empty()) {
+            sql.push_str(&format!(" AND date >= ?{}", args.len() + 1));
+            args.push(d.to_string().into());
+        }
+        if let Some(d) = date_to.filter(|x| !x.trim().is_empty()) {
+            sql.push_str(&format!(" AND date <= ?{}", args.len() + 1));
+            args.push(d.to_string().into());
+        }
+        sql.push_str(" ORDER BY date DESC, created_at DESC");
+        let conn_ref = &conn;
+        let mut stmt = conn_ref.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+            Ok(crate::models::RegularInvoice {
+                id: row.get(0)?,
+                sale_id: row.get(1)?,
+                invoice_number: row.get(2)?,
+                client_id: row.get(3)?,
+                client_name: row.get(4)?,
+                date: row.get(5)?,
+                total: row.get(6)?,
+                pdf_filename: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn sales_monthly_report(&self, year: i32) -> anyhow::Result<Vec<crate::models::MonthlyReportRow>> {
+        let conn = self.conn.lock().unwrap();
+        let year_str = year.to_string();
+        let mut stmt = conn.prepare(
+            "SELECT strftime('%m', date) as month, SUM(total) as total, COUNT(*) as count
+             FROM sales
+             WHERE deleted = 0 AND date IS NOT NULL AND strftime('%Y', date) = ?1
+             GROUP BY strftime('%m', date)
+             ORDER BY month"
+        )?;
+        let rows = stmt.query_map([&year_str], |row| {
+            Ok(crate::models::MonthlyReportRow {
+                month: row.get::<_, String>(0)?,
+                total: row.get::<_, f64>(1)?,
+                count: row.get::<_, i64>(2)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn stock_suppliers_list(&self) -> anyhow::Result<Vec<crate::models::StockSupplier>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, phone, email, address, notes, created_at, updated_at FROM stock_suppliers WHERE deleted = 0 ORDER BY name"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::models::StockSupplier {
+                id: row.get(0)?, name: row.get(1)?, phone: row.get(2)?, email: row.get(3)?,
+                address: row.get(4)?, notes: row.get(5)?, created_at: row.get(6)?, updated_at: row.get(7)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn stock_supplier_upsert(&self, s: &crate::models::StockSupplier) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO stock_suppliers (id, name, phone, email, address, notes, created_at, updated_at, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, phone=excluded.phone, email=excluded.email,
+               address=excluded.address, notes=excluded.notes, updated_at=excluded.updated_at",
+            rusqlite::params![s.id, s.name, s.phone, s.email, s.address, s.notes, s.created_at, s.updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn stock_supplier_delete(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE stock_suppliers SET deleted=1 WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    pub fn stock_items_list(&self) -> anyhow::Result<Vec<crate::models::StockItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT i.id, i.name, i.unit, i.category, i.supplier_id, i.min_quantity, COALESCE(i.sale_price, 0), i.notes, i.created_at, i.updated_at,
+                    s.name as supplier_name,
+                    COALESCE((SELECT SUM(CASE WHEN m.movement_type='in' THEN m.quantity WHEN m.movement_type='out' THEN -m.quantity ELSE m.quantity END)
+                              FROM stock_movements m WHERE m.item_id = i.id), 0) as current_quantity
+             FROM stock_items i
+             LEFT JOIN stock_suppliers s ON s.id = i.supplier_id
+             WHERE i.deleted = 0 ORDER BY i.name"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::models::StockItem {
+                id: row.get(0)?, name: row.get(1)?, unit: row.get(2)?, category: row.get(3)?,
+                supplier_id: row.get(4)?, min_quantity: row.get(5)?, sale_price: row.get(6)?,
+                notes: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
+                supplier_name: row.get(10)?, current_quantity: row.get(11)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn stock_item_upsert(&self, item: &crate::models::StockItem) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO stock_items (id, name, unit, category, supplier_id, min_quantity, sale_price, notes, created_at, updated_at, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, unit=excluded.unit, category=excluded.category,
+               supplier_id=excluded.supplier_id, min_quantity=excluded.min_quantity,
+               sale_price=excluded.sale_price, notes=excluded.notes, updated_at=excluded.updated_at",
+            rusqlite::params![item.id, item.name, item.unit, item.category, item.supplier_id, item.min_quantity, item.sale_price, item.notes, item.created_at, item.updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn stock_item_delete(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE stock_items SET deleted=1 WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    pub fn stock_movements_list(&self, item_id: &str) -> anyhow::Result<Vec<crate::models::StockMovement>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at
+             FROM stock_movements WHERE item_id = ?1 ORDER BY date DESC, created_at DESC LIMIT 200"
+        )?;
+        let rows = stmt.query_map([item_id], |row| {
+            Ok(crate::models::StockMovement {
+                id: row.get(0)?, item_id: row.get(1)?, movement_type: row.get(2)?,
+                quantity: row.get(3)?, price_per_unit: row.get(4)?, notes: row.get(5)?,
+                date: row.get(6)?, created_at: row.get(7)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn stock_movement_add(&self, m: &crate::models::StockMovement) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![m.id, m.item_id, m.movement_type, m.quantity, m.price_per_unit, m.notes, m.date, m.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn sale_items_list(&self, sale_id: &str) -> anyhow::Result<Vec<crate::models::SaleItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, sale_id, item_type, ref_id, title, qty, unit_price, created_at
+             FROM sale_items WHERE sale_id = ?1 ORDER BY created_at"
+        )?;
+        let rows = stmt.query_map([sale_id], |row| {
+            Ok(crate::models::SaleItem {
+                id: row.get(0)?, sale_id: row.get(1)?, item_type: row.get(2)?, ref_id: row.get(3)?,
+                title: row.get(4)?, qty: row.get(5)?, unit_price: row.get(6)?, created_at: row.get(7)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn sale_items_replace(&self, sale_id: &str, items: &[crate::models::SaleItemInput]) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Return stock for old product line-items being replaced.
+        {
+            let mut stmt = tx.prepare(
+                "SELECT ref_id, qty FROM sale_items WHERE sale_id = ?1 AND item_type = 'product' AND ref_id IS NOT NULL"
+            )?;
+            let old_products: Vec<(String, f64)> = stmt
+                .query_map([sale_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (ref_id, qty) in old_products {
+                let now = chrono::Utc::now().to_rfc3339();
+                let date = now.split('T').next().unwrap_or(&now).to_string();
+                tx.execute(
+                    "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
+                     VALUES (?1,?2,'in',?3,NULL,?4,?5,?6)",
+                    rusqlite::params![Uuid::new_v4().to_string(), ref_id, qty, "Rikthim - ndryshim shitje", date, now],
+                )?;
+            }
+        }
+        tx.execute("DELETE FROM sale_items WHERE sale_id = ?1", [sale_id])?;
+        for item in items {
+            let now = chrono::Utc::now().to_rfc3339();
+            let date = now.split('T').next().unwrap_or(&now).to_string();
+            let id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO sale_items (id, sale_id, item_type, ref_id, title, qty, unit_price, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![id, sale_id, item.item_type, item.ref_id, item.title, item.qty, item.unit_price, now],
+            )?;
+            if item.item_type == "product" {
+                if let Some(ref_id) = &item.ref_id {
+                    tx.execute(
+                        "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
+                         VALUES (?1,?2,'out',?3,?4,?5,?6,?7)",
+                        rusqlite::params![Uuid::new_v4().to_string(), ref_id, item.qty, item.unit_price, "Shitje", date, now],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ─── Offers ───────────────────────────────────────────────────────────────
+
+    pub fn next_offer_number(&self, month: u32, year: i32) -> anyhow::Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%/{:02}/{}", month, year);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM offers WHERE offer_number LIKE ?1 AND deleted_at IS NULL",
+            rusqlite::params![pattern],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        Ok(format!("{:03}/{:02}/{}", count + 1, month, year))
+    }
+
+    pub fn offers_list(&self, clinic_id: &str) -> anyhow::Result<Vec<crate::models::Offer>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, clinic_id, client_id, offer_number, status, valid_until, notes,
+                    vat_pct, subtotal, vat_amount, total, invoice_id, source_offer_id,
+                    created_at, updated_at, deleted_at
+             FROM offers WHERE clinic_id = ?1 AND deleted_at IS NULL
+             ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![clinic_id], |r| {
+            Ok(crate::models::Offer {
+                id: r.get(0)?, clinic_id: r.get(1)?, client_id: r.get(2)?,
+                offer_number: r.get(3)?, status: r.get(4)?, valid_until: r.get(5)?,
+                notes: r.get(6)?, vat_pct: r.get(7)?, subtotal: r.get(8)?,
+                vat_amount: r.get(9)?, total: r.get(10)?, invoice_id: r.get(11)?,
+                source_offer_id: r.get(12)?, created_at: r.get(13)?,
+                updated_at: r.get(14)?, deleted_at: r.get(15)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn offer_get(&self, id: &str) -> anyhow::Result<Option<crate::models::Offer>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, clinic_id, client_id, offer_number, status, valid_until, notes,
+                    vat_pct, subtotal, vat_amount, total, invoice_id, source_offer_id,
+                    created_at, updated_at, deleted_at
+             FROM offers WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok(crate::models::Offer {
+                id: r.get(0)?, clinic_id: r.get(1)?, client_id: r.get(2)?,
+                offer_number: r.get(3)?, status: r.get(4)?, valid_until: r.get(5)?,
+                notes: r.get(6)?, vat_pct: r.get(7)?, subtotal: r.get(8)?,
+                vat_amount: r.get(9)?, total: r.get(10)?, invoice_id: r.get(11)?,
+                source_offer_id: r.get(12)?, created_at: r.get(13)?,
+                updated_at: r.get(14)?, deleted_at: r.get(15)?,
+            }),
+        ).optional().map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub fn offer_upsert(&self, o: &crate::models::Offer) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO offers (id, clinic_id, client_id, offer_number, status, valid_until, notes,
+                                 vat_pct, subtotal, vat_amount, total, invoice_id, source_offer_id,
+                                 created_at, updated_at, deleted_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(id) DO UPDATE SET
+               client_id=excluded.client_id, status=excluded.status,
+               valid_until=excluded.valid_until, notes=excluded.notes,
+               vat_pct=excluded.vat_pct, subtotal=excluded.subtotal,
+               vat_amount=excluded.vat_amount, total=excluded.total,
+               invoice_id=excluded.invoice_id, source_offer_id=excluded.source_offer_id,
+               updated_at=excluded.updated_at, deleted_at=excluded.deleted_at",
+            rusqlite::params![
+                o.id, o.clinic_id, o.client_id, o.offer_number, o.status,
+                o.valid_until, o.notes, o.vat_pct, o.subtotal, o.vat_amount,
+                o.total, o.invoice_id, o.source_offer_id, o.created_at, o.updated_at, o.deleted_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn offer_soft_delete(&self, id: &str, now: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE offers SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn offer_items_list(&self, offer_id: &str) -> anyhow::Result<Vec<crate::models::OfferItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, offer_id, clinic_id, description, qty, unit_price, discount_pct,
+                    line_total, sort_order, created_at, updated_at, deleted_at
+             FROM offer_items WHERE offer_id = ?1 AND deleted_at IS NULL
+             ORDER BY sort_order ASC, created_at ASC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![offer_id], |r| {
+            Ok(crate::models::OfferItem {
+                id: r.get(0)?, offer_id: r.get(1)?, clinic_id: r.get(2)?,
+                description: r.get(3)?, qty: r.get(4)?, unit_price: r.get(5)?,
+                discount_pct: r.get(6)?, line_total: r.get(7)?, sort_order: r.get(8)?,
+                created_at: r.get(9)?, updated_at: r.get(10)?, deleted_at: r.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn offer_items_replace(
+        &self,
+        offer_id: &str,
+        clinic_id: &str,
+        items: &[crate::models::OfferItemInput],
+        now: &str,
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE offer_items SET deleted_at = ?1, updated_at = ?1 WHERE offer_id = ?2 AND deleted_at IS NULL",
+            rusqlite::params![now, offer_id],
+        )?;
+        for (i, item) in items.iter().enumerate() {
+            let id = item.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let line_total = item.qty * item.unit_price * (1.0 - item.discount_pct / 100.0);
+            tx.execute(
+                "INSERT INTO offer_items (id, offer_id, clinic_id, description, qty, unit_price, discount_pct, line_total, sort_order, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)
+                 ON CONFLICT(id) DO UPDATE SET description=excluded.description, qty=excluded.qty, unit_price=excluded.unit_price, discount_pct=excluded.discount_pct, line_total=excluded.line_total, sort_order=excluded.sort_order, updated_at=excluded.updated_at, deleted_at=NULL",
+                rusqlite::params![id, offer_id, clinic_id, item.description, item.qty, item.unit_price, item.discount_pct, line_total, i as i64, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn offer_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT updated_at FROM offers WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        ).optional().map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub fn offer_items_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT updated_at FROM offer_items WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        ).optional().map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub fn apply_remote_offer(&self, o: &crate::models::Offer) -> anyhow::Result<()> {
+        self.offer_upsert(o)
+    }
+
+    pub fn apply_remote_offer_item(&self, item: &crate::models::OfferItem) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO offer_items (id, offer_id, clinic_id, description, qty, unit_price, discount_pct, line_total, sort_order, created_at, updated_at, deleted_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             ON CONFLICT(id) DO UPDATE SET offer_id=excluded.offer_id, description=excluded.description, qty=excluded.qty, unit_price=excluded.unit_price, discount_pct=excluded.discount_pct, line_total=excluded.line_total, sort_order=excluded.sort_order, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at",
+            rusqlite::params![item.id, item.offer_id, item.clinic_id, item.description, item.qty, item.unit_price, item.discount_pct, item.line_total, item.sort_order, item.created_at, item.updated_at, item.deleted_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn offer_set_status(&self, id: &str, status: &str, invoice_id: Option<&str>, now: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE offers SET status=?1, invoice_id=COALESCE(?2, invoice_id), updated_at=?3 WHERE id=?4",
+            rusqlite::params![status, invoice_id, now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn offer_queue_upsert(&self, o: &crate::models::Offer) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(o).map_err(|e| anyhow::anyhow!(e))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        Self::queue_replace_pending_tx(&tx, "offers", &o.id, "upsert", &payload, &o.updated_at)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn offer_item_queue_upsert(&self, item: &crate::models::OfferItem) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(item).map_err(|e| anyhow::anyhow!(e))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        Self::queue_replace_pending_tx(&tx, "offer_items", &item.id, "upsert", &payload, &item.updated_at)?;
+        tx.commit()?;
         Ok(())
     }
 }

@@ -24,7 +24,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::bail;
 use chrono::Utc;
 use chrono::Duration as ChronoDuration;
-use tauri::Manager;
+use chrono::Datelike;
+use tauri::{Emitter, Manager};
+use tauri_plugin_updater::UpdaterExt;
 
 use crate::auth::{AuthState, AuthStateInfo, SessionKind};
 use crate::db::Db;
@@ -42,6 +44,7 @@ use crate::updates::UpdatesEngine;
 const LOGS_ADMIN_USER: &str = "fatlindadmin";
 const LOGS_ADMIN_PASS: &str = "Fatlind0)";
 const FISCAL_PRINTER_PROVIDER_KEY: &str = "fiscal_printer_provider";
+const SEF_PRINTER_NAME_KEY: &str = "sef_printer_name";
 const KEY_SUPABASE_URL: &str = "supabase_url";
 const KEY_SUPABASE_API_KEY: &str = "supabase_api_key";
 const KEY_SUPABASE_ANON_KEY: &str = "supabase_anon_key";
@@ -311,6 +314,7 @@ fn normalize_fiscal_printer_provider(v: &str) -> Option<String> {
     match s.as_str() {
         "enternet" => Some("enternet".to_string()),
         "global_eu" | "globaleu" | "global" => Some("global_eu".to_string()),
+        "sef" => Some("sef".to_string()),
         _ => None,
     }
 }
@@ -337,7 +341,149 @@ fn require_enternet_for_fiscal(provider: &str) -> Result<(), String> {
     if provider == "global_eu" {
         return Err("Printeri fiskal i zgjedhur është Global EU. Ky model do të implementohet më vonë; zgjidh ENTERNET te Cilësimet për printim .inp.".to_string());
     }
-    Err("Printeri fiskal nuk është i konfiguruar saktë. Te Cilësimet zgjidh ENTERNET ose Global EU.".to_string())
+    Err("Printeri fiskal nuk është i konfiguruar saktë. Te Cilësimet zgjidh ENTERNET, Global EU ose SEF.".to_string())
+}
+
+fn build_invoice_pdf_bytes_inner(
+    db: &Db,
+    data_dir: &std::path::Path,
+    sale_id: &str,
+    fiscal_only: bool,
+) -> Result<Vec<u8>, String> {
+    let clinic_name = db
+        .setting_get("clinic_name")
+        .map_err(err_string)?
+        .unwrap_or_else(|| "Klinika".to_string());
+    let header_png: Option<Vec<u8>> = db
+        .setting_get("pdf_header_path")
+        .ok()
+        .flatten()
+        .and_then(|rel| {
+            let rel = rel.trim().to_string();
+            if rel.is_empty() { return None; }
+            std::fs::read(data_dir.join(rel)).ok()
+        });
+    let sale = db
+        .sales_get(sale_id)
+        .map_err(err_string)?
+        .ok_or_else(|| "fatura nuk u gjet".to_string())?;
+    let invoice_no = db
+        .sales_invoice_number(&sale.id)
+        .unwrap_or_else(|_| sale.id.clone());
+    let client = db
+        .clients_get(&sale.client_id)
+        .map_err(err_string)?
+        .ok_or_else(|| "pacienti nuk u gjet".to_string())?;
+    let logo_png: Option<Vec<u8>> = db
+        .setting_get("clinic_logo_path")
+        .ok()
+        .flatten()
+        .and_then(|rel| {
+            let rel = rel.trim().to_string();
+            if rel.is_empty() { return None; }
+            std::fs::read(data_dir.join(rel)).ok()
+        });
+    let vis_items = db
+        .visit_items_list(Some(crate::models::VisitItemsListFilters {
+            visit_id: Some(sale_id.to_string()),
+            client_id: None,
+            include_deleted: Some(false),
+        }))
+        .map_err(err_string)?;
+    let mut lines: Vec<crate::invoice::InvoiceLine> = vis_items
+        .into_iter()
+        .filter(|x| x.deleted == 0)
+        .map(|it| crate::invoice::InvoiceLine {
+            tooth: it.tooth,
+            title: it.title,
+            qty: it.qty,
+            unit_price: it.unit_price,
+            fiscal: it.fiscal == 1,
+            vat_code: it.vat_code,
+        })
+        .collect();
+    if fiscal_only && !lines.is_empty() {
+        let before = lines.len();
+        lines.retain(|ln| ln.fiscal);
+        if before > 0 && lines.is_empty() {
+            return Err("kjo fature nuk ka pjese fiskale".to_string());
+        }
+    }
+    let mut total = sale.total;
+    let mut fiscal_total = sale.total;
+    let mut non_fiscal_total = 0.0_f64;
+    if !lines.is_empty() {
+        total = 0.0;
+        fiscal_total = 0.0;
+        non_fiscal_total = 0.0;
+        for ln in &lines {
+            let sub = ln.qty * ln.unit_price;
+            total += sub;
+            if ln.fiscal { fiscal_total += sub; } else { non_fiscal_total += sub; }
+        }
+    }
+    let bank_account = db
+        .setting_get("clinic_bank_account")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty());
+    let data = crate::invoice::InvoicePdfData {
+        clinic_name,
+        header_png,
+        logo_png,
+        invoice_id: invoice_no,
+        date: sale.date.clone(),
+        client_name: client.name,
+        client_code: client.patient_code,
+        client_dob: client.dob,
+        client_address: client.address,
+        client_city: client.city,
+        client_phone: client.phone,
+        client_email: client.email,
+        notes: sale.notes.clone(),
+        bank_account,
+        lines,
+        total,
+        fiscal_total,
+        non_fiscal_total,
+    };
+    crate::invoice::render_invoice_pdf(&data).map_err(err_string)
+}
+
+fn print_pdf_to_windows_printer(pdf_bytes: &[u8], printer_name: &str) -> anyhow::Result<()> {
+    let file_name = format!("mjeku-print-{}.pdf", uuid::Uuid::new_v4());
+    let pdf_path = std::env::temp_dir().join(&file_name);
+    std::fs::write(&pdf_path, pdf_bytes)?;
+
+    let pdf_str = pdf_path.to_string_lossy().replace('\'', "''");
+    let pr_str = printer_name.trim().replace('\'', "''");
+
+    let script = format!(
+        "$file='{pdf}'; $pr='{pr}'; \
+         $sh=New-Object -ComObject Shell.Application; \
+         $d=[IO.Path]::GetDirectoryName($file); \
+         $n=[IO.Path]::GetFileName($file); \
+         $item=$sh.NameSpace($d).ParseName($n); \
+         if ($item) {{ $item.InvokeVerbEx('printto',$pr) }} \
+         else {{ Start-Process -FilePath $file -Verb PrintTo -ArgumentList $pr }}; \
+         Start-Sleep 6",
+        pdf = pdf_str,
+        pr = pr_str
+    );
+
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .status()?;
+
+    let _ = std::fs::remove_file(&pdf_path);
+
+    if !status.success() {
+        anyhow::bail!(
+            "Printimi dështoi (kod {:?}). Kontrolloni emrin e printerit te Cilësimet.",
+            status.code()
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1111,7 +1257,7 @@ async fn settings_set(
 
     if k == FISCAL_PRINTER_PROVIDER_KEY {
         v = normalize_fiscal_printer_provider(&v).ok_or_else(|| {
-            "vlera e printerit fiskal duhet të jetë ENTERNET ose Global EU".to_string()
+            "vlera e printerit fiskal duhet të jetë ENTERNET, Global EU ose SEF".to_string()
         })?;
     }
 
@@ -1894,13 +2040,42 @@ async fn reload_ui(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn invoice_export_fiscal_inp(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     sale_id: String,
     allow_any_if_no_fiscal: Option<bool>,
 ) -> Result<String, String> {
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
+
+    if provider == "sef" {
+        let sale_id = sale_id.trim().to_string();
+        if sale_id.is_empty() {
+            return Err("sale_id eshte i detyrueshem".to_string());
+        }
+        let db = state.db.clone();
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| anyhow::anyhow!(e))
+            .map_err(err_string)?;
+        return tokio::task::spawn_blocking(move || {
+            let printer_name = db
+                .setting_get(SEF_PRINTER_NAME_KEY)
+                .map_err(err_string)?
+                .unwrap_or_default();
+            let printer_name = printer_name.trim().to_string();
+            if printer_name.is_empty() {
+                return Err("Emri i printerit SEF nuk është konfiguruar. Shko te Cilësimet > Printer SEF dhe vendos emrin.".to_string());
+            }
+            let pdf_bytes = build_invoice_pdf_bytes_inner(&db, &data_dir, &sale_id, false)?;
+            print_pdf_to_windows_printer(&pdf_bytes, &printer_name).map_err(err_string)?;
+            Ok("Fatura u dërgua në printer.".to_string())
+        })
+        .await
+        .map_err(err_string)?;
+    }
+
     require_enternet_for_fiscal(&provider)?;
     let sale_id = sale_id.trim().to_string();
     let allow_any_items_if_no_fiscal = allow_any_if_no_fiscal.unwrap_or(false);
@@ -2107,118 +2282,11 @@ async fn invoice_export_pdf(
     tokio::task::spawn_blocking(move || {
         use base64::{engine::general_purpose, Engine as _};
 
-        let clinic_name = db
-            .setting_get("clinic_name")
-            .map_err(err_string)?
-            .unwrap_or_else(|| "Klinika".to_string());
+        let pdf_bytes = build_invoice_pdf_bytes_inner(&db, &data_dir, &sale_id, fiscal_only)?;
 
-        let header_png: Option<Vec<u8>> = db
-            .setting_get("pdf_header_path")
-            .ok()
-            .flatten()
-            .and_then(|rel| {
-                let rel = rel.trim().to_string();
-                if rel.is_empty() {
-                    return None;
-                }
-                std::fs::read(data_dir.join(rel)).ok()
-            });
-
-        let sale = db
-            .sales_get(&sale_id)
-            .map_err(err_string)?
-            .ok_or_else(|| "fatura nuk u gjet".to_string())?;
-        let invoice_no = db
-            .sales_invoice_number(&sale.id)
-            .unwrap_or_else(|_| sale.id.clone());
-        let client = db
-            .clients_get(&sale.client_id)
-            .map_err(err_string)?
-            .ok_or_else(|| "pacienti nuk u gjet".to_string())?;
-        let logo_png: Option<Vec<u8>> =
-            db.setting_get("clinic_logo_path")
-                .ok()
-                .flatten()
-                .and_then(|rel| {
-                    let rel = rel.trim().to_string();
-                    if rel.is_empty() {
-                        return None;
-                    }
-                    std::fs::read(data_dir.join(rel)).ok()
-                });
-
-        let vis_items = db
-            .visit_items_list(Some(crate::models::VisitItemsListFilters {
-                visit_id: Some(sale_id.clone()),
-                client_id: None,
-                include_deleted: Some(false),
-            }))
-            .map_err(err_string)?;
-        let mut lines: Vec<crate::invoice::InvoiceLine> = vis_items
-            .into_iter()
-            .filter(|x| x.deleted == 0)
-            .map(|it| crate::invoice::InvoiceLine {
-                tooth: it.tooth,
-                title: it.title,
-                qty: it.qty,
-                unit_price: it.unit_price,
-                fiscal: it.fiscal == 1,
-                vat_code: it.vat_code,
-            })
-            .collect();
-
-        if fiscal_only && !lines.is_empty() {
-            let before = lines.len();
-            lines.retain(|ln| ln.fiscal);
-            if before > 0 && lines.is_empty() {
-                return Err("kjo fature nuk ka pjese fiskale".to_string());
-            }
-        }
-
-        let mut total = sale.total;
-        let mut fiscal_total = sale.total;
-        let mut non_fiscal_total = 0.0_f64;
-        if !lines.is_empty() {
-            total = 0.0;
-            fiscal_total = 0.0;
-            non_fiscal_total = 0.0;
-            for ln in &lines {
-                let sub = ln.qty * ln.unit_price;
-                total += sub;
-                if ln.fiscal {
-                    fiscal_total += sub;
-                } else {
-                    non_fiscal_total += sub;
-                }
-            }
-        }
-
-        let data = crate::invoice::InvoicePdfData {
-            clinic_name,
-            header_png,
-            logo_png,
-            invoice_id: invoice_no,
-            date: sale.date.clone(),
-            client_name: client.name,
-            client_code: client.patient_code,
-            client_dob: client.dob,
-            client_address: client.address,
-            client_city: client.city,
-            client_phone: client.phone,
-            client_email: client.email,
-            notes: sale.notes.clone(),
-            lines,
-            total,
-            fiscal_total,
-            non_fiscal_total,
-        };
-
-        let pdf_bytes = crate::invoice::render_invoice_pdf(&data).map_err(err_string)?;
-
-        // Also persist a physical PDF copy on Desktop for user convenience.
         let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
         std::fs::create_dir_all(&out_dir).map_err(err_string)?;
-        let out_path = out_dir.join(format!("Fature-{}.pdf", sale.id));
+        let out_path = out_dir.join(format!("Fature-{}.pdf", sale_id));
         std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
 
         Ok(general_purpose::STANDARD.encode(pdf_bytes))
@@ -2421,8 +2489,517 @@ async fn error_logs_clear(state: tauri::State<'_, AppState>) -> Result<(), Strin
         .map_err(err_string)
 }
 
+#[tauri::command]
+async fn regular_invoice_create(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    sale_id: String,
+) -> Result<crate::models::RegularInvoice, String> {
+    require_finance(&state).await?;
+    let sale_id = sale_id.trim().to_string();
+    if sale_id.is_empty() {
+        return Err("sale_id eshte i detyrueshem".to_string());
+    }
+    let db = state.db.clone();
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!(e))
+        .map_err(err_string)?;
+    let desktop_dir = app.path().desktop_dir().ok();
+
+    tokio::task::spawn_blocking(move || {
+        use base64::{engine::general_purpose, Engine as _};
+
+        let clinic_name = db
+            .setting_get("clinic_name")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "Klinika".to_string());
+        let bank_account = db.setting_get("clinic_bank_account").ok().flatten()
+            .filter(|s| !s.trim().is_empty());
+        let header_png: Option<Vec<u8>> = db
+            .setting_get("pdf_header_path")
+            .ok()
+            .flatten()
+            .and_then(|rel| {
+                let rel = rel.trim().to_string();
+                if rel.is_empty() { return None; }
+                std::fs::read(data_dir.join(rel)).ok()
+            });
+        let logo_png: Option<Vec<u8>> = db
+            .setting_get("clinic_logo_path")
+            .ok()
+            .flatten()
+            .and_then(|rel| {
+                let rel = rel.trim().to_string();
+                if rel.is_empty() { return None; }
+                std::fs::read(data_dir.join(rel)).ok()
+            });
+
+        let sale = db.sales_get(&sale_id).map_err(err_string)?
+            .ok_or_else(|| "fatura nuk u gjet".to_string())?;
+        let invoice_no = db.sales_invoice_number(&sale.id).unwrap_or_else(|_| sale.id.clone());
+        let client = db.clients_get(&sale.client_id).map_err(err_string)?
+            .ok_or_else(|| "pacienti nuk u gjet".to_string())?;
+
+        let vis_items = db.visit_items_list(Some(crate::models::VisitItemsListFilters {
+            visit_id: Some(sale_id.clone()),
+            client_id: None,
+            include_deleted: Some(false),
+        })).map_err(err_string)?;
+        let lines: Vec<crate::invoice::InvoiceLine> = vis_items
+            .into_iter()
+            .filter(|x| x.deleted == 0)
+            .map(|it| crate::invoice::InvoiceLine {
+                tooth: it.tooth,
+                title: it.title,
+                qty: it.qty,
+                unit_price: it.unit_price,
+                fiscal: it.fiscal == 1,
+                vat_code: it.vat_code,
+            })
+            .collect();
+
+        let (total, fiscal_total, non_fiscal_total) = if lines.is_empty() {
+            (sale.total, sale.total, 0.0)
+        } else {
+            let mut t = 0.0_f64; let mut ft = 0.0_f64; let mut nft = 0.0_f64;
+            for ln in &lines {
+                let sub = ln.qty * ln.unit_price;
+                t += sub;
+                if ln.fiscal { ft += sub; } else { nft += sub; }
+            }
+            (t, ft, nft)
+        };
+
+        let data = crate::invoice::InvoicePdfData {
+            clinic_name,
+            header_png,
+            logo_png,
+            invoice_id: invoice_no.clone(),
+            date: sale.date.clone(),
+            client_name: client.name.clone(),
+            client_code: client.patient_code.clone(),
+            client_dob: client.dob.clone(),
+            client_address: client.address.clone(),
+            client_city: client.city.clone(),
+            client_phone: client.phone.clone(),
+            client_email: client.email.clone(),
+            notes: sale.notes.clone(),
+            bank_account,
+            lines,
+            total,
+            fiscal_total,
+            non_fiscal_total,
+        };
+
+        let pdf_bytes = crate::invoice::render_invoice_pdf(&data).map_err(err_string)?;
+
+        // Save to Desktop/Faturat_Rregullta/
+        let out_dir = desktop_dir
+            .map(|d| d.join("Faturat_Rregullta"))
+            .unwrap_or_else(|| data_dir.join("Faturat_Rregullta"));
+        std::fs::create_dir_all(&out_dir).map_err(err_string)?;
+        let filename = format!("Fature-Rregullt-{}.pdf", sale.id);
+        let out_path = out_dir.join(&filename);
+        std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
+
+        // Record in DB.
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = crate::util::now_iso();
+        db.regular_invoice_insert(
+            &id,
+            &sale_id,
+            Some(&invoice_no),
+            Some(&sale.client_id),
+            Some(&client.name),
+            sale.date.as_deref(),
+            total,
+            Some(&filename),
+            &now,
+        ).map_err(err_string)?;
+
+        // Also return base64 for optional download in UI.
+        let _b64 = general_purpose::STANDARD.encode(&pdf_bytes);
+
+        Ok(crate::models::RegularInvoice {
+            id,
+            sale_id,
+            invoice_number: Some(invoice_no),
+            client_id: Some(sale.client_id),
+            client_name: Some(client.name),
+            date: sale.date,
+            total,
+            pdf_filename: Some(filename),
+            created_at: now,
+        })
+    })
+    .await
+    .map_err(err_string)?
+}
+
+#[tauri::command]
+async fn regular_invoices_list(
+    state: tauri::State<'_, AppState>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+) -> Result<Vec<crate::models::RegularInvoice>, String> {
+    require_finance(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.regular_invoices_list(
+            date_from.as_deref(),
+            date_to.as_deref(),
+        ).map_err(err_string)
+    })
+    .await
+    .map_err(err_string)?
+}
+
+#[tauri::command]
+fn app_restart(app: tauri::AppHandle) {
+    app.restart();
+}
+
+#[tauri::command]
+async fn sales_monthly_report(state: tauri::State<'_, AppState>, year: i32) -> Result<Vec<crate::models::MonthlyReportRow>, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.sales_monthly_report(year))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn stock_suppliers_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate::models::StockSupplier>, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.stock_suppliers_list())
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn stock_supplier_upsert(state: tauri::State<'_, AppState>, supplier: crate::models::StockSupplier) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.stock_supplier_upsert(&supplier))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn stock_supplier_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.stock_supplier_delete(&id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn stock_items_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate::models::StockItem>, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.stock_items_list())
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn stock_item_upsert(state: tauri::State<'_, AppState>, item: crate::models::StockItem) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.stock_item_upsert(&item))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn stock_item_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.stock_item_delete(&id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn stock_movements_list(state: tauri::State<'_, AppState>, item_id: String) -> Result<Vec<crate::models::StockMovement>, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.stock_movements_list(&item_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn stock_movement_add(state: tauri::State<'_, AppState>, movement: crate::models::StockMovement) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.stock_movement_add(&movement))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn sale_items_list(state: tauri::State<'_, AppState>, sale_id: String) -> Result<Vec<crate::models::SaleItem>, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.sale_items_list(&sale_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn sale_items_replace(state: tauri::State<'_, AppState>, sale_id: String, items: Vec<crate::models::SaleItemInput>) -> Result<(), String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.sale_items_replace(&sale_id, &items))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+// ─── Offer commands ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn offers_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate::models::Offer>, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    let clinic_id = tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || db.setting_get("clinic_id")
+    }).await.map_err(err_string)?.map_err(err_string)?.unwrap_or_default();
+    tokio::task::spawn_blocking(move || db.offers_list(&clinic_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn offer_items_list(state: tauri::State<'_, AppState>, offer_id: String) -> Result<Vec<crate::models::OfferItem>, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.offer_items_list(&offer_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn offer_upsert(
+    state: tauri::State<'_, AppState>,
+    client_id: String,
+    status: String,
+    valid_until: Option<String>,
+    notes: Option<String>,
+    vat_pct: f64,
+    items: Vec<crate::models::OfferItemInput>,
+    id: Option<String>,
+    source_offer_id: Option<String>,
+) -> Result<crate::models::Offer, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    let now = crate::util::now_iso();
+
+    let clinic_id = tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || db.setting_get("clinic_id")
+    }).await.map_err(err_string)?.map_err(err_string)?.unwrap_or_default();
+
+    // Compute totals
+    let subtotal_raw: f64 = items.iter().map(|it| it.qty * it.unit_price * (1.0 - it.discount_pct / 100.0)).sum();
+    let subtotal = (subtotal_raw * 100.0).round() / 100.0;
+    let vat_amount = (subtotal * vat_pct / 100.0 * 100.0).round() / 100.0;
+    let total = (subtotal + vat_amount) * 100.0 / 100.0;
+    let total = (total * 100.0).round() / 100.0;
+
+    let offer_id = id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let is_new = id.is_none();
+
+    // Get offer_number
+    let offer_number = if is_new {
+        let db2 = db.clone();
+        let now_dt = chrono::Utc::now();
+        let month = now_dt.month();
+        let year = now_dt.year();
+        tokio::task::spawn_blocking(move || db2.next_offer_number(month, year))
+            .await.map_err(err_string)?.map_err(err_string)?
+    } else {
+        let db2 = db.clone();
+        let oid = offer_id.clone();
+        tokio::task::spawn_blocking(move || db2.offer_get(&oid))
+            .await.map_err(err_string)?.map_err(err_string)?
+            .map(|o| o.offer_number)
+            .unwrap_or_else(|| "000/00/0000".to_string())
+    };
+
+    let created_at = if is_new {
+        now.clone()
+    } else {
+        let db2 = db.clone();
+        let oid = offer_id.clone();
+        tokio::task::spawn_blocking(move || db2.offer_get(&oid))
+            .await.map_err(err_string)?.map_err(err_string)?
+            .map(|o| o.created_at)
+            .unwrap_or_else(|| now.clone())
+    };
+
+    let offer = crate::models::Offer {
+        id: offer_id.clone(),
+        clinic_id: clinic_id.clone(),
+        client_id,
+        offer_number,
+        status,
+        valid_until,
+        notes,
+        vat_pct,
+        subtotal,
+        vat_amount,
+        total,
+        invoice_id: None,
+        source_offer_id,
+        created_at,
+        updated_at: now.clone(),
+        deleted_at: None,
+    };
+
+    let db2 = db.clone();
+    let offer2 = offer.clone();
+    tokio::task::spawn_blocking(move || db2.offer_upsert(&offer2))
+        .await.map_err(err_string)?.map_err(err_string)?;
+
+    let db3 = db.clone();
+    let now2 = crate::util::now_iso();
+    let oid = offer_id.clone();
+    let cid = clinic_id.clone();
+    tokio::task::spawn_blocking(move || db3.offer_items_replace(&oid, &cid, &items, &now2))
+        .await.map_err(err_string)?.map_err(err_string)?;
+
+    // Queue sync for offer
+    let db4 = db.clone();
+    let offer3 = offer.clone();
+    tokio::task::spawn_blocking(move || db4.offer_queue_upsert(&offer3))
+        .await.map_err(err_string)?.map_err(err_string)?;
+
+    // Queue sync for items
+    let db5 = db.clone();
+    let oid2 = offer_id.clone();
+    let updated_items = tokio::task::spawn_blocking(move || db5.offer_items_list(&oid2))
+        .await.map_err(err_string)?.map_err(err_string)?;
+    let db6 = db.clone();
+    tokio::task::spawn_blocking(move || {
+        for item in &updated_items {
+            db6.offer_item_queue_upsert(item)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }).await.map_err(err_string)?.map_err(err_string)?;
+
+    Ok(offer)
+}
+
+#[tauri::command]
+async fn offer_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    let now = crate::util::now_iso();
+    let id2 = id.clone();
+    let now2 = now.clone();
+    tokio::task::spawn_blocking(move || db.offer_soft_delete(&id2, &now2))
+        .await.map_err(err_string)?.map_err(err_string)?;
+    // Queue a soft-delete by re-fetching the row and queuing it
+    let db2 = state.db.clone();
+    let deleted_offer = tokio::task::spawn_blocking(move || db2.offer_get(&id))
+        .await.map_err(err_string)?.map_err(err_string)?;
+    if let Some(offer) = deleted_offer {
+        let db3 = state.db.clone();
+        tokio::task::spawn_blocking(move || db3.offer_queue_upsert(&offer))
+            .await.map_err(err_string)?.map_err(err_string)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn offer_set_status(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    status: String,
+    invoice_id: Option<String>,
+) -> Result<(), String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    let now = crate::util::now_iso();
+    let id2 = id.clone();
+    let status2 = status.clone();
+    let invoice_id2 = invoice_id.clone();
+    let now2 = now.clone();
+    tokio::task::spawn_blocking(move || db.offer_set_status(&id2, &status2, invoice_id2.as_deref(), &now2))
+        .await.map_err(err_string)?.map_err(err_string)?;
+    // Queue sync
+    let db2 = state.db.clone();
+    let updated_offer = tokio::task::spawn_blocking(move || db2.offer_get(&id))
+        .await.map_err(err_string)?.map_err(err_string)?;
+    if let Some(offer) = updated_offer {
+        let db3 = state.db.clone();
+        tokio::task::spawn_blocking(move || db3.offer_queue_upsert(&offer))
+            .await.map_err(err_string)?.map_err(err_string)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn offer_pdf(state: tauri::State<'_, AppState>, offer_id: String) -> Result<String, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    let oid = offer_id.clone();
+    let offer = tokio::task::spawn_blocking(move || db.offer_get(&oid))
+        .await.map_err(err_string)?.map_err(err_string)?
+        .ok_or_else(|| "Oferta nuk u gjet".to_string())?;
+
+    let db2 = state.db.clone();
+    let oid2 = offer_id.clone();
+    let items = tokio::task::spawn_blocking(move || db2.offer_items_list(&oid2))
+        .await.map_err(err_string)?.map_err(err_string)?;
+
+    let db3 = state.db.clone();
+    let client_id = offer.client_id.clone();
+    let (clinic_name, clinic_address, clinic_phone, header_png, logo_png, client_name, client_phone, client_email) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let clinic_name = db3.setting_get("clinic_name")?.unwrap_or_default();
+            let clinic_address = db3.setting_get("clinic_address")?;
+            let clinic_phone = db3.setting_get("clinic_phone")?;
+            let decode = |key: &str| -> Option<Vec<u8>> {
+                db3.setting_get(key).ok().flatten()
+                    .and_then(|s| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim()).ok())
+            };
+            let header_png = decode("header_image_b64");
+            let logo_png = decode("logo_image_b64");
+            let client = db3.clients_get(&client_id)?;
+            let client_name = client.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+            let client_phone = client.as_ref().and_then(|c| c.phone.clone());
+            let client_email = client.as_ref().and_then(|c| c.email.clone());
+            Ok((clinic_name, clinic_address, clinic_phone, header_png, logo_png, client_name, client_phone, client_email))
+        }).await.map_err(err_string)?.map_err(err_string)?;
+
+    let pdf_data = crate::invoice::OfferPdfData {
+        clinic_name,
+        clinic_address,
+        clinic_phone,
+        header_png,
+        logo_png,
+        offer_number: offer.offer_number.clone(),
+        date: offer.created_at.get(..10).unwrap_or("").to_string(),
+        valid_until: offer.valid_until.clone(),
+        client_name,
+        client_phone,
+        client_email,
+        notes: offer.notes.clone(),
+        lines: items.iter().map(|it| crate::invoice::OfferPdfLine {
+            description: it.description.clone(),
+            qty: it.qty,
+            unit_price: it.unit_price,
+            discount_pct: it.discount_pct,
+            line_total: it.line_total,
+        }).collect(),
+        vat_pct: offer.vat_pct,
+        subtotal: offer.subtotal,
+        vat_amount: offer.vat_amount,
+        total: offer.total,
+    };
+
+    let pdf_bytes = crate::invoice::generate_offer_pdf(&pdf_data).map_err(err_string)?;
+    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pdf_bytes))
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .register_uri_scheme_protocol("mjeku", ui_protocol::handle)
         .setup(|app| {
             let handle = app.handle();
@@ -2532,6 +3109,30 @@ fn main() {
                 error_log_path,
             });
 
+            // Silent background updater: check once on startup, download+install, then restart.
+            if !tauri::is_dev() {
+                let handle_upd = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Wait 30 s so the app is fully ready before hitting the network.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    if let Ok(updater) = handle_upd.updater() {
+                        if let Ok(Some(update)) = updater.check().await {
+                            let new_version = update.version.clone();
+                            let handle2 = handle_upd.clone();
+                            // download_and_install runs the NSIS installer /S (silent, no UAC with currentUser).
+                            if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
+                                if let Some(win) = handle2.get_webview_window("main") {
+                                    let _ = win.emit("mjeku-update-ready", &new_version);
+                                }
+                                // Give the frontend 6 seconds to show the countdown toast.
+                                tokio::time::sleep(Duration::from_secs(6)).await;
+                                handle2.restart();
+                            }
+                        }
+                    }
+                });
+            }
+
             // In dev, load the Vite dev server for fast iteration.
             if tauri::is_dev() {
                 if let Some(win) = app.get_webview_window("main") {
@@ -2611,7 +3212,27 @@ fn main() {
             invoice_export_pdf,
             visit_export_pdf,
             error_logs_list,
-            error_logs_clear
+            error_logs_clear,
+            regular_invoice_create,
+            regular_invoices_list,
+            app_restart,
+            sales_monthly_report,
+            stock_suppliers_list,
+            stock_supplier_upsert,
+            stock_supplier_delete,
+            stock_items_list,
+            stock_item_upsert,
+            stock_item_delete,
+            stock_movements_list,
+            stock_movement_add,
+            sale_items_list,
+            sale_items_replace,
+            offers_list,
+            offer_items_list,
+            offer_upsert,
+            offer_delete,
+            offer_set_status,
+            offer_pdf
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
