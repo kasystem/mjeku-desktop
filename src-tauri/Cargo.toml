@@ -1,6 +1,6 @@
 [package]
 name = "mjeku_desktop"
-version = "0.4.9"
+version = "0.4.10"
 description = "Mjeku Desktop"
 authors = ["Mjeku"]
 edition = "2021"

@@ -293,20 +293,7 @@ impl UpdatesEngine {
     pub fn ensure_seed_installed(app: &tauri::AppHandle) -> anyhow::Result<()> {
         ensure_ui_dirs(app)?;
 
-        // If current exists and looks compatible, keep it.
-        // If it exists but looks incompatible (older seed), prefer the packaged seed.
-        let current_dir = current_ui_dir(app).ok();
-        let current_has_index = current_dir
-            .as_ref()
-            .is_some_and(|d| d.join("index.html").exists());
-        let current_looks_compatible = current_dir
-            .as_ref()
-            .is_some_and(|d| ui_bundle_looks_compatible(d));
-        if current_has_index && current_looks_compatible {
-            return Ok(());
-        }
-
-        // Install from packaged resources if present.
+        // Read the seed version bundled in this exe's resources.
         let seed_ver =
             read_resource_text(app, SEED_VER_RESOURCE).unwrap_or_else(|_| "seed".to_string());
         let seed_ver = seed_ver.trim().to_string();
@@ -319,10 +306,20 @@ impl UpdatesEngine {
         let versions = versions_dir(app)?;
         fs::create_dir_all(&versions)?;
         let seed_dir = versions.join(&seed_ver);
+
+        // If this exact seed version is already extracted, point to it and return.
+        // This handles: fresh installs, re-installs of the same version.
         if seed_dir.join("index.html").exists() {
             set_pointer_atomic(&current_ptr_path(app)?, &seed_ver)?;
             return Ok(());
         }
+
+        // The seed version from this exe is not yet extracted — install it.
+        // (This is the path taken when upgrading to a new exe with a new UI bundle.)
+        let current_dir = current_ui_dir(app).ok();
+        let current_has_index = current_dir
+            .as_ref()
+            .is_some_and(|d| d.join("index.html").exists());
 
         match extract_seed_resource(app, &seed_dir) {
             Ok(()) => {
@@ -330,13 +327,12 @@ impl UpdatesEngine {
                 Ok(())
             }
             Err(e) => {
-                // If we already have a current UI (even if it's incompatible), don't replace it with
-                // an error page. Keep the previous UI and allow an online update later.
+                // Extraction failed. Keep previous UI rather than showing an error page.
                 if current_has_index {
                     return Ok(());
                 }
 
-                // Otherwise, fallback: create a tiny offline page so the app can still render.
+                // No previous UI either — render a minimal offline fallback.
                 fs::create_dir_all(&seed_dir)?;
                 fs::write(
                     seed_dir.join("index.html"),
