@@ -8,10 +8,10 @@
     "tauri:build": "tauri build",
     "cargo:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml",
     "cargo:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings",
-    "cargo:test": "cargo test --manifest-path src-tauri/Cargo.toml"
+    "cargo:test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "tauri": "tauri"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0"
   }
 }
-
