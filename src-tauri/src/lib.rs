@@ -29,7 +29,7 @@ use crate::db::Db;
 use crate::license_engine::LicenseEngine;
 use crate::models::{
     AppInfo, Appointment, AppointmentUpsertInput, AppointmentsListFilters, CashEntry,
-    CashEntryUpsertInput, CashListFilters, Client, ClientUpsertInput, DailySalesReport, Doctor,
+    CashEntryUpsertInput, CashListFilters, Client, ClientPhoto, ClientUpsertInput, DailySalesReport, Doctor,
     DoctorLoginOption, DoctorUpsertInput, Payment, PaymentUpsertInput, PaymentsListFilters, Sale,
     SaleUpsertInput, SalesListFilters, Service, ServiceUpsertInput, Visit, VisitItem,
     VisitItemUpsertInput, VisitItemsListFilters, VisitUpsertInput, VisitsListFilters,
@@ -3002,6 +3002,113 @@ async fn offer_pdf(state: tauri::State<'_, AppState>, offer_id: String) -> Resul
     Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pdf_bytes))
 }
 
+#[tauri::command]
+async fn client_photos_list(
+    state: tauri::State<'_, AppState>,
+    client_id: String,
+) -> Result<Vec<ClientPhoto>, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.client_photos_list(&client_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
+#[tauri::command]
+async fn client_photo_add(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    client_id: String,
+    stage: String,
+    label: Option<String>,
+    base64_data: String,
+    ext: Option<String>,
+) -> Result<ClientPhoto, String> {
+    let _ = require_login(&state).await?;
+    if client_id.trim().is_empty() {
+        return Err("client_id eshte i detyrueshem".to_string());
+    }
+    let ext = ext
+        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+        .filter(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp"))
+        .unwrap_or_else(|| "jpg".to_string());
+    let stage = match stage.trim() {
+        "after" => "after",
+        "other" => "other",
+        _ => "before",
+    }
+    .to_string();
+
+    let bytes = {
+        use base64::{engine::general_purpose, Engine as _};
+        general_purpose::STANDARD
+            .decode(base64_data.trim())
+            .map_err(err_string)?
+    };
+    if bytes.is_empty() {
+        return Err("Foto e zbrazet".to_string());
+    }
+    if bytes.len() > 15 * 1024 * 1024 {
+        return Err("Foto shume e madhe (max 15MB)".to_string());
+    }
+
+    let data_dir = app.path().app_data_dir().map_err(err_string)?;
+    let dir = data_dir.join("photos").join(client_id.trim());
+    std::fs::create_dir_all(&dir).map_err(err_string)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let file_path = dir.join(format!("{id}.{ext}"));
+    std::fs::write(&file_path, &bytes).map_err(err_string)?;
+
+    let row = ClientPhoto {
+        id,
+        client_id: client_id.trim().to_string(),
+        stage,
+        label: label.unwrap_or_default().trim().to_string(),
+        file_path: file_path.display().to_string(),
+        taken_at: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        deleted: 0,
+    };
+    let db = state.db.clone();
+    let row2 = row.clone();
+    tokio::task::spawn_blocking(move || db.client_photo_add(&row2))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    Ok(row)
+}
+
+#[tauri::command]
+async fn client_photo_data(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    let photo = tokio::task::spawn_blocking(move || db.client_photo_get(&id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?
+        .ok_or_else(|| "Foto nuk u gjet".to_string())?;
+    let bytes = std::fs::read(&photo.file_path).map_err(err_string)?;
+    use base64::{engine::general_purpose, Engine as _};
+    Ok(general_purpose::STANDARD.encode(bytes))
+}
+
+#[tauri::command]
+async fn client_photo_delete(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.client_photo_delete(&id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3204,6 +3311,10 @@ pub fn run() {
             visit_items_list,
             visit_items_upsert,
             visit_items_delete,
+            client_photos_list,
+            client_photo_add,
+            client_photo_data,
+            client_photo_delete,
             cash_list,
             cash_upsert,
             cash_delete,

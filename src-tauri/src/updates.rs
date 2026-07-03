@@ -16,8 +16,10 @@ const DEFAULT_UPDATE_BASE_URL: &str = "https://mjeku-ui.vercel.app";
 
 const KEY_UPDATE_BASE_URL: &str = "update_base_url";
 
-const SEED_ZIP_RESOURCE: &str = "ui-seed.zip";
-const SEED_VER_RESOURCE: &str = "ui-seed-version.txt";
+// The UI seed ships inside the binary itself: on Android the Tauri resource dir is an
+// `asset://` URI that std::fs cannot read, so file-based resource lookup breaks there.
+const SEED_ZIP_BYTES: &[u8] = include_bytes!("../resources/ui-seed.zip");
+const SEED_VER_TEXT: &str = include_str!("../resources/ui-seed-version.txt");
 
 const UI_ROOT_DIRNAME: &str = "ui";
 const UI_VERSIONS_DIRNAME: &str = "versions";
@@ -39,49 +41,6 @@ pub struct UpdatesEngine {
     db: std::sync::Arc<Db>,
     client: reqwest::Client,
     lock: tokio::sync::Mutex<()>,
-}
-
-fn find_resource_file(app: &tauri::AppHandle, name: &str) -> anyhow::Result<PathBuf> {
-    let dir = app.path().resource_dir()?;
-    let mut tries: Vec<PathBuf> = Vec::new();
-
-    // Typical layout in dev/release.
-    tries.push(dir.join(name));
-    tries.push(dir.join("resources").join(name));
-
-    // `tauri dev` can sometimes not copy resources into `resource_dir()` on Windows. Fall back to the
-    // source-tree `src-tauri/resources` by walking up from the executable:
-    //   .../src-tauri/target/debug/<exe>
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(src_tauri_dir) = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-        {
-            tries.push(src_tauri_dir.join("resources").join(name));
-        }
-    }
-
-    // Also try relative to the current working directory (when running from the repo root).
-    if let Ok(cwd) = std::env::current_dir() {
-        tries.push(cwd.join("src-tauri").join("resources").join(name));
-        tries.push(cwd.join("resources").join(name));
-    }
-
-    for p in &tries {
-        if p.exists() {
-            return Ok(p.clone());
-        }
-    }
-
-    bail!(
-        "missing resource: tried {}",
-        tries
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" | ")
-    )
 }
 
 fn ui_bundle_looks_compatible(dir: &Path) -> bool {
@@ -294,8 +253,7 @@ impl UpdatesEngine {
         ensure_ui_dirs(app)?;
 
         // Read the seed version bundled in this exe's resources.
-        let seed_ver =
-            read_resource_text(app, SEED_VER_RESOURCE).unwrap_or_else(|_| "seed".to_string());
+        let seed_ver = SEED_VER_TEXT.to_string();
         let seed_ver = seed_ver.trim().to_string();
         let seed_ver = if seed_ver.is_empty() {
             "seed".to_string()
@@ -435,22 +393,25 @@ fn eq_hex(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
-fn read_resource_text(app: &tauri::AppHandle, name: &str) -> anyhow::Result<String> {
-    let p = find_resource_file(app, name)?;
-    Ok(fs::read_to_string(p)?)
-}
-
-fn extract_seed_resource(app: &tauri::AppHandle, dest: &Path) -> anyhow::Result<()> {
-    let zip_path = find_resource_file(app, SEED_ZIP_RESOURCE)?;
+fn extract_seed_resource(_app: &tauri::AppHandle, dest: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(dest)?;
-    extract_zip(&zip_path, dest)?;
+    let cursor = std::io::Cursor::new(SEED_ZIP_BYTES);
+    let archive = ZipArchive::new(cursor).context("read embedded seed zip")?;
+    extract_zip_archive(archive, dest)?;
     Ok(())
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> anyhow::Result<()> {
     let f =
         fs::File::open(zip_path).with_context(|| format!("open zip: {}", zip_path.display()))?;
-    let mut archive = ZipArchive::new(f).context("read zip archive")?;
+    let archive = ZipArchive::new(f).context("read zip archive")?;
+    extract_zip_archive(archive, dest)
+}
+
+fn extract_zip_archive<R: std::io::Read + std::io::Seek>(
+    mut archive: ZipArchive<R>,
+    dest: &Path,
+) -> anyhow::Result<()> {
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;

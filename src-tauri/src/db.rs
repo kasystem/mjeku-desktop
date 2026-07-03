@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use uuid::Uuid;
 
 use crate::models::{
+    ClientPhoto,
     Appointment, AppointmentUpsertInput, AppointmentsListFilters, CashEntry, CashEntryUpsertInput,
     CashListFilters, Client, ClientUpsertInput, Doctor, DoctorUpsertInput, Payment,
     PaymentUpsertInput, PaymentsListFilters, Sale, SaleUpsertInput, SalesListFilters, Service,
@@ -283,6 +284,17 @@ CREATE TABLE IF NOT EXISTS offers (
   deleted_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS client_photos (
+  id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  stage TEXT NOT NULL DEFAULT 'before',
+  label TEXT NOT NULL DEFAULT '',
+  file_path TEXT NOT NULL,
+  taken_at TEXT,
+  created_at TEXT NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS offer_items (
   id TEXT PRIMARY KEY,
   offer_id TEXT NOT NULL DEFAULT '',
@@ -430,6 +442,7 @@ impl Db {
             ("therapies", "TEXT"),
             ("diagnosis", "TEXT"),
             ("examinations", "TEXT"),
+            ("specialty_report", "TEXT"),
         ] {
             Self::add_column_if_missing(conn, "visits", col, ddl)?;
         }
@@ -3417,7 +3430,7 @@ impl Db {
         let include_deleted = f.include_deleted.unwrap_or(false);
 
         let mut sql = String::from(
-      "SELECT id, client_id, doctor_id, date, visit_time, status, notes, body_weight, body_weight_unit, body_height, body_height_unit, head_circumference, head_circumference_unit, body_temperature, body_temperature_unit, blood_oxygen, blood_oxygen_unit, glycemia, glycemia_unit, pulse, pulse_unit, bmi, blood_pressure_systolic, blood_pressure_diastolic, blood_pressure_unit, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted
+      "SELECT id, client_id, doctor_id, date, visit_time, status, notes, body_weight, body_weight_unit, body_height, body_height_unit, head_circumference, head_circumference_unit, body_temperature, body_temperature_unit, blood_oxygen, blood_oxygen_unit, glycemia, glycemia_unit, pulse, pulse_unit, bmi, blood_pressure_systolic, blood_pressure_diastolic, blood_pressure_unit, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted, specialty_report
        FROM visits WHERE 1=1",
     );
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
@@ -3487,6 +3500,7 @@ impl Db {
                 therapies: row.get(31)?,
                 diagnosis: row.get(32)?,
                 examinations: row.get(33)?,
+                specialty_report: row.get(37)?,
                 created_at: row.get(34)?,
                 updated_at: row.get(35)?,
                 deleted: row.get(36)?,
@@ -3503,7 +3517,7 @@ impl Db {
         Ok(
       conn
         .query_row(
-          "SELECT id, client_id, doctor_id, date, visit_time, status, notes, body_weight, body_weight_unit, body_height, body_height_unit, head_circumference, head_circumference_unit, body_temperature, body_temperature_unit, blood_oxygen, blood_oxygen_unit, glycemia, glycemia_unit, pulse, pulse_unit, bmi, blood_pressure_systolic, blood_pressure_diastolic, blood_pressure_unit, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted
+          "SELECT id, client_id, doctor_id, date, visit_time, status, notes, body_weight, body_weight_unit, body_height, body_height_unit, head_circumference, head_circumference_unit, body_temperature, body_temperature_unit, blood_oxygen, blood_oxygen_unit, glycemia, glycemia_unit, pulse, pulse_unit, bmi, blood_pressure_systolic, blood_pressure_diastolic, blood_pressure_unit, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted, specialty_report
            FROM visits WHERE id=?1",
           params![id],
           |row| {
@@ -3542,6 +3556,7 @@ impl Db {
               therapies: row.get(31)?,
               diagnosis: row.get(32)?,
               examinations: row.get(33)?,
+                specialty_report: row.get(37)?,
               created_at: row.get(34)?,
               updated_at: row.get(35)?,
               deleted: row.get(36)?,
@@ -3593,6 +3608,7 @@ impl Db {
         let therapies = input.therapies;
         let diagnosis = input.diagnosis;
         let examinations = input.examinations;
+        let specialty_report = input.specialty_report;
         let now = now_iso();
 
         let mut conn = self.conn()?;
@@ -3618,7 +3634,7 @@ impl Db {
          bmi,
          blood_pressure_systolic, blood_pressure_diastolic, blood_pressure_unit,
          complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations,
-         created_at, updated_at, deleted
+         created_at, updated_at, deleted, specialty_report
        )
        VALUES (
          ?1, ?2, ?3, ?4, ?5, ?6, ?7,
@@ -3631,7 +3647,7 @@ impl Db {
          ?22,
          ?23, ?24, ?25,
          ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34,
-         ?35, ?36, 0
+         ?35, ?36, 0, ?37
        )
        ON CONFLICT(id) DO UPDATE SET
          client_id=excluded.client_id,
@@ -3667,6 +3683,7 @@ impl Db {
          therapies=excluded.therapies,
          diagnosis=excluded.diagnosis,
          examinations=excluded.examinations,
+         specialty_report=excluded.specialty_report,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
       params![
@@ -3705,7 +3722,8 @@ impl Db {
         &diagnosis,
         &examinations,
         &created_at,
-        &now
+        &now,
+        &specialty_report
       ],
     )?;
         let row = Visit {
@@ -3743,6 +3761,7 @@ impl Db {
             therapies,
             diagnosis,
             examinations,
+            specialty_report,
             created_at: created_at.clone(),
             updated_at: now.clone(),
             deleted: 0,
@@ -3751,6 +3770,71 @@ impl Db {
         Self::queue_replace_pending_tx(&tx, "visits", &row.id, "upsert", &payload, &now)?;
         tx.commit()?;
         Ok(row)
+    }
+
+    pub fn client_photos_list(&self, client_id: &str) -> anyhow::Result<Vec<ClientPhoto>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, client_id, stage, label, file_path, taken_at, created_at, deleted
+             FROM client_photos WHERE client_id=?1 AND deleted=0 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![client_id], |r| {
+            Ok(ClientPhoto {
+                id: r.get(0)?,
+                client_id: r.get(1)?,
+                stage: r.get(2)?,
+                label: r.get(3)?,
+                file_path: r.get(4)?,
+                taken_at: r.get(5)?,
+                created_at: r.get(6)?,
+                deleted: r.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn client_photo_add(&self, row: &ClientPhoto) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO client_photos (id, client_id, stage, label, file_path, taken_at, created_at, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            params![row.id, row.client_id, row.stage, row.label, row.file_path, row.taken_at, row.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn client_photo_get(&self, id: &str) -> anyhow::Result<Option<ClientPhoto>> {
+        let conn = self.conn()?;
+        let r = conn
+            .query_row(
+                "SELECT id, client_id, stage, label, file_path, taken_at, created_at, deleted
+                 FROM client_photos WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok(ClientPhoto {
+                        id: r.get(0)?,
+                        client_id: r.get(1)?,
+                        stage: r.get(2)?,
+                        label: r.get(3)?,
+                        file_path: r.get(4)?,
+                        taken_at: r.get(5)?,
+                        created_at: r.get(6)?,
+                        deleted: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(r)
+    }
+
+    pub fn client_photo_delete(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute("UPDATE client_photos SET deleted=1 WHERE id=?1", params![id])?;
+        Ok(())
     }
 
     pub fn visits_delete(&self, id: &str) -> anyhow::Result<()> {
@@ -3766,7 +3850,7 @@ impl Db {
         )?;
         let row = tx
       .query_row(
-        "SELECT id, client_id, doctor_id, date, visit_time, status, notes, body_weight, body_weight_unit, body_height, body_height_unit, head_circumference, head_circumference_unit, body_temperature, body_temperature_unit, blood_oxygen, blood_oxygen_unit, glycemia, glycemia_unit, pulse, pulse_unit, bmi, blood_pressure_systolic, blood_pressure_diastolic, blood_pressure_unit, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted
+        "SELECT id, client_id, doctor_id, date, visit_time, status, notes, body_weight, body_weight_unit, body_height, body_height_unit, head_circumference, head_circumference_unit, body_temperature, body_temperature_unit, blood_oxygen, blood_oxygen_unit, glycemia, glycemia_unit, pulse, pulse_unit, bmi, blood_pressure_systolic, blood_pressure_diastolic, blood_pressure_unit, complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations, created_at, updated_at, deleted, specialty_report
          FROM visits WHERE id=?1",
         params![id],
         |r| {
@@ -3805,6 +3889,7 @@ impl Db {
             therapies: r.get(31)?,
             diagnosis: r.get(32)?,
             examinations: r.get(33)?,
+            specialty_report: r.get(37)?,
             created_at: r.get(34)?,
             updated_at: r.get(35)?,
             deleted: r.get(36)?,
@@ -4815,7 +4900,7 @@ impl Db {
          bmi,
          blood_pressure_systolic, blood_pressure_diastolic, blood_pressure_unit,
          complaints, additional_notes, controls, remarks, analyses, advice, therapies, diagnosis, examinations,
-         created_at, updated_at, deleted
+         created_at, updated_at, deleted, specialty_report
        )
        VALUES (
          ?1, ?2, ?3, ?4, ?5, ?6, ?7,
@@ -4828,7 +4913,7 @@ impl Db {
          ?22,
          ?23, ?24, ?25,
          ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34,
-         ?35, ?36, ?37
+         ?35, ?36, ?37, ?38
        )
        ON CONFLICT(id) DO UPDATE SET
          client_id=excluded.client_id,
@@ -4864,6 +4949,7 @@ impl Db {
          therapies=excluded.therapies,
          diagnosis=excluded.diagnosis,
          examinations=excluded.examinations,
+         specialty_report=excluded.specialty_report,
          created_at=excluded.created_at,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
@@ -4904,7 +4990,8 @@ impl Db {
         row.examinations,
         row.created_at,
         row.updated_at,
-        row.deleted
+        row.deleted,
+        row.specialty_report
       ],
     )?;
         Ok(())

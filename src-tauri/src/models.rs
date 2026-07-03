@@ -290,6 +290,8 @@ pub struct Visit {
     pub therapies: Option<String>,
     pub diagnosis: Option<String>,
     pub examinations: Option<String>,
+    #[serde(default)]
+    pub specialty_report: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub deleted: i64,
@@ -341,6 +343,8 @@ pub struct VisitUpsertInput {
     pub therapies: Option<String>,
     pub diagnosis: Option<String>,
     pub examinations: Option<String>,
+    #[serde(default)]
+    pub specialty_report: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -568,4 +572,16 @@ pub struct OfferItemInput {
     pub qty: f64,
     pub unit_price: f64,
     pub discount_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientPhoto {
+    pub id: String,
+    pub client_id: String,
+    pub stage: String, // before|after|other
+    pub label: String,
+    pub file_path: String,
+    pub taken_at: Option<String>,
+    pub created_at: String,
+    pub deleted: i64,
 }
