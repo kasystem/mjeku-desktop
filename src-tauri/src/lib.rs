@@ -2468,6 +2468,132 @@ async fn visit_export_pdf(
 }
 
 #[tauri::command]
+async fn prescription_export_pdf(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    visit_id: Option<String>,
+) -> Result<String, String> {
+    let session = require_login(&state).await?;
+    let visit_id = visit_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+
+    let db = state.db.clone();
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!(e))
+        .map_err(err_string)?;
+    #[cfg(desktop)]
+    let desktop_dir = app.path().desktop_dir().ok();
+    #[cfg(mobile)]
+    let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
+
+    tokio::task::spawn_blocking(move || {
+        use base64::{engine::general_purpose, Engine as _};
+
+        let clinic_name = db
+            .setting_get("clinic_name")
+            .map_err(err_string)?
+            .unwrap_or_else(|| "Klinika".to_string());
+
+        let header_png: Option<Vec<u8>> = db
+            .setting_get("pdf_header_path")
+            .ok()
+            .flatten()
+            .and_then(|rel| {
+                let rel = rel.trim().to_string();
+                if rel.is_empty() { return None; }
+                std::fs::read(data_dir.join(rel)).ok()
+            });
+        let logo_png: Option<Vec<u8>> = db
+            .setting_get("clinic_logo_path")
+            .ok()
+            .flatten()
+            .and_then(|rel| {
+                let rel = rel.trim().to_string();
+                if rel.is_empty() { return None; }
+                std::fs::read(data_dir.join(rel)).ok()
+            });
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let (date, doctor_id_opt, client_opt, diagnosis, therapies, file_tag) = match &visit_id {
+            Some(vid) => {
+                let visit = db
+                    .visits_get(vid)
+                    .map_err(err_string)?
+                    .ok_or_else(|| "vizita nuk u gjet".to_string())?;
+                if let SessionKind::Doctor { doctor_id, is_admin: false } = &session {
+                    let row_doctor = visit.doctor_id.as_deref().unwrap_or("").trim().to_string();
+                    if row_doctor.is_empty() || row_doctor != doctor_id.trim() {
+                        return Err("nuk ke akses ne kete vizite".to_string());
+                    }
+                }
+                let client = db
+                    .clients_get(&visit.client_id)
+                    .map_err(err_string)?
+                    .ok_or_else(|| "pacienti nuk u gjet".to_string())?;
+                (
+                    visit.date.clone().unwrap_or_else(|| today.clone()),
+                    visit.doctor_id.clone(),
+                    Some(client),
+                    visit.diagnosis.clone(),
+                    visit.therapies.clone(),
+                    format!("Receta-{}", visit.id),
+                )
+            }
+            None => {
+                // Recete e zbrazet: nese eshte kyçur mjeku, vendos emrin e tij.
+                let did = match &session {
+                    SessionKind::Doctor { doctor_id, .. } => Some(doctor_id.clone()),
+                    _ => None,
+                };
+                let ts = chrono::Local::now().format("%H%M%S").to_string();
+                (today.clone(), did, None, None, None, format!("Receta-Zbrazet-{}", ts))
+            }
+        };
+
+        let (doctor_name, doctor_title) = if let Some(did) = doctor_id_opt
+            .as_deref()
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+        {
+            db.doctors_list(None)
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|d| d.id == did))
+                .map(|d| (Some(d.name), d.title))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+
+        let data = crate::invoice::PrescriptionPdfData {
+            clinic_name,
+            header_png,
+            logo_png,
+            date,
+            doctor_name,
+            doctor_title,
+            client_name: client_opt.as_ref().map(|c| c.name.clone()),
+            client_dob: client_opt.as_ref().and_then(|c| c.dob.clone()),
+            client_code: client_opt.as_ref().and_then(|c| c.patient_code.clone()),
+            diagnosis,
+            therapies,
+        };
+
+        let pdf_bytes = crate::invoice::render_prescription_pdf(&data).map_err(err_string)?;
+
+        let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
+        std::fs::create_dir_all(&out_dir).map_err(err_string)?;
+        let out_path = out_dir.join(format!("{}.pdf", file_tag));
+        std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
+
+        Ok(general_purpose::STANDARD.encode(pdf_bytes))
+    })
+    .await
+    .map_err(err_string)?
+}
+
+#[tauri::command]
 async fn error_logs_list(
     state: tauri::State<'_, AppState>,
     limit: Option<u32>,
@@ -3331,6 +3457,7 @@ pub fn run() {
             history_reset_all,
             invoice_export_pdf,
             visit_export_pdf,
+            prescription_export_pdf,
             error_logs_list,
             error_logs_clear,
             regular_invoice_create,

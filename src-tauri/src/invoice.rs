@@ -1140,3 +1140,147 @@ mod tests {
         println!("Saved {} bytes to {}", pdf.len(), path);
     }
 }
+
+// ─── Receta mjekesore ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct PrescriptionPdfData {
+    pub clinic_name: String,
+    pub header_png: Option<Vec<u8>>,
+    pub logo_png: Option<Vec<u8>>,
+    pub date: String, // YYYY-MM-DD
+    pub doctor_name: Option<String>,
+    pub doctor_title: Option<String>,
+    pub client_name: Option<String>, // None => recete e zbrazet
+    pub client_dob: Option<String>,
+    pub client_code: Option<String>,
+    pub diagnosis: Option<String>,
+    pub therapies: Option<String>, // rreshtat Rp.; bosh => vija per plotesim me dore
+}
+
+pub fn render_prescription_pdf(data: &PrescriptionPdfData) -> anyhow::Result<Vec<u8>> {
+    let (doc, page1, layer1) = PdfDocument::new("Recete", Mm(PAGE_W), Mm(PAGE_H), "Layer 1");
+    let font   = doc.add_builtin_font(BuiltinFont::Helvetica).context("font")?;
+    let font_b = doc.add_builtin_font(BuiltinFont::HelveticaBold).context("font bold")?;
+
+    let layer = doc.get_page(page1).get_layer(layer1);
+
+    let doc_name = opt(&data.doctor_name);
+    let subtitle = if doc_name.is_empty() {
+        data.clinic_name.clone()
+    } else {
+        format!("{}  |  Dr. {}", data.clinic_name, doc_name)
+    };
+
+    let mut y = render_header(
+        &layer, &font, &font_b,
+        "RECETE MJEKESORE", &subtitle,
+        "", &format!("Data: {}", fmt_date(&data.date)),
+        data.header_png.as_deref(), data.logo_png.as_deref(),
+    );
+
+    // ── Pacienti ───────────────────────────────────────────────────────────
+    y -= 2.0;
+    ctxt_l(&layer, &font_b, ML, y, "Pacienti", 9.5, c_navy_text());
+    y -= LH + 1.0;
+
+    let name = opt(&data.client_name).trim().to_string();
+    let dob  = fmt_date(opt(&data.client_dob));
+    let code = opt(&data.client_code).trim().to_string();
+
+    // Emri (gjysma e majte) + Datelindja (gjysma e djathte) — me vija kur mungojne.
+    let mid = ML + CW * 0.55;
+    ctxt_l(&layer, &font, ML, y, "Emri:", 9.0, c_label());
+    if name.is_empty() {
+        hline(&layer, ML + 12.0, mid - 6.0, y - 1.0, 0.4, c_label());
+    } else {
+        txt_l(&layer, &font_b, ML + 12.0, y, &clamp_text(&name, 34), 10.0);
+    }
+    ctxt_l(&layer, &font, mid, y, "Datelindja:", 9.0, c_label());
+    if dob.trim().is_empty() || dob.trim() == "-" {
+        hline(&layer, mid + 20.0, CR, y - 1.0, 0.4, c_label());
+    } else {
+        txt_l(&layer, &font_b, mid + 20.0, y, &dob, 10.0);
+    }
+    y -= LH + 2.0;
+
+    if !code.is_empty() {
+        ctxt_l(&layer, &font, ML, y, "Kodi i pacientit:", 9.0, c_label());
+        txt_l(&layer, &font, ML + 26.0, y, &code, 9.0);
+        y -= LH + 1.0;
+    }
+
+    // ── Diagnoza ───────────────────────────────────────────────────────────
+    ctxt_l(&layer, &font, ML, y, "Diagnoza:", 9.0, c_label());
+    let diag = opt(&data.diagnosis).trim().to_string();
+    if diag.is_empty() {
+        hline(&layer, ML + 18.0, CR, y - 1.0, 0.4, c_label());
+        y -= LH + 2.0;
+        hline(&layer, ML, CR, y - 1.0, 0.4, c_label());
+        y -= LH + 2.0;
+    } else {
+        let mut first = true;
+        for line in diag.lines().take(3) {
+            let x = if first { ML + 18.0 } else { ML };
+            txt_l(&layer, &font, x, y, &clamp_text(line, 88), 9.0);
+            y -= LH;
+            first = false;
+        }
+        y -= 2.0;
+    }
+
+    // ── Rp./ ───────────────────────────────────────────────────────────────
+    y -= 3.0;
+    hline(&layer, ML, CR, y, 1.2, c_navy());
+    y -= LH + 3.0;
+    ctxt_l(&layer, &font_b, ML, y, "Rp./", 16.0, c_navy_text());
+    y -= LH + 4.0;
+
+    let therapies = opt(&data.therapies).trim().to_string();
+    if therapies.is_empty() {
+        // Recete e zbrazet: 8 vija per plotesim me dore.
+        for _ in 0..8 {
+            hline(&layer, ML + 4.0, CR, y - 1.0, 0.4, c_label());
+            y -= LH + 4.5;
+        }
+    } else {
+        for line in therapies.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                y -= LH * 0.6;
+                continue;
+            }
+            txt_l(&layer, &font, ML + 4.0, y, &clamp_text(t, 92), 10.5);
+            y -= LH + 1.5;
+        }
+        // Disa vija shtese per plotesime.
+        for _ in 0..2 {
+            hline(&layer, ML + 4.0, CR, y - 1.0, 0.4, c_label());
+            y -= LH + 4.5;
+        }
+    }
+
+    // ── Nenshkrimi + vula (fiksuar poshte) ────────────────────────────────
+    let sig_y: f32 = 42.0;
+    let title_line = {
+        let t = opt(&data.doctor_title).trim().to_string();
+        if t.is_empty() { String::new() } else { format!("{} ", t) }
+    };
+    let sig_label = if doc_name.is_empty() {
+        "Mjeku".to_string()
+    } else {
+        format!("{}Dr. {}", title_line, doc_name)
+    };
+
+    ctxt_l(&layer, &font, ML, sig_y, "Vula:", 9.0, c_label());
+    hline(&layer, ML, ML + 55.0, sig_y - 16.0, 0.4, c_label());
+
+    hline(&layer, CR - 65.0, CR, sig_y - 2.0, 0.5, c_label());
+    ctxt_l(&layer, &font, CR - 65.0, sig_y - 7.0, &sig_label, 9.0, c_label());
+    ctxt_l(&layer, &font, CR - 65.0, sig_y - 12.0, "Nenshkrimi i mjekut", 8.0, c_label());
+
+    // Footer i vogel.
+    ctxt_l(&layer, &font, ML, 14.0, &format!("{} — Recete e leshuar me {}", data.clinic_name, fmt_date(&data.date)), 7.5, c_label());
+
+    save_pdf(doc)
+}
