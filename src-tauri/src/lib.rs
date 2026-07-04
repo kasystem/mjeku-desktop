@@ -2468,13 +2468,51 @@ async fn visit_export_pdf(
 }
 
 #[tauri::command]
+async fn prescriptions_list(
+    state: tauri::State<'_, AppState>,
+    kind: Option<String>,
+    client_id: Option<String>,
+) -> Result<Vec<crate::models::Prescription>, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.prescriptions_list(kind, client_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
+#[tauri::command]
+async fn prescriptions_delete(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.prescriptions_delete(&id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
+#[tauri::command]
 async fn prescription_export_pdf(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     visit_id: Option<String>,
+    kind: Option<String>,
+    title: Option<String>,
+    content: Option<String>,
+    save: Option<bool>,
 ) -> Result<String, String> {
     let session = require_login(&state).await?;
     let visit_id = visit_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let kind = match kind.as_deref().map(str::trim) {
+        Some("udhezim") => "udhezim".to_string(),
+        _ => "recete".to_string(),
+    };
+    let title = title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let content_in = content.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    let save = save.unwrap_or(false);
 
     let db = state.db.clone();
     let data_dir = app
@@ -2494,16 +2532,14 @@ async fn prescription_export_pdf(
             .setting_get("clinic_name")
             .map_err(err_string)?
             .unwrap_or_else(|| "Klinika".to_string());
-
-        let header_png: Option<Vec<u8>> = db
-            .setting_get("pdf_header_path")
+        let format = db
+            .setting_get("print_format")
             .ok()
             .flatten()
-            .and_then(|rel| {
-                let rel = rel.trim().to_string();
-                if rel.is_empty() { return None; }
-                std::fs::read(data_dir.join(rel)).ok()
-            });
+            .map(|f| f.trim().to_lowercase())
+            .filter(|f| matches!(f.as_str(), "a4" | "a5" | "termik"))
+            .unwrap_or_else(|| "a4".to_string());
+
         let logo_png: Option<Vec<u8>> = db
             .setting_get("clinic_logo_path")
             .ok()
@@ -2516,7 +2552,7 @@ async fn prescription_export_pdf(
 
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-        let (date, doctor_id_opt, client_opt, diagnosis, therapies, file_tag) = match &visit_id {
+        let (date, doctor_id_opt, client_opt, diagnosis, content_final, file_tag) = match &visit_id {
             Some(vid) => {
                 let visit = db
                     .visits_get(vid)
@@ -2532,52 +2568,80 @@ async fn prescription_export_pdf(
                     .clients_get(&visit.client_id)
                     .map_err(err_string)?
                     .ok_or_else(|| "pacienti nuk u gjet".to_string())?;
+                let content = content_in.clone().or_else(|| visit.therapies.clone());
                 (
                     visit.date.clone().unwrap_or_else(|| today.clone()),
                     visit.doctor_id.clone(),
                     Some(client),
                     visit.diagnosis.clone(),
-                    visit.therapies.clone(),
-                    format!("Receta-{}", visit.id),
+                    content,
+                    format!("{}-{}", if kind == "udhezim" { "Udhezim" } else { "Receta" }, visit.id),
                 )
             }
             None => {
-                // Recete e zbrazet: nese eshte kyçur mjeku, vendos emrin e tij.
                 let did = match &session {
                     SessionKind::Doctor { doctor_id, .. } => Some(doctor_id.clone()),
                     _ => None,
                 };
                 let ts = chrono::Local::now().format("%H%M%S").to_string();
-                (today.clone(), did, None, None, None, format!("Receta-Zbrazet-{}", ts))
+                (
+                    today.clone(),
+                    did,
+                    None,
+                    None,
+                    content_in.clone(),
+                    format!("{}-{}", if kind == "udhezim" { "Udhezim" } else { "Receta" }, ts),
+                )
             }
         };
 
-        let (doctor_name, doctor_title) = if let Some(did) = doctor_id_opt
+        let (doctor_name, doctor_title, doctor_specialty) = if let Some(did) = doctor_id_opt
             .as_deref()
             .map(str::trim)
             .filter(|x| !x.is_empty())
         {
-            db.doctors_list(None)
+            db.doctors_get(did)
                 .ok()
-                .and_then(|rows| rows.into_iter().find(|d| d.id == did))
-                .map(|d| (Some(d.name), d.title))
-                .unwrap_or((None, None))
+                .flatten()
+                .map(|d| (Some(d.name), d.title, d.specialty))
+                .unwrap_or((None, None, None))
         } else {
-            (None, None)
+            (None, None, None)
         };
+
+        // Ruaje ne DB (sinkronizohet ne background) nese kerkohet.
+        if save {
+            let now = crate::util::now_iso();
+            let row = crate::models::Prescription {
+                id: uuid::Uuid::new_v4().to_string(),
+                visit_id: visit_id.clone(),
+                client_id: client_opt.as_ref().map(|c| c.id.clone()),
+                doctor_id: doctor_id_opt.clone(),
+                kind: kind.clone(),
+                title: title.clone().unwrap_or_default(),
+                content: content_final.clone().unwrap_or_default(),
+                created_at: now.clone(),
+                updated_at: now,
+                deleted: 0,
+            };
+            db.prescriptions_upsert(&row).map_err(err_string)?;
+        }
 
         let data = crate::invoice::PrescriptionPdfData {
             clinic_name,
-            header_png,
             logo_png,
+            format,
+            kind: kind.clone(),
+            doc_title: title.clone(),
             date,
             doctor_name,
             doctor_title,
+            doctor_specialty,
             client_name: client_opt.as_ref().map(|c| c.name.clone()),
             client_dob: client_opt.as_ref().and_then(|c| c.dob.clone()),
             client_code: client_opt.as_ref().and_then(|c| c.patient_code.clone()),
             diagnosis,
-            therapies,
+            content: content_final,
         };
 
         let pdf_bytes = crate::invoice::render_prescription_pdf(&data).map_err(err_string)?;
@@ -3458,6 +3522,8 @@ pub fn run() {
             invoice_export_pdf,
             visit_export_pdf,
             prescription_export_pdf,
+            prescriptions_list,
+            prescriptions_delete,
             error_logs_list,
             error_logs_clear,
             regular_invoice_create,

@@ -467,6 +467,8 @@ pub struct MonthlyReportRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StockSupplier {
+    #[serde(default)]
+    pub deleted: i64,
     pub id: String,
     pub name: String,
     pub phone: Option<String>,
@@ -479,6 +481,8 @@ pub struct StockSupplier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StockItem {
+    #[serde(default)]
+    pub deleted: i64,
     pub id: String,
     pub name: String,
     pub unit: Option<String>,
@@ -519,6 +523,8 @@ pub struct SaleItemInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StockMovement {
+    #[serde(default)]
+    pub deleted: i64,
     pub id: String,
     pub item_id: String,
     pub movement_type: String,
@@ -583,5 +589,20 @@ pub struct ClientPhoto {
     pub file_path: String,
     pub taken_at: Option<String>,
     pub created_at: String,
+    pub deleted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Prescription {
+    pub id: String,
+    pub visit_id: Option<String>,
+    pub client_id: Option<String>,
+    pub doctor_id: Option<String>,
+    pub kind: String, // recete | udhezim
+    pub title: String,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
     pub deleted: i64,
 }

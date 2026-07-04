@@ -1146,141 +1146,181 @@ mod tests {
 #[derive(Debug, Clone)]
 pub struct PrescriptionPdfData {
     pub clinic_name: String,
-    pub header_png: Option<Vec<u8>>,
     pub logo_png: Option<Vec<u8>>,
-    pub date: String, // YYYY-MM-DD
+    pub format: String, // a4 | a5 | termik
+    pub kind: String,   // recete | udhezim
+    pub doc_title: Option<String>, // titulli i udhezimit, p.sh. "Udhezim per Prizren"
+    pub date: String,   // YYYY-MM-DD
     pub doctor_name: Option<String>,
     pub doctor_title: Option<String>,
-    pub client_name: Option<String>, // None => recete e zbrazet
+    pub doctor_specialty: Option<String>,
+    pub client_name: Option<String>,
     pub client_dob: Option<String>,
     pub client_code: Option<String>,
     pub diagnosis: Option<String>,
-    pub therapies: Option<String>, // rreshtat Rp.; bosh => vija per plotesim me dore
+    pub content: Option<String>, // rreshtat e recetes / teksti i udhezimit; bosh => vija
+}
+
+// Ngjyra te ngrohta per recetat.
+fn c_warm()      -> Color { Color::Rgb(Rgb::new(0.72, 0.45, 0.20, None)) } // amber i thelle
+fn c_warm_pale() -> Color { Color::Rgb(Rgb::new(0.99, 0.96, 0.90, None)) } // krem
+fn c_warm_line() -> Color { Color::Rgb(Rgb::new(0.85, 0.65, 0.35, None)) } // amber i lehte
+
+fn center_x(page_w: f32, text: &str, sz: f32) -> f32 {
+    // Perafrim i gjeresise per Helvetica (~0.5 em per karakter).
+    let w = text.chars().count() as f32 * sz * 0.176;
+    ((page_w - w) / 2.0).max(2.0)
 }
 
 pub fn render_prescription_pdf(data: &PrescriptionPdfData) -> anyhow::Result<Vec<u8>> {
-    let (doc, page1, layer1) = PdfDocument::new("Recete", Mm(PAGE_W), Mm(PAGE_H), "Layer 1");
+    let (pw, ph, ml): (f32, f32, f32) = match data.format.as_str() {
+        "a5" => (148.0, 210.0, 10.0),
+        "termik" => (80.0, 210.0, 4.0),
+        _ => (210.0, 297.0, 16.0),
+    };
+    let cr = pw - ml;
+    let cw = cr - ml;
+    let is_thermal = data.format == "termik";
+    let lh: f32 = if is_thermal { 4.6 } else { 6.0 };
+    let base_sz: f32 = if is_thermal { 7.5 } else { 9.5 };
+
+    let (doc, page1, layer1) = PdfDocument::new("Recete", Mm(pw), Mm(ph), "Layer 1");
     let font   = doc.add_builtin_font(BuiltinFont::Helvetica).context("font")?;
     let font_b = doc.add_builtin_font(BuiltinFont::HelveticaBold).context("font bold")?;
-
     let layer = doc.get_page(page1).get_layer(layer1);
 
-    let doc_name = opt(&data.doctor_name);
-    let subtitle = if doc_name.is_empty() {
-        data.clinic_name.clone()
-    } else {
-        format!("{}  |  Dr. {}", data.clinic_name, doc_name)
-    };
+    let mut y = ph - (if is_thermal { 6.0 } else { 12.0 });
 
-    let mut y = render_header(
-        &layer, &font, &font_b,
-        "RECETE MJEKESORE", &subtitle,
-        "", &format!("Data: {}", fmt_date(&data.date)),
-        data.header_png.as_deref(), data.logo_png.as_deref(),
-    );
+    // ── Koka e ngrohte: logo ne qender + emri i biznesit ──────────────────
+    if let Some(lb) = &data.logo_png {
+        let logo_h: f32 = if is_thermal { 14.0 } else { 22.0 };
+        place_png(&layer, lb, ml, y - logo_h, cw, logo_h);
+        y -= logo_h + 3.0;
+    }
+    let name_sz = if is_thermal { 10.0 } else { 15.0 };
+    ctxt_l(&layer, &font_b, center_x(pw, &data.clinic_name, name_sz), y, &data.clinic_name, name_sz, c_navy_text());
+    y -= lh + 1.0;
+    hline(&layer, ml, cr, y, 1.4, c_warm());
+    hline(&layer, ml, cr, y - 1.2, 0.5, c_warm_line());
+    y -= lh + 1.5;
+
+    // Titulli i dokumentit.
+    let title_text = if data.kind == "udhezim" {
+        data.doc_title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "UDHEZIM".to_string()).to_uppercase()
+    } else {
+        "RECETE MJEKESORE".to_string()
+    };
+    let t_sz = if is_thermal { 9.0 } else { 12.5 };
+    ctxt_l(&layer, &font_b, center_x(pw, &title_text, t_sz), y, &title_text, t_sz, c_warm());
+    y -= lh;
+    let date_line = format!("Data: {}", fmt_date(&data.date));
+    ctxt_l(&layer, &font, center_x(pw, &date_line, base_sz - 1.0), y, &date_line, base_sz - 1.0, c_label());
+    y -= lh + 2.0;
 
     // ── Pacienti ───────────────────────────────────────────────────────────
-    y -= 2.0;
-    ctxt_l(&layer, &font_b, ML, y, "Pacienti", 9.5, c_navy_text());
-    y -= LH + 1.0;
-
     let name = opt(&data.client_name).trim().to_string();
     let dob  = fmt_date(opt(&data.client_dob));
-    let code = opt(&data.client_code).trim().to_string();
-
-    // Emri (gjysma e majte) + Datelindja (gjysma e djathte) — me vija kur mungojne.
-    let mid = ML + CW * 0.55;
-    ctxt_l(&layer, &font, ML, y, "Emri:", 9.0, c_label());
+    ctxt_l(&layer, &font, ml, y, "Pacienti:", base_sz - 1.0, c_label());
+    let px = ml + (if is_thermal { 13.0 } else { 18.0 });
     if name.is_empty() {
-        hline(&layer, ML + 12.0, mid - 6.0, y - 1.0, 0.4, c_label());
+        hline(&layer, px, cr, y - 1.0, 0.4, c_label());
     } else {
-        txt_l(&layer, &font_b, ML + 12.0, y, &clamp_text(&name, 34), 10.0);
+        txt_l(&layer, &font_b, px, y, &clamp_text(&name, if is_thermal { 24 } else { 40 }), base_sz + 0.5);
     }
-    ctxt_l(&layer, &font, mid, y, "Datelindja:", 9.0, c_label());
+    y -= lh + 1.0;
+    ctxt_l(&layer, &font, ml, y, "Datelindja:", base_sz - 1.0, c_label());
+    let dx = ml + (if is_thermal { 15.0 } else { 20.0 });
     if dob.trim().is_empty() || dob.trim() == "-" {
-        hline(&layer, mid + 20.0, CR, y - 1.0, 0.4, c_label());
+        hline(&layer, dx, ml + cw * 0.6, y - 1.0, 0.4, c_label());
     } else {
-        txt_l(&layer, &font_b, mid + 20.0, y, &dob, 10.0);
+        txt_l(&layer, &font, dx, y, &dob, base_sz);
     }
-    y -= LH + 2.0;
-
-    if !code.is_empty() {
-        ctxt_l(&layer, &font, ML, y, "Kodi i pacientit:", 9.0, c_label());
-        txt_l(&layer, &font, ML + 26.0, y, &code, 9.0);
-        y -= LH + 1.0;
-    }
-
-    // ── Diagnoza ───────────────────────────────────────────────────────────
-    ctxt_l(&layer, &font, ML, y, "Diagnoza:", 9.0, c_label());
-    let diag = opt(&data.diagnosis).trim().to_string();
-    if diag.is_empty() {
-        hline(&layer, ML + 18.0, CR, y - 1.0, 0.4, c_label());
-        y -= LH + 2.0;
-        hline(&layer, ML, CR, y - 1.0, 0.4, c_label());
-        y -= LH + 2.0;
-    } else {
-        let mut first = true;
-        for line in diag.lines().take(3) {
-            let x = if first { ML + 18.0 } else { ML };
-            txt_l(&layer, &font, x, y, &clamp_text(line, 88), 9.0);
-            y -= LH;
-            first = false;
+    if let Some(code) = data.client_code.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        if !is_thermal {
+            ctxt_l(&layer, &font, ml + cw * 0.65, y, &format!("Kodi: {}", code), base_sz - 1.0, c_label());
         }
-        y -= 2.0;
     }
+    y -= lh + 1.0;
 
-    // ── Rp./ ───────────────────────────────────────────────────────────────
-    y -= 3.0;
-    hline(&layer, ML, CR, y, 1.2, c_navy());
-    y -= LH + 3.0;
-    ctxt_l(&layer, &font_b, ML, y, "Rp./", 16.0, c_navy_text());
-    y -= LH + 4.0;
-
-    let therapies = opt(&data.therapies).trim().to_string();
-    if therapies.is_empty() {
-        // Recete e zbrazet: 8 vija per plotesim me dore.
-        for _ in 0..8 {
-            hline(&layer, ML + 4.0, CR, y - 1.0, 0.4, c_label());
-            y -= LH + 4.5;
-        }
-    } else {
-        for line in therapies.lines() {
-            let t = line.trim();
-            if t.is_empty() {
-                y -= LH * 0.6;
-                continue;
+    if data.kind != "udhezim" {
+        ctxt_l(&layer, &font, ml, y, "Diagnoza:", base_sz - 1.0, c_label());
+        let gx = ml + (if is_thermal { 14.0 } else { 19.0 });
+        let diag = opt(&data.diagnosis).trim().to_string();
+        if diag.is_empty() {
+            hline(&layer, gx, cr, y - 1.0, 0.4, c_label());
+            y -= lh + 1.0;
+        } else {
+            let mut first = true;
+            for line in diag.lines().take(2) {
+                let x = if first { gx } else { ml };
+                txt_l(&layer, &font, x, y, &clamp_text(line, if is_thermal { 26 } else { 80 }), base_sz);
+                y -= lh;
+                first = false;
             }
-            txt_l(&layer, &font, ML + 4.0, y, &clamp_text(t, 92), 10.5);
-            y -= LH + 1.5;
         }
-        // Disa vija shtese per plotesime.
+    }
+    y -= 2.0;
+
+    // ── Permbajtja ─────────────────────────────────────────────────────────
+    if data.kind != "udhezim" {
+        ctxt_l(&layer, &font_b, ml, y, "Rp./", if is_thermal { 11.0 } else { 15.0 }, c_navy_text());
+        y -= lh + 2.5;
+    }
+
+    let content = opt(&data.content).trim().to_string();
+    let row_h = lh + (if is_thermal { 2.5 } else { 4.0 });
+    if content.is_empty() {
+        // Dokument i zbrazet: vija per plotesim me kimik.
+        let n = if is_thermal { 10 } else { 9 };
+        for i in 0..n {
+            if i % 2 == 0 && !is_thermal {
+                fill_rect(&layer, ml, y - row_h + 2.0, cw, row_h, c_warm_pale());
+            }
+            hline(&layer, ml + 2.0, cr - 2.0, y - row_h + 3.0, 0.4, c_label());
+            y -= row_h;
+        }
+    } else {
+        // Tabela e rreshtave me sfond te alternuar te ngrohte.
+        let mut i = 0usize;
+        for line in content.lines() {
+            let t = line.trim();
+            if t.is_empty() { continue; }
+            if y < 40.0 { break; }
+            if i % 2 == 0 {
+                fill_rect(&layer, ml, y - row_h + 2.0, cw, row_h, c_warm_pale());
+            }
+            if data.kind != "udhezim" {
+                ctxt_l(&layer, &font_b, ml + 2.0, y - row_h / 2.0 + 2.0, &format!("{}.", i + 1), base_sz - 1.0, c_warm());
+                txt_l(&layer, &font, ml + (if is_thermal { 7.0 } else { 10.0 }), y - row_h / 2.0 + 2.0, &clamp_text(t, if is_thermal { 26 } else { 82 }), base_sz + 0.5);
+            } else {
+                txt_l(&layer, &font, ml + 2.0, y - row_h / 2.0 + 2.0, &clamp_text(t, if is_thermal { 28 } else { 88 }), base_sz + 0.5);
+            }
+            y -= row_h;
+            i += 1;
+        }
+        // 2 vija shtese.
         for _ in 0..2 {
-            hline(&layer, ML + 4.0, CR, y - 1.0, 0.4, c_label());
-            y -= LH + 4.5;
+            hline(&layer, ml + 2.0, cr - 2.0, y - row_h + 3.0, 0.4, c_label());
+            y -= row_h;
         }
     }
 
-    // ── Nenshkrimi + vula (fiksuar poshte) ────────────────────────────────
-    let sig_y: f32 = 42.0;
-    let title_line = {
-        let t = opt(&data.doctor_title).trim().to_string();
-        if t.is_empty() { String::new() } else { format!("{} ", t) }
-    };
-    let sig_label = if doc_name.is_empty() {
-        "Mjeku".to_string()
-    } else {
-        format!("{}Dr. {}", title_line, doc_name)
-    };
+    // ── Fundi: mjeku + nenshkrimi + specializimi ───────────────────────────
+    let sig_y: f32 = if is_thermal { 22.0 } else { 34.0 };
+    let doc_name = opt(&data.doctor_name).trim().to_string();
+    let title_p = data.doctor_title.as_deref().map(str::trim).filter(|x| !x.is_empty()).map(|t| format!("{} ", t)).unwrap_or_default();
+    let name_line = if doc_name.is_empty() { "Mjeku".to_string() } else { format!("{}Dr. {}", title_p, doc_name) };
+    let spec = data.doctor_specialty.as_deref().map(str::trim).filter(|x| !x.is_empty()).unwrap_or("");
 
-    ctxt_l(&layer, &font, ML, sig_y, "Vula:", 9.0, c_label());
-    hline(&layer, ML, ML + 55.0, sig_y - 16.0, 0.4, c_label());
+    let sx = if is_thermal { ml } else { cr - 70.0 };
+    let sw = if is_thermal { cw } else { 70.0 };
+    ctxt_l(&layer, &font_b, sx, sig_y + lh + 1.0, &name_line, base_sz, c_navy_text());
+    hline(&layer, sx, sx + sw, sig_y, 0.5, c_label());
+    ctxt_l(&layer, &font, sx, sig_y - lh + 1.5, if spec.is_empty() { "Nenshkrimi" } else { spec }, base_sz - 1.0, c_label());
 
-    hline(&layer, CR - 65.0, CR, sig_y - 2.0, 0.5, c_label());
-    ctxt_l(&layer, &font, CR - 65.0, sig_y - 7.0, &sig_label, 9.0, c_label());
-    ctxt_l(&layer, &font, CR - 65.0, sig_y - 12.0, "Nenshkrimi i mjekut", 8.0, c_label());
-
-    // Footer i vogel.
-    ctxt_l(&layer, &font, ML, 14.0, &format!("{} — Recete e leshuar me {}", data.clinic_name, fmt_date(&data.date)), 7.5, c_label());
+    if !is_thermal {
+        ctxt_l(&layer, &font, ml, 12.0, &format!("{} — {}", data.clinic_name, fmt_date(&data.date)), 7.0, c_label());
+    }
 
     save_pdf(doc)
 }

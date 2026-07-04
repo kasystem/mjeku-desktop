@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::db::Db;
 use crate::models::{
-    Appointment, CashEntry, Client, Doctor, Offer, OfferItem, Payment, Sale, Service, SyncQueueItem, Visit, VisitItem, DoctorAccount,
+    Appointment, CashEntry, Client, Doctor, Offer, OfferItem, Payment, Prescription, Sale, Service, StockItem, StockMovement, StockSupplier, SyncQueueItem, Visit, VisitItem, DoctorAccount,
 };
 use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 
@@ -272,6 +272,57 @@ impl SyncEngine {
             .context("pull offer_items")?;
         for it in offer_items {
             self.apply_remote_row_offer_items(&it)?;
+        }
+
+        let prescriptions: Vec<Prescription> = self
+            .fetch_table(base, api_key, "prescriptions", last_sync_time, clinic_id)
+            .await
+            .context("pull prescriptions")?;
+        for r in prescriptions {
+            if let Some(local_ts) = self.db.row_updated_at("prescriptions", &r.id)? {
+                if newer_or_equal(&local_ts, &r.updated_at)? {
+                    continue;
+                }
+            }
+            self.db.sync_queue_drop_pending_for_row("prescriptions", &r.id)?;
+            self.db.apply_remote_prescription(&r)?;
+        }
+
+        let suppliers: Vec<StockSupplier> = self
+            .fetch_table(base, api_key, "stock_suppliers", last_sync_time, clinic_id)
+            .await
+            .context("pull stock_suppliers")?;
+        for r in suppliers {
+            if let Some(local_ts) = self.db.row_updated_at("stock_suppliers", &r.id)? {
+                if newer_or_equal(&local_ts, &r.updated_at)? {
+                    continue;
+                }
+            }
+            self.db.sync_queue_drop_pending_for_row("stock_suppliers", &r.id)?;
+            self.db.apply_remote_stock_supplier(&r)?;
+        }
+
+        let stock_items: Vec<StockItem> = self
+            .fetch_table(base, api_key, "stock_items", last_sync_time, clinic_id)
+            .await
+            .context("pull stock_items")?;
+        for r in stock_items {
+            if let Some(local_ts) = self.db.row_updated_at("stock_items", &r.id)? {
+                if newer_or_equal(&local_ts, &r.updated_at)? {
+                    continue;
+                }
+            }
+            self.db.sync_queue_drop_pending_for_row("stock_items", &r.id)?;
+            self.db.apply_remote_stock_item(&r)?;
+        }
+
+        let movements: Vec<StockMovement> = self
+            .fetch_table(base, api_key, "stock_movements", last_sync_time, clinic_id)
+            .await
+            .context("pull stock_movements")?;
+        for r in movements {
+            // Levizjet jane te pandryshueshme — ON CONFLICT DO NOTHING lokalisht.
+            self.db.apply_remote_stock_movement(&r)?;
         }
 
         Ok(())

@@ -284,6 +284,19 @@ CREATE TABLE IF NOT EXISTS offers (
   deleted_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS prescriptions (
+  id TEXT PRIMARY KEY,
+  visit_id TEXT,
+  client_id TEXT,
+  doctor_id TEXT,
+  kind TEXT NOT NULL DEFAULT 'recete',
+  title TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS client_photos (
   id TEXT PRIMARY KEY,
   client_id TEXT NOT NULL,
@@ -691,12 +704,45 @@ impl Db {
         Ok(())
     }
 
+    pub fn row_updated_at(&self, table: &str, id: &str) -> anyhow::Result<Option<String>> {
+        // Only whitelisted tables — table name is never user input.
+        let sql = match table {
+            "prescriptions" => "SELECT updated_at FROM prescriptions WHERE id=?1",
+            "stock_suppliers" => "SELECT updated_at FROM stock_suppliers WHERE id=?1",
+            "stock_items" => "SELECT updated_at FROM stock_items WHERE id=?1",
+            _ => return Ok(None),
+        };
+        let conn = self.conn()?;
+        let v: Option<String> = conn.query_row(sql, params![id], |r| r.get(0)).optional()?;
+        Ok(v)
+    }
+
     pub fn sync_queue_drop_pending_for_row(&self, table: &str, row_id: &str) -> anyhow::Result<()> {
         let conn = self.conn()?;
         conn.execute(
       "DELETE FROM sync_queue WHERE table_name=?1 AND row_id=?2 AND status IN ('pending','failed')",
       params![table, row_id],
     )?;
+        Ok(())
+    }
+
+    fn queue_replace_pending_conn(
+        conn: &Connection,
+        table: &str,
+        row_id: &str,
+        op: &str,
+        payload_json: &str,
+        created_at: &str,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "DELETE FROM sync_queue WHERE table_name=?1 AND row_id=?2 AND status IN ('pending','failed')",
+            params![table, row_id],
+        )?;
+        conn.execute(
+            "INSERT INTO sync_queue (id, table_name, row_id, op, payload, created_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+            params![Uuid::new_v4().to_string(), table, row_id, op, payload_json, created_at],
+        )?;
         Ok(())
     }
 
@@ -5158,6 +5204,7 @@ impl Db {
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(crate::models::StockSupplier {
+                deleted: 0,
                 id: row.get(0)?, name: row.get(1)?, phone: row.get(2)?, email: row.get(3)?,
                 address: row.get(4)?, notes: row.get(5)?, created_at: row.get(6)?, updated_at: row.get(7)?,
             })
@@ -5174,12 +5221,17 @@ impl Db {
                address=excluded.address, notes=excluded.notes, updated_at=excluded.updated_at",
             rusqlite::params![s.id, s.name, s.phone, s.email, s.address, s.notes, s.created_at, s.updated_at],
         )?;
+        let payload = serde_json::to_string(s)?;
+        Self::queue_replace_pending_conn(&conn, "stock_suppliers", &s.id, "upsert", &payload, &now_iso())?;
         Ok(())
     }
 
     pub fn stock_supplier_delete(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE stock_suppliers SET deleted=1 WHERE id=?1", [id])?;
+        let now = now_iso();
+        conn.execute("UPDATE stock_suppliers SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+        let payload = serde_json::json!({ "id": id, "updated_at": now }).to_string();
+        Self::queue_replace_pending_conn(&conn, "stock_suppliers", id, "delete", &payload, &now)?;
         Ok(())
     }
 
@@ -5196,6 +5248,7 @@ impl Db {
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(crate::models::StockItem {
+                deleted: 0,
                 id: row.get(0)?, name: row.get(1)?, unit: row.get(2)?, category: row.get(3)?,
                 supplier_id: row.get(4)?, min_quantity: row.get(5)?, sale_price: row.get(6)?,
                 notes: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
@@ -5215,12 +5268,17 @@ impl Db {
                sale_price=excluded.sale_price, notes=excluded.notes, updated_at=excluded.updated_at",
             rusqlite::params![item.id, item.name, item.unit, item.category, item.supplier_id, item.min_quantity, item.sale_price, item.notes, item.created_at, item.updated_at],
         )?;
+        let payload = serde_json::to_string(item)?;
+        Self::queue_replace_pending_conn(&conn, "stock_items", &item.id, "upsert", &payload, &now_iso())?;
         Ok(())
     }
 
     pub fn stock_item_delete(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE stock_items SET deleted=1 WHERE id=?1", [id])?;
+        let now = now_iso();
+        conn.execute("UPDATE stock_items SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+        let payload = serde_json::json!({ "id": id, "updated_at": now }).to_string();
+        Self::queue_replace_pending_conn(&conn, "stock_items", id, "delete", &payload, &now)?;
         Ok(())
     }
 
@@ -5232,6 +5290,7 @@ impl Db {
         )?;
         let rows = stmt.query_map([item_id], |row| {
             Ok(crate::models::StockMovement {
+                deleted: 0,
                 id: row.get(0)?, item_id: row.get(1)?, movement_type: row.get(2)?,
                 quantity: row.get(3)?, price_per_unit: row.get(4)?, notes: row.get(5)?,
                 date: row.get(6)?, created_at: row.get(7)?,
@@ -5246,6 +5305,109 @@ impl Db {
             "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params![m.id, m.item_id, m.movement_type, m.quantity, m.price_per_unit, m.notes, m.date, m.created_at],
+        )?;
+        let payload = serde_json::to_string(m)?;
+        Self::queue_replace_pending_conn(&conn, "stock_movements", &m.id, "upsert", &payload, &now_iso())?;
+        Ok(())
+    }
+
+    pub fn prescriptions_list(&self, kind: Option<String>, client_id: Option<String>) -> anyhow::Result<Vec<crate::models::Prescription>> {
+        let conn = self.conn()?;
+        let mut sql = String::from(
+            "SELECT id, visit_id, client_id, doctor_id, kind, title, content, created_at, updated_at, deleted
+             FROM prescriptions WHERE deleted=0",
+        );
+        let mut args: Vec<String> = Vec::new();
+        if let Some(k) = kind.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+            args.push(k.to_string());
+            sql.push_str(&format!(" AND kind=?{}", args.len()));
+        }
+        if let Some(c) = client_id.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+            args.push(c.to_string());
+            sql.push_str(&format!(" AND client_id=?{}", args.len()));
+        }
+        sql.push_str(" ORDER BY created_at DESC LIMIT 500");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            Ok(crate::models::Prescription {
+                id: r.get(0)?, visit_id: r.get(1)?, client_id: r.get(2)?, doctor_id: r.get(3)?,
+                kind: r.get(4)?, title: r.get(5)?, content: r.get(6)?,
+                created_at: r.get(7)?, updated_at: r.get(8)?, deleted: r.get(9)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn prescriptions_upsert(&self, row: &crate::models::Prescription) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO prescriptions (id, visit_id, client_id, doctor_id, kind, title, content, created_at, updated_at, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0)
+             ON CONFLICT(id) DO UPDATE SET visit_id=excluded.visit_id, client_id=excluded.client_id,
+               doctor_id=excluded.doctor_id, kind=excluded.kind, title=excluded.title,
+               content=excluded.content, updated_at=excluded.updated_at",
+            params![row.id, row.visit_id, row.client_id, row.doctor_id, row.kind, row.title, row.content, row.created_at, row.updated_at],
+        )?;
+        let payload = serde_json::to_string(row)?;
+        Self::queue_replace_pending_conn(&conn, "prescriptions", &row.id, "upsert", &payload, &now_iso())?;
+        Ok(())
+    }
+
+    pub fn prescriptions_delete(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        let now = now_iso();
+        conn.execute("UPDATE prescriptions SET deleted=1, updated_at=?2 WHERE id=?1", params![id, now])?;
+        let payload = serde_json::json!({ "id": id, "updated_at": now }).to_string();
+        Self::queue_replace_pending_conn(&conn, "prescriptions", id, "delete", &payload, &now)?;
+        Ok(())
+    }
+
+    pub fn apply_remote_prescription(&self, r: &crate::models::Prescription) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO prescriptions (id, visit_id, client_id, doctor_id, kind, title, content, created_at, updated_at, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(id) DO UPDATE SET visit_id=excluded.visit_id, client_id=excluded.client_id,
+               doctor_id=excluded.doctor_id, kind=excluded.kind, title=excluded.title, content=excluded.content,
+               created_at=excluded.created_at, updated_at=excluded.updated_at, deleted=excluded.deleted",
+            params![r.id, r.visit_id, r.client_id, r.doctor_id, r.kind, r.title, r.content, r.created_at, r.updated_at, r.deleted],
+        )?;
+        Ok(())
+    }
+
+    pub fn apply_remote_stock_supplier(&self, r: &crate::models::StockSupplier) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO stock_suppliers (id, name, phone, email, address, notes, created_at, updated_at, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, phone=excluded.phone, email=excluded.email,
+               address=excluded.address, notes=excluded.notes, created_at=excluded.created_at,
+               updated_at=excluded.updated_at, deleted=excluded.deleted",
+            params![r.id, r.name, r.phone, r.email, r.address, r.notes, r.created_at, r.updated_at, r.deleted],
+        )?;
+        Ok(())
+    }
+
+    pub fn apply_remote_stock_item(&self, r: &crate::models::StockItem) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO stock_items (id, name, unit, category, supplier_id, min_quantity, sale_price, notes, created_at, updated_at, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, unit=excluded.unit, category=excluded.category,
+               supplier_id=excluded.supplier_id, min_quantity=excluded.min_quantity, sale_price=excluded.sale_price,
+               notes=excluded.notes, created_at=excluded.created_at, updated_at=excluded.updated_at, deleted=excluded.deleted",
+            params![r.id, r.name, r.unit, r.category, r.supplier_id, r.min_quantity, r.sale_price, r.notes, r.created_at, r.updated_at, r.deleted],
+        )?;
+        Ok(())
+    }
+
+    pub fn apply_remote_stock_movement(&self, r: &crate::models::StockMovement) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(id) DO NOTHING",
+            params![r.id, r.item_id, r.movement_type, r.quantity, r.price_per_unit, r.notes, r.date, r.created_at],
         )?;
         Ok(())
     }
