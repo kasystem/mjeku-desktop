@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::db::Db;
 use crate::models::{
-    Appointment, CashEntry, Client, Doctor, Offer, OfferItem, Payment, Prescription, Sale, Service, StockItem, StockMovement, StockSupplier, SyncQueueItem, Visit, VisitItem, DoctorAccount,
+    Appointment, CashEntry, Client, Doctor, FiscalJob, Offer, OfferItem, Payment, Prescription, Sale, Service, StockItem, StockMovement, StockSupplier, SyncQueueItem, Visit, VisitItem, DoctorAccount,
 };
 use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 
@@ -272,6 +272,20 @@ impl SyncEngine {
             .context("pull offer_items")?;
         for it in offer_items {
             self.apply_remote_row_offer_items(&it)?;
+        }
+
+        let fjobs: Vec<FiscalJob> = self
+            .fetch_table(base, api_key, "fiscal_jobs", last_sync_time, clinic_id)
+            .await
+            .context("pull fiscal_jobs")?;
+        for r in fjobs {
+            if let Some(local_ts) = self.db.row_updated_at("fiscal_jobs", &r.id)? {
+                if newer_or_equal(&local_ts, &r.updated_at)? {
+                    continue;
+                }
+            }
+            self.db.sync_queue_drop_pending_for_row("fiscal_jobs", &r.id)?;
+            self.db.apply_remote_fiscal_job(&r)?;
         }
 
         let prescriptions: Vec<Prescription> = self

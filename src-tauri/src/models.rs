@@ -606,3 +606,17 @@ pub struct Prescription {
     #[serde(default)]
     pub deleted: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FiscalJob {
+    pub id: String,
+    pub sale_id: String,
+    pub status: String, // pending | done | failed | cancelled
+    pub requested_by: String,
+    pub error: Option<String>,
+    pub processed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub deleted: i64,
+}

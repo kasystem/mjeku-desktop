@@ -284,6 +284,18 @@ CREATE TABLE IF NOT EXISTS offers (
   deleted_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS fiscal_jobs (
+  id TEXT PRIMARY KEY,
+  sale_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  requested_by TEXT NOT NULL DEFAULT '',
+  error TEXT,
+  processed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS prescriptions (
   id TEXT PRIMARY KEY,
   visit_id TEXT,
@@ -708,6 +720,7 @@ impl Db {
         // Only whitelisted tables — table name is never user input.
         let sql = match table {
             "prescriptions" => "SELECT updated_at FROM prescriptions WHERE id=?1",
+            "fiscal_jobs" => "SELECT updated_at FROM fiscal_jobs WHERE id=?1",
             "stock_suppliers" => "SELECT updated_at FROM stock_suppliers WHERE id=?1",
             "stock_items" => "SELECT updated_at FROM stock_items WHERE id=?1",
             _ => return Ok(None),
@@ -5308,6 +5321,72 @@ impl Db {
         )?;
         let payload = serde_json::to_string(m)?;
         Self::queue_replace_pending_conn(&conn, "stock_movements", &m.id, "upsert", &payload, &now_iso())?;
+        Ok(())
+    }
+
+    pub fn fiscal_jobs_list(&self, status: Option<String>) -> anyhow::Result<Vec<crate::models::FiscalJob>> {
+        let conn = self.conn()?;
+        let mut sql = String::from(
+            "SELECT id, sale_id, status, requested_by, error, processed_at, created_at, updated_at, deleted
+             FROM fiscal_jobs WHERE deleted=0",
+        );
+        let mut args: Vec<String> = Vec::new();
+        if let Some(st) = status.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+            args.push(st.to_string());
+            sql.push_str(" AND status=?1");
+        }
+        sql.push_str(" ORDER BY created_at ASC LIMIT 300");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            Ok(crate::models::FiscalJob {
+                id: r.get(0)?, sale_id: r.get(1)?, status: r.get(2)?, requested_by: r.get(3)?,
+                error: r.get(4)?, processed_at: r.get(5)?, created_at: r.get(6)?,
+                updated_at: r.get(7)?, deleted: r.get(8)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn fiscal_job_upsert(&self, row: &crate::models::FiscalJob) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO fiscal_jobs (id, sale_id, status, requested_by, error, processed_at, created_at, updated_at, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET sale_id=excluded.sale_id, status=excluded.status,
+               requested_by=excluded.requested_by, error=excluded.error, processed_at=excluded.processed_at,
+               updated_at=excluded.updated_at, deleted=excluded.deleted",
+            params![row.id, row.sale_id, row.status, row.requested_by, row.error, row.processed_at, row.created_at, row.updated_at, row.deleted],
+        )?;
+        let payload = serde_json::to_string(row)?;
+        Self::queue_replace_pending_conn(&conn, "fiscal_jobs", &row.id, "upsert", &payload, &now_iso())?;
+        Ok(())
+    }
+
+    pub fn fiscal_job_get(&self, id: &str) -> anyhow::Result<Option<crate::models::FiscalJob>> {
+        let conn = self.conn()?;
+        let r = conn.query_row(
+            "SELECT id, sale_id, status, requested_by, error, processed_at, created_at, updated_at, deleted
+             FROM fiscal_jobs WHERE id=?1",
+            params![id],
+            |r| Ok(crate::models::FiscalJob {
+                id: r.get(0)?, sale_id: r.get(1)?, status: r.get(2)?, requested_by: r.get(3)?,
+                error: r.get(4)?, processed_at: r.get(5)?, created_at: r.get(6)?,
+                updated_at: r.get(7)?, deleted: r.get(8)?,
+            }),
+        ).optional()?;
+        Ok(r)
+    }
+
+    pub fn apply_remote_fiscal_job(&self, r: &crate::models::FiscalJob) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO fiscal_jobs (id, sale_id, status, requested_by, error, processed_at, created_at, updated_at, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET sale_id=excluded.sale_id, status=excluded.status,
+               requested_by=excluded.requested_by, error=excluded.error, processed_at=excluded.processed_at,
+               created_at=excluded.created_at, updated_at=excluded.updated_at, deleted=excluded.deleted",
+            params![r.id, r.sale_id, r.status, r.requested_by, r.error, r.processed_at, r.created_at, r.updated_at, r.deleted],
+        )?;
         Ok(())
     }
 

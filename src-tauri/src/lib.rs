@@ -2467,6 +2467,136 @@ async fn visit_export_pdf(
     .map_err(err_string)?
 }
 
+fn fiscal_job_process_inner(db: &Db, job: &crate::models::FiscalJob) -> Result<(), String> {
+    let provider_raw = db
+        .setting_get(FISCAL_PRINTER_PROVIDER_KEY)
+        .map_err(err_string)?
+        .unwrap_or_default();
+    let provider = normalize_fiscal_printer_provider(&provider_raw)
+        .unwrap_or_else(|| provider_raw.trim().to_ascii_lowercase());
+    if provider != "enternet" && provider != "global_eu" {
+        return Err("Provideri fiskal i këtij kompjuteri nuk është Enternet/Global EU".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    let out_dir = std::path::PathBuf::from(r"C:\Temp");
+    #[cfg(not(target_os = "windows"))]
+    return Err("Fiskalizimi i radhës bëhet vetëm nga kompjuteri i klinikës".to_string());
+    #[cfg(target_os = "windows")]
+    {
+        db.fiscal_receipt_generate_inp(&job.sale_id, &out_dir, true)
+            .map_err(err_string)?;
+        Ok(())
+    }
+}
+
+fn fiscal_job_mark(db: &Db, job: &crate::models::FiscalJob, status: &str, error: Option<String>) -> anyhow::Result<()> {
+    let now = crate::util::now_iso();
+    let mut row = job.clone();
+    row.status = status.to_string();
+    row.error = error;
+    row.processed_at = if status == "done" { Some(now.clone()) } else { row.processed_at.clone() };
+    row.updated_at = now;
+    db.fiscal_job_upsert(&row)
+}
+
+const FISCAL_JOB_AUTO_MAX_AGE_SECS: i64 = 2 * 3600; // 2 orë — më të vjetrat kërkojnë aprovim manual
+
+fn fiscal_job_age_secs(created_at: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds())
+        .unwrap_or(i64::MAX)
+}
+
+#[tauri::command]
+async fn fiscal_jobs_list(
+    state: tauri::State<'_, AppState>,
+    status: Option<String>,
+) -> Result<Vec<crate::models::FiscalJob>, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.fiscal_jobs_list(status))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
+#[tauri::command]
+async fn fiscal_job_create(
+    state: tauri::State<'_, AppState>,
+    sale_id: String,
+) -> Result<crate::models::FiscalJob, String> {
+    let session = require_login(&state).await?;
+    let sale_id = sale_id.trim().to_string();
+    if sale_id.is_empty() {
+        return Err("sale_id eshte i detyrueshem".to_string());
+    }
+    let requested_by = match &session {
+        SessionKind::Doctor { doctor_id, .. } => format!("mjeku:{doctor_id}"),
+        _ => "perdorues".to_string(),
+    };
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<crate::models::FiscalJob> {
+        let now = crate::util::now_iso();
+        let row = crate::models::FiscalJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            sale_id,
+            status: "pending".to_string(),
+            requested_by,
+            error: None,
+            processed_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deleted: 0,
+        };
+        db.fiscal_job_upsert(&row)?;
+        Ok(row)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn fiscal_job_cancel(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if let Some(job) = db.fiscal_job_get(&id)? {
+            if job.status == "pending" {
+                fiscal_job_mark(&db, &job, "cancelled", None)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn fiscal_job_process(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let job = db
+            .fiscal_job_get(&id)
+            .map_err(err_string)?
+            .ok_or_else(|| "Job-i nuk u gjet".to_string())?;
+        if job.status != "pending" && job.status != "failed" {
+            return Err(format!("Job-i është '{}'", job.status));
+        }
+        match fiscal_job_process_inner(&db, &job) {
+            Ok(()) => fiscal_job_mark(&db, &job, "done", None).map_err(err_string),
+            Err(e) => {
+                let _ = fiscal_job_mark(&db, &job, "failed", Some(e.clone()));
+                Err(e)
+            }
+        }
+    })
+    .await
+    .map_err(err_string)?
+}
+
 #[tauri::command]
 async fn prescriptions_list(
     state: tauri::State<'_, AppState>,
@@ -3388,6 +3518,36 @@ pub fn run() {
             UpdatesEngine::ensure_seed_installed(&handle)?;
 
             sync.clone().spawn_background();
+
+            // Procesori i radhës fiskale: çdo 15s proceson job-et 'pending' më të reja se 2 orë.
+            // Më të vjetrat presin aprovim manual te Sporteli (mbrojtje nga printimet aksidentale).
+            #[cfg(all(desktop, target_os = "windows"))]
+            {
+                let db_fj = db.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(15));
+                    loop {
+                        tick.tick().await;
+                        let db2 = db_fj.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let jobs = match db2.fiscal_jobs_list(Some("pending".to_string())) {
+                                Ok(j) => j,
+                                Err(_) => return,
+                            };
+                            for job in jobs {
+                                if fiscal_job_age_secs(&job.created_at) > FISCAL_JOB_AUTO_MAX_AGE_SECS {
+                                    continue; // kërkon aprovim manual
+                                }
+                                match fiscal_job_process_inner(&db2, &job) {
+                                    Ok(()) => { let _ = fiscal_job_mark(&db2, &job, "done", None); }
+                                    Err(e) => { let _ = fiscal_job_mark(&db2, &job, "failed", Some(e)); }
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                });
+            }
             updates.clone().spawn_background(handle.clone());
             license.clone().spawn_background();
             {
@@ -3523,6 +3683,10 @@ pub fn run() {
             visit_export_pdf,
             prescription_export_pdf,
             prescriptions_list,
+            fiscal_jobs_list,
+            fiscal_job_create,
+            fiscal_job_cancel,
+            fiscal_job_process,
             prescriptions_delete,
             error_logs_list,
             error_logs_clear,
