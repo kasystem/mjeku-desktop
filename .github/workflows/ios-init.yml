@@ -63,6 +63,13 @@ jobs:
               /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string Mjeku përdor kamerën për të shtuar foto Para/Pas te kartela e pacientit." "$plist"
             /usr/libexec/PlistBuddy -c "Set :NSPhotoLibraryUsageDescription Mjeku përdor galerinë e fotove për të bashkangjitur foto te kartela e pacientit." "$plist" 2>/dev/null || \
               /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string Mjeku përdor galerinë e fotove për të bashkangjitur foto te kartela e pacientit." "$plist"
+            # Bën të dukshëm folderin Documents të app-it te Files → "On My iPhone" — pa
+            # këto dy çelësa, PDF-të e eksportuara (fatura/receta) mbeten të fshehura brenda
+            # sandbox-it dhe përdoruesi s'ka asnjë mënyrë t'i hapë/printojë nga iOS.
+            /usr/libexec/PlistBuddy -c "Set :UIFileSharingEnabled true" "$plist" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$plist"
+            /usr/libexec/PlistBuddy -c "Set :LSSupportsOpeningDocumentsInPlace true" "$plist" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$plist"
           done < <(find mjeku-desktop/src-tauri/gen/apple -name "Info.plist" -not -path "*/Pods/*")
           if [ "$found" -eq 0 ]; then
             echo "::warning::Asnjë Info.plist nuk u gjet nën gen/apple — kontrollo strukturën e projektit."
