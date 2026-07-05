@@ -1,0 +1,84 @@
+# Gjeneron projektin Xcode (src-tauri/gen/apple) në një macOS runner të GitHub
+# dhe e commit-on në repo — pa pasur nevojë për Mac lokal.
+# Pas kësaj, Xcode Cloud mund të lidhet me .xcodeproj dhe të gjenerojë .ipa.
+#
+# Nisja: GitHub → Actions → "iOS init (gjenero projektin Xcode)" → Run workflow
+name: iOS init (gjenero projektin Xcode)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ios-init:
+    runs-on: macos-14
+    steps:
+      - name: Checkout mjeku-desktop
+        uses: actions/checkout@v4
+        with:
+          path: mjeku-desktop
+
+      - name: Checkout mjeku-ui (repo simotër)
+        uses: actions/checkout@v4
+        with:
+          repository: kasystem/mjeku-ui
+          token: ${{ secrets.MJEKU_UI_TOKEN || github.token }}
+          path: mjeku-ui
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust + iOS targets
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Instalimi i varësive
+        run: |
+          cd mjeku-ui && npm ci
+          cd ../mjeku-desktop && npm ci
+
+      - name: Build UI + seed (kërkohet nga tauri.conf beforeBuild)
+        run: |
+          cd mjeku-ui && npm run build
+          cd ../mjeku-desktop && node scripts/prepare_ui_seed.mjs
+
+      - name: tauri ios init
+        run: |
+          cd mjeku-desktop
+          npx tauri ios init
+
+      - name: Shto lejet Camera/Photo Library (për Foto Para/Pas)
+        run: |
+          set -e
+          found=0
+          while IFS= read -r plist; do
+            found=1
+            echo "Patching $plist"
+            /usr/libexec/PlistBuddy -c "Set :NSCameraUsageDescription Mjeku përdor kamerën për të shtuar foto Para/Pas te kartela e pacientit." "$plist" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string Mjeku përdor kamerën për të shtuar foto Para/Pas te kartela e pacientit." "$plist"
+            /usr/libexec/PlistBuddy -c "Set :NSPhotoLibraryUsageDescription Mjeku përdor galerinë e fotove për të bashkangjitur foto te kartela e pacientit." "$plist" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string Mjeku përdor galerinë e fotove për të bashkangjitur foto te kartela e pacientit." "$plist"
+          done < <(find mjeku-desktop/src-tauri/gen/apple -name "Info.plist" -not -path "*/Pods/*")
+          if [ "$found" -eq 0 ]; then
+            echo "::warning::Asnjë Info.plist nuk u gjet nën gen/apple — kontrollo strukturën e projektit."
+          fi
+
+      - name: Vendos ci_scripts për Xcode Cloud
+        run: |
+          mkdir -p mjeku-desktop/src-tauri/gen/apple/ci_scripts
+          cp mjeku-desktop/ci_scripts/ci_post_clone.sh mjeku-desktop/src-tauri/gen/apple/ci_scripts/
+          chmod +x mjeku-desktop/src-tauri/gen/apple/ci_scripts/ci_post_clone.sh
+
+      - name: Commit gen/apple në repo
+        run: |
+          cd mjeku-desktop
+          git config user.name "kasystem"
+          git config user.email "fatlindmazreku07@gmail.com"
+          git add -f src-tauri/gen/apple
+          git commit -m "feat(ios): projekti Xcode i gjeneruar nga tauri ios init (për Xcode Cloud)" || echo "Asgjë për commit"
+          git push

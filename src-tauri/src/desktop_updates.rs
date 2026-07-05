@@ -148,6 +148,13 @@ pub fn open_external(url: &str) -> anyhow::Result<()> {
     if u.is_empty() {
         bail!("url is empty");
     }
-    open::that(u).context("open external url")?;
-    Ok(())
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        open::that(u).context("open external url")?;
+        Ok(())
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        anyhow::bail!("Hapja e linqeve të jashtme nuk mbështetet në mobile: {u}")
+    }
 }
