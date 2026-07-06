@@ -50,30 +50,10 @@ jobs:
       - name: tauri ios init
         run: |
           cd mjeku-desktop
-          npx tauri ios init
+          npx tauri ios init --ci
 
       - name: Shto lejet Camera/Photo Library (për Foto Para/Pas)
-        run: |
-          set -e
-          found=0
-          while IFS= read -r plist; do
-            found=1
-            echo "Patching $plist"
-            /usr/libexec/PlistBuddy -c "Set :NSCameraUsageDescription Mjeku përdor kamerën për të shtuar foto Para/Pas te kartela e pacientit." "$plist" 2>/dev/null || \
-              /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string Mjeku përdor kamerën për të shtuar foto Para/Pas te kartela e pacientit." "$plist"
-            /usr/libexec/PlistBuddy -c "Set :NSPhotoLibraryUsageDescription Mjeku përdor galerinë e fotove për të bashkangjitur foto te kartela e pacientit." "$plist" 2>/dev/null || \
-              /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string Mjeku përdor galerinë e fotove për të bashkangjitur foto te kartela e pacientit." "$plist"
-            # Bën të dukshëm folderin Documents të app-it te Files → "On My iPhone" — pa
-            # këto dy çelësa, PDF-të e eksportuara (fatura/receta) mbeten të fshehura brenda
-            # sandbox-it dhe përdoruesi s'ka asnjë mënyrë t'i hapë/printojë nga iOS.
-            /usr/libexec/PlistBuddy -c "Set :UIFileSharingEnabled true" "$plist" 2>/dev/null || \
-              /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$plist"
-            /usr/libexec/PlistBuddy -c "Set :LSSupportsOpeningDocumentsInPlace true" "$plist" 2>/dev/null || \
-              /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$plist"
-          done < <(find mjeku-desktop/src-tauri/gen/apple -name "Info.plist" -not -path "*/Pods/*")
-          if [ "$found" -eq 0 ]; then
-            echo "::warning::Asnjë Info.plist nuk u gjet nën gen/apple — kontrollo strukturën e projektit."
-          fi
+        run: bash mjeku-desktop/ci_scripts/patch_ios_plist.sh mjeku-desktop/src-tauri/gen/apple
 
       - name: Vendos ci_scripts për Xcode Cloud
         run: |

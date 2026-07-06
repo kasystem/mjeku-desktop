@@ -1,0 +1,92 @@
+# Ndërton .ipa drejtpërdrejt në GitHub Actions (macOS runner), pa Xcode Cloud.
+# Gjeneron projektin Xcode në fluturim (`tauri ios init --ci`) — nuk e commit-on,
+# ndryshe nga ios-init.yml (i cili ekziston veç e veç për rrugën Xcode Cloud).
+#
+# Kërkon 3 GitHub Secrets (Settings → Secrets and variables → Actions):
+#   IOS_CERTIFICATE           base64 i certifikatës "Apple Distribution" (.p12)
+#   IOS_CERTIFICATE_PASSWORD  fjalëkalimi i vendosur kur u eksportua .p12-ja
+#   IOS_MOBILE_PROVISION      base64 i provisioning profile-it (.mobileprovision)
+#                             për bundle id "com.mjeku.desktop"
+# Nëse mjeku-ui është repo privat, duhet edhe:
+#   MJEKU_UI_TOKEN            PAT me lexim te kasystem/mjeku-ui
+#
+# Si të prodhosh vlerat base64 (macOS/Linux): base64 -i Certificate.p12 | pbcopy
+# Si të prodhosh vlerat base64 (Windows PowerShell):
+#   [Convert]::ToBase64String([IO.File]::ReadAllBytes("Certificate.p12")) | Set-Clipboard
+#
+# Nisja: GitHub → Actions → "iOS build (.ipa)" → Run workflow
+name: iOS build (.ipa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: "Metoda e exportit"
+        required: false
+        default: "release-testing"
+        type: choice
+        options:
+          - release-testing
+          - app-store-connect
+          - debugging
+
+jobs:
+  ios-build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout mjeku-desktop
+        uses: actions/checkout@v4
+        with:
+          path: mjeku-desktop
+
+      - name: Checkout mjeku-ui (repo simotër)
+        uses: actions/checkout@v4
+        with:
+          repository: kasystem/mjeku-ui
+          token: ${{ secrets.MJEKU_UI_TOKEN || github.token }}
+          path: mjeku-ui
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust + iOS targets
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Instalimi i varësive
+        run: |
+          cd mjeku-ui && npm ci
+          cd ../mjeku-desktop && npm ci
+
+      - name: Build UI + seed (kërkohet nga tauri.conf beforeBuild)
+        run: |
+          cd mjeku-ui && npm run build
+          cd ../mjeku-desktop && node scripts/prepare_ui_seed.mjs
+
+      - name: tauri ios init
+        working-directory: mjeku-desktop
+        run: npx tauri ios init --ci
+
+      - name: Shto lejet Camera/Photo Library + File Sharing te Info.plist
+        run: bash mjeku-desktop/ci_scripts/patch_ios_plist.sh mjeku-desktop/src-tauri/gen/apple
+
+      - name: tauri ios build (.ipa)
+        working-directory: mjeku-desktop
+        env:
+          CI: true
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+        run: >
+          npx tauri ios build --ci --target aarch64
+          --export-method ${{ github.event.inputs.export_method || 'release-testing' }}
+
+      - name: Ngarko .ipa si artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mjeku-ios-ipa
+          path: mjeku-desktop/src-tauri/gen/apple/build/arm64/*.ipa
+          if-no-files-found: error
