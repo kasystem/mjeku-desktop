@@ -2279,8 +2279,6 @@ async fn invoice_export_pdf(
     #[cfg(mobile)]
     let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
     tokio::task::spawn_blocking(move || {
-        use base64::{engine::general_purpose, Engine as _};
-
         let pdf_bytes = build_invoice_pdf_bytes_inner(&db, &data_dir, &sale_id, fiscal_only)?;
 
         let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
@@ -2288,7 +2286,7 @@ async fn invoice_export_pdf(
         let out_path = out_dir.join(format!("Fature-{}.pdf", sale_id));
         std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
 
-        Ok(general_purpose::STANDARD.encode(pdf_bytes))
+        Ok(out_path.display().to_string())
     })
     .await
     .map_err(err_string)?
@@ -2317,8 +2315,6 @@ async fn visit_export_pdf(
     #[cfg(mobile)]
     let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
     tokio::task::spawn_blocking(move || {
-        use base64::{engine::general_purpose, Engine as _};
-
         let clinic_name = db
             .setting_get("clinic_name")
             .map_err(err_string)?
@@ -2461,7 +2457,7 @@ async fn visit_export_pdf(
         let out_path = out_dir.join(format!("Vizite-{}.pdf", visit.id));
         std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
 
-        Ok(general_purpose::STANDARD.encode(pdf_bytes))
+        Ok(out_path.display().to_string())
     })
     .await
     .map_err(err_string)?
@@ -2656,8 +2652,6 @@ async fn prescription_export_pdf(
     let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
 
     tokio::task::spawn_blocking(move || {
-        use base64::{engine::general_purpose, Engine as _};
-
         let clinic_name = db
             .setting_get("clinic_name")
             .map_err(err_string)?
@@ -2781,7 +2775,7 @@ async fn prescription_export_pdf(
         let out_path = out_dir.join(format!("{}.pdf", file_tag));
         std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
 
-        Ok(general_purpose::STANDARD.encode(pdf_bytes))
+        Ok(out_path.display().to_string())
     })
     .await
     .map_err(err_string)?
@@ -2834,8 +2828,6 @@ async fn regular_invoice_create(
     let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
 
     tokio::task::spawn_blocking(move || {
-        use base64::{engine::general_purpose, Engine as _};
-
         let clinic_name = db
             .setting_get("clinic_name")
             .ok()
@@ -2944,9 +2936,6 @@ async fn regular_invoice_create(
             Some(&filename),
             &now,
         ).map_err(err_string)?;
-
-        // Also return base64 for optional download in UI.
-        let _b64 = general_purpose::STANDARD.encode(&pdf_bytes);
 
         Ok(crate::models::RegularInvoice {
             id,
@@ -3259,8 +3248,21 @@ async fn offer_set_status(
 }
 
 #[tauri::command]
-async fn offer_pdf(state: tauri::State<'_, AppState>, offer_id: String) -> Result<String, String> {
+async fn offer_pdf(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    offer_id: String,
+) -> Result<String, String> {
     let _ = require_finance(&state).await?;
+    #[cfg(desktop)]
+    let desktop_dir = app.path().desktop_dir().ok();
+    #[cfg(mobile)]
+    let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!(e))
+        .map_err(err_string)?;
     let db = state.db.clone();
     let oid = offer_id.clone();
     let offer = tokio::task::spawn_blocking(move || db.offer_get(&oid))
@@ -3319,6 +3321,15 @@ async fn offer_pdf(state: tauri::State<'_, AppState>, offer_id: String) -> Resul
     };
 
     let pdf_bytes = crate::invoice::generate_offer_pdf(&pdf_data).map_err(err_string)?;
+
+    // Ruaje gjithmone ne disk (Desktop/Documents) qe eksporti te funksionoje edhe
+    // ne native mobile, ku shkarkimi permes Blob ne WebView s'eshte i besueshem.
+    // Kthimi mbetet base64: `print()` ne OffersPage.tsx e perdor per parapamje ne blob.
+    let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
+    std::fs::create_dir_all(&out_dir).map_err(err_string)?;
+    let out_path = out_dir.join(format!("Oferta-{}.pdf", offer.offer_number.replace('/', "-")));
+    std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
+
     Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pdf_bytes))
 }
 
