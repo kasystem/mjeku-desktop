@@ -2250,6 +2250,34 @@ async fn history_reset_all(state: tauri::State<'_, AppState>) -> Result<(), Stri
         .map_err(err_string)
 }
 
+// Ne mobile, document_dir() shkon te nje dosje private e app-it (Android/data/<pkg>/files/Documents)
+// qe Android 11+ e fsheh nga app-i standard "Files" (scoped storage). Prandaj ketu hapim save-dialog-un
+// nativ (SAF) qe useri te zgjedhe vete vendin — skedari garantohet i dukshem pas kesaj.
+#[cfg(mobile)]
+fn save_pdf_via_dialog(app: &tauri::AppHandle, default_name: &str, pdf_bytes: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    use tauri_plugin_dialog::DialogExt;
+    use tauri_plugin_fs::FsExt;
+
+    let chosen = app
+        .dialog()
+        .file()
+        .set_file_name(default_name)
+        .add_filter("PDF", &["pdf"])
+        .blocking_save_file()
+        .ok_or_else(|| "Eksportimi u anulua".to_string())?;
+
+    let mut opts = tauri_plugin_fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    let mut file = app.fs().open(chosen.clone(), opts).map_err(|e| e.to_string())?;
+    file.write_all(pdf_bytes).map_err(|e| e.to_string())?;
+
+    Ok(chosen
+        .as_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| default_name.to_string()))
+}
+
 #[tauri::command]
 async fn invoice_export_pdf(
     app: tauri::AppHandle,
@@ -2277,16 +2305,22 @@ async fn invoice_export_pdf(
     #[cfg(desktop)]
     let desktop_dir = app.path().desktop_dir().ok();
     #[cfg(mobile)]
-    let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
+    let app_for_save = app.clone();
     tokio::task::spawn_blocking(move || {
         let pdf_bytes = build_invoice_pdf_bytes_inner(&db, &data_dir, &sale_id, fiscal_only)?;
 
-        let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
-        std::fs::create_dir_all(&out_dir).map_err(err_string)?;
-        let out_path = out_dir.join(format!("Fature-{}.pdf", sale_id));
-        std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
-
-        Ok(out_path.display().to_string())
+        #[cfg(mobile)]
+        {
+            return save_pdf_via_dialog(&app_for_save, &format!("Fature-{}.pdf", sale_id), &pdf_bytes);
+        }
+        #[cfg(desktop)]
+        {
+            let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
+            std::fs::create_dir_all(&out_dir).map_err(err_string)?;
+            let out_path = out_dir.join(format!("Fature-{}.pdf", sale_id));
+            std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
+            Ok(out_path.display().to_string())
+        }
     })
     .await
     .map_err(err_string)?
@@ -2313,7 +2347,7 @@ async fn visit_export_pdf(
     #[cfg(desktop)]
     let desktop_dir = app.path().desktop_dir().ok();
     #[cfg(mobile)]
-    let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
+    let app_for_save = app.clone();
     tokio::task::spawn_blocking(move || {
         let clinic_name = db
             .setting_get("clinic_name")
@@ -2452,12 +2486,18 @@ async fn visit_export_pdf(
 
         let pdf_bytes = crate::invoice::render_visit_pdf(&data).map_err(err_string)?;
 
-        let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
-        std::fs::create_dir_all(&out_dir).map_err(err_string)?;
-        let out_path = out_dir.join(format!("Vizite-{}.pdf", visit.id));
-        std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
-
-        Ok(out_path.display().to_string())
+        #[cfg(mobile)]
+        {
+            return save_pdf_via_dialog(&app_for_save, &format!("Vizite-{}.pdf", visit.id), &pdf_bytes);
+        }
+        #[cfg(desktop)]
+        {
+            let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
+            std::fs::create_dir_all(&out_dir).map_err(err_string)?;
+            let out_path = out_dir.join(format!("Vizite-{}.pdf", visit.id));
+            std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
+            Ok(out_path.display().to_string())
+        }
     })
     .await
     .map_err(err_string)?
@@ -2649,7 +2689,7 @@ async fn prescription_export_pdf(
     #[cfg(desktop)]
     let desktop_dir = app.path().desktop_dir().ok();
     #[cfg(mobile)]
-    let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
+    let app_for_save = app.clone();
 
     tokio::task::spawn_blocking(move || {
         let clinic_name = db
@@ -2770,12 +2810,18 @@ async fn prescription_export_pdf(
 
         let pdf_bytes = crate::invoice::render_prescription_pdf(&data).map_err(err_string)?;
 
-        let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
-        std::fs::create_dir_all(&out_dir).map_err(err_string)?;
-        let out_path = out_dir.join(format!("{}.pdf", file_tag));
-        std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
-
-        Ok(out_path.display().to_string())
+        #[cfg(mobile)]
+        {
+            return save_pdf_via_dialog(&app_for_save, &format!("{}.pdf", file_tag), &pdf_bytes);
+        }
+        #[cfg(desktop)]
+        {
+            let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
+            std::fs::create_dir_all(&out_dir).map_err(err_string)?;
+            let out_path = out_dir.join(format!("{}.pdf", file_tag));
+            std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
+            Ok(out_path.display().to_string())
+        }
     })
     .await
     .map_err(err_string)?
@@ -3256,8 +3302,7 @@ async fn offer_pdf(
     let _ = require_finance(&state).await?;
     #[cfg(desktop)]
     let desktop_dir = app.path().desktop_dir().ok();
-    #[cfg(mobile)]
-    let desktop_dir: Option<PathBuf> = app.path().document_dir().ok();
+    #[cfg(desktop)]
     let data_dir = app
         .path()
         .app_data_dir()
@@ -3322,13 +3367,25 @@ async fn offer_pdf(
 
     let pdf_bytes = crate::invoice::generate_offer_pdf(&pdf_data).map_err(err_string)?;
 
-    // Ruaje gjithmone ne disk (Desktop/Documents) qe eksporti te funksionoje edhe
-    // ne native mobile, ku shkarkimi permes Blob ne WebView s'eshte i besueshem.
-    // Kthimi mbetet base64: `print()` ne OffersPage.tsx e perdor per parapamje ne blob.
-    let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
-    std::fs::create_dir_all(&out_dir).map_err(err_string)?;
-    let out_path = out_dir.join(format!("Oferta-{}.pdf", offer.offer_number.replace('/', "-")));
-    std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
+    // Ruaje gjithmone ne disk qe eksporti te funksionoje edhe ne native mobile, ku
+    // shkarkimi permes Blob ne WebView s'eshte i besueshem. Kthimi mbetet base64:
+    // `print()` ne OffersPage.tsx e perdor per parapamje ne blob.
+    #[cfg(desktop)]
+    {
+        let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
+        std::fs::create_dir_all(&out_dir).map_err(err_string)?;
+        let out_path = out_dir.join(format!("Oferta-{}.pdf", offer.offer_number.replace('/', "-")));
+        std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
+    }
+    #[cfg(mobile)]
+    {
+        let app_for_save = app.clone();
+        let pdf_bytes2 = pdf_bytes.clone();
+        let file_name = format!("Oferta-{}.pdf", offer.offer_number.replace('/', "-"));
+        let _ = tokio::task::spawn_blocking(move || save_pdf_via_dialog(&app_for_save, &file_name, &pdf_bytes2))
+            .await
+            .map_err(err_string)?;
+    }
 
     Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pdf_bytes))
 }
@@ -3443,6 +3500,8 @@ async fn client_photo_delete(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .register_uri_scheme_protocol("mjeku", ui_protocol::handle)
         .setup(|app| {
             #[cfg(desktop)]
