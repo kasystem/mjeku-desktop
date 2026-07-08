@@ -12,11 +12,15 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: mjeku-desktop
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: mjeku-desktop
+      - uses: actions/checkout@v4
+        with:
+          repository: kasystem/mjeku-ui
+          token: ${{ secrets.MJEKU_UI_TOKEN || github.token }}
+          path: mjeku-ui
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -24,8 +28,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: npm install
-      - run: npm --prefix ../mjeku-ui install
+        working-directory: mjeku-desktop
+      - run: npm install
+        working-directory: mjeku-ui
       - run: npm run cargo:fmt
+        working-directory: mjeku-desktop
       - run: npm run cargo:clippy
+        working-directory: mjeku-desktop
       - run: npm run cargo:test
+        working-directory: mjeku-desktop
       - run: npm run tauri:build
+        working-directory: mjeku-desktop
