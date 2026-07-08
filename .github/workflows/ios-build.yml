@@ -43,10 +43,12 @@ jobs:
   ios-build:
     runs-on: macos-15
     steps:
-      - name: DEBUG liston versionet Xcode ne dispozicion
+      # Apple kerkon SDK iOS 26+ (Xcode 26+) per te ngarkuar ne App Store Connect —
+      # macos-15 runner e ka Xcode 16.4 si default, por Xcode 26.x eshte i instaluar
+      # gjithashtu (thjesht jo i zgjedhur). E zgjedhim eksplicit.
+      - name: Zgjidh Xcode 26
         run: |
-          ls /Applications | grep -i xcode
-          echo "---aktual (xcode-select)---"
+          sudo xcode-select -s /Applications/Xcode_26.3.app
           xcode-select -p
 
       - name: Checkout mjeku-desktop
