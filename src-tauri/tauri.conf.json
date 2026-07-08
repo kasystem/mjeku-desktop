@@ -45,7 +45,7 @@
       }
     },
     "iOS": {
-      "minimumSystemVersion": "15.0"
+      "minimumSystemVersion": "16.0"
     }
   },
   "plugins": {
