@@ -91,6 +91,31 @@ jobs:
           echo "Profili u instalua:"
           security cms -D -i ~/Library/MobileDevice/Provisioning\ Profiles/mjeku.mobileprovision | grep -A1 "UUID\|application-identifier\|<key>Name"
 
+      # `tauri ios build -- ARGS` i kalon argumentet te cargo, JO te xcodebuild — pra
+      # CODE_SIGN_STYLE/PROVISIONING_PROFILE_SPECIFIER s'mund t'i kalojme si CLI args.
+      # Modifikojme direkt .xcodeproj-in e gjeneruar (permes gem-it Ruby `xcodeproj`,
+      # i disponueshem nga CocoaPods) qe te detyroje Manual signing per te gjitha
+      # target-et/config-et — keshtu Tauri vete e perdor kete kur therret xcodebuild.
+      - name: Detyro Manual code signing ne .xcodeproj
+        run: |
+          gem list -i xcodeproj || gem install xcodeproj --no-document
+          ruby -e '
+            require "xcodeproj"
+            path = "mjeku-desktop/src-tauri/gen/apple/mjeku_desktop.xcodeproj"
+            project = Xcodeproj::Project.open(path)
+            project.targets.each do |target|
+              target.build_configurations.each do |config|
+                config.build_settings["CODE_SIGN_STYLE"] = "Manual"
+                config.build_settings["DEVELOPMENT_TEAM"] = "79HPB8A463"
+                config.build_settings["PROVISIONING_PROFILE_SPECIFIER"] = "Mjeku App Store"
+                config.build_settings["CODE_SIGN_IDENTITY"] = "Apple Distribution"
+                config.build_settings["CODE_SIGN_IDENTITY[sdk=iphoneos*]"] = "Apple Distribution"
+              end
+            end
+            project.save
+            puts "Signing i detyruar (Manual) per #{project.targets.map(&:name).join(", ")}"
+          '
+
       - name: tauri ios build (.ipa)
         working-directory: mjeku-desktop
         env:
@@ -102,10 +127,6 @@ jobs:
         run: >
           npx tauri ios build --ci --target aarch64
           --export-method ${{ github.event.inputs.export_method || 'release-testing' }}
-          -- CODE_SIGN_STYLE=Manual
-          PROVISIONING_PROFILE_SPECIFIER="Mjeku App Store"
-          DEVELOPMENT_TEAM=79HPB8A463
-          CODE_SIGN_IDENTITY="Apple Distribution"
 
       - name: Ngarko .ipa si artifact
         uses: actions/upload-artifact@v4
