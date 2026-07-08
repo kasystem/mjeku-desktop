@@ -72,6 +72,8 @@ jobs:
 
       - name: tauri ios init
         working-directory: mjeku-desktop
+        env:
+          APPLE_DEVELOPMENT_TEAM: "79HPB8A463"
         run: npx tauri ios init --ci
 
       - name: Shto lejet Camera/Photo Library + File Sharing te Info.plist
@@ -81,6 +83,7 @@ jobs:
         working-directory: mjeku-desktop
         env:
           CI: true
+          APPLE_DEVELOPMENT_TEAM: "79HPB8A463"
           IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
           IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
