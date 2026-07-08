@@ -10,6 +10,11 @@
 # Nëse mjeku-ui është repo privat, duhet edhe:
 #   MJEKU_UI_TOKEN            PAT me lexim te kasystem/mjeku-ui
 #
+# Për ngarkim automatik në TestFlight (kur export_method = app-store-connect):
+#   APP_STORE_CONNECT_KEY_ID       Key ID nga App Store Connect → Users and Access → Integrations
+#   APP_STORE_CONNECT_ISSUER_ID    Issuer ID (i njëjti për të gjithë çelësat)
+#   APP_STORE_CONNECT_API_KEY_P8   base64 i skedarit AuthKey_<KEYID>.p8 (shkarkohet 1 herë)
+#
 # Si të prodhosh vlerat base64 (macOS/Linux): base64 -i Certificate.p12 | pbcopy
 # Si të prodhosh vlerat base64 (Windows PowerShell):
 #   [Convert]::ToBase64String([IO.File]::ReadAllBytes("Certificate.p12")) | Set-Clipboard
@@ -134,3 +139,22 @@ jobs:
           name: mjeku-ios-ipa
           path: mjeku-desktop/src-tauri/gen/apple/build/arm64/*.ipa
           if-no-files-found: error
+
+      # Vetem kur eksportohet per App Store Connect (jo per release-testing/debugging
+      # lokal) — ngarkon .ipa-ne direkt ne TestFlight permes App Store Connect API,
+      # pa Mac/Transporter. Kerkon 3 GitHub Secrets: APP_STORE_CONNECT_KEY_ID,
+      # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_API_KEY_P8 (base64 i .p8).
+      - name: Ngarko ne TestFlight (App Store Connect)
+        if: ${{ github.event.inputs.export_method == 'app-store-connect' }}
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$APP_STORE_CONNECT_API_KEY_P8" | base64 -d > ~/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8
+          IPA_PATH=$(find mjeku-desktop/src-tauri/gen/apple/build/arm64 -name "*.ipa" | head -1)
+          echo "Duke ngarkuar: $IPA_PATH"
+          xcrun altool --upload-app -f "$IPA_PATH" -t ios \
+            --apiKey "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
