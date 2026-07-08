@@ -43,6 +43,12 @@ jobs:
   ios-build:
     runs-on: macos-15
     steps:
+      - name: DEBUG liston versionet Xcode ne dispozicion
+        run: |
+          ls /Applications | grep -i xcode
+          echo "---aktual (xcode-select)---"
+          xcode-select -p
+
       - name: Checkout mjeku-desktop
         uses: actions/checkout@v4
         with:
