@@ -202,20 +202,23 @@ impl SyncEngine {
             self.apply_remote_row_services(&s)?;
         }
 
-        let appointments: Vec<Appointment> = self
-            .fetch_table(base, api_key, "appointments", last_sync_time, clinic_id)
-            .await
-            .context("pull appointments")?;
-        for a in appointments {
-            self.apply_remote_row_appointments(&a)?;
-        }
-
+        // Klientet duhet te terhiqen PARA appointments/visits/sales/payments (te gjitha
+        // i referencojne nga client_id) - perndryshe nje rekord i lidhur mund te mberrije
+        // lokalisht para vete klientit dhe UI-ja bie ne fallback duke shfaqur UUID-ne.
         let clients: Vec<Client> = self
             .fetch_table(base, api_key, "clients", last_sync_time, clinic_id)
             .await
             .context("pull clients")?;
         for c in clients {
             self.apply_remote_row_clients(&c)?;
+        }
+
+        let appointments: Vec<Appointment> = self
+            .fetch_table(base, api_key, "appointments", last_sync_time, clinic_id)
+            .await
+            .context("pull appointments")?;
+        for a in appointments {
+            self.apply_remote_row_appointments(&a)?;
         }
 
         let sales: Vec<Sale> = self
@@ -583,8 +586,14 @@ impl SyncEngine {
             }
         }
 
+        // Push "clients" pare se cdo tabele tjeter - appointments/visits/sales/payments
+        // i referencojne nga client_id, dhe HashMap-i s'garanton renditje vetiu.
+        let mut table_order: Vec<String> = upserts.keys().cloned().collect();
+        table_order.sort_by_key(|t| if t == "clients" { 0 } else { 1 });
+
         // Upserts in batches per table.
-        for (table, mut rows) in upserts {
+        for table in table_order {
+            let mut rows = upserts.remove(&table).unwrap_or_default();
             while !rows.is_empty() {
                 let batch: Vec<(String, Value)> = rows.drain(0..rows.len().min(50)).collect();
                 let mut payload: Vec<Value> = batch.iter().map(|(_, v)| v.clone()).collect();
