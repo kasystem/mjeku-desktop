@@ -79,6 +79,18 @@ jobs:
       - name: Shto lejet Camera/Photo Library + File Sharing te Info.plist
         run: bash mjeku-desktop/ci_scripts/patch_ios_plist.sh mjeku-desktop/src-tauri/gen/apple
 
+      # Tauri s'e instalon vete IOS_MOBILE_PROVISION te dosja e sistemit — pa kete
+      # hap, xcodebuild dështon me "requires a provisioning profile" edhe pse
+      # certifikata dhe Team ID jane korrekte.
+      - name: Instalo provisioning profile
+        env:
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$IOS_MOBILE_PROVISION" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/mjeku.mobileprovision
+          echo "Profili u instalua:"
+          security cms -D -i ~/Library/MobileDevice/Provisioning\ Profiles/mjeku.mobileprovision | grep -A1 "UUID\|application-identifier\|<key>Name"
+
       - name: tauri ios build (.ipa)
         working-directory: mjeku-desktop
         env:
