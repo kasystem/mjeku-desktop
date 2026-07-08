@@ -14,6 +14,10 @@
 # Si të prodhosh vlerat base64 (Windows PowerShell):
 #   [Convert]::ToBase64String([IO.File]::ReadAllBytes("Certificate.p12")) | Set-Clipboard
 #
+# KUJDES: .p12-ja duhet eksportuar me `openssl pkcs12 -export -legacy ...` (jo formatin
+# modern AES të OpenSSL 3.x) — përndryshe `security import` në macOS dështon me
+# "MAC verification failed" edhe kur fjalëkalimi është korrekt.
+#
 # Nisja: GitHub → Actions → "iOS build (.ipa)" → Run workflow
 name: iOS build (.ipa)
 
@@ -32,7 +36,7 @@ on:
 
 jobs:
   ios-build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout mjeku-desktop
         uses: actions/checkout@v4
@@ -72,18 +76,6 @@ jobs:
 
       - name: Shto lejet Camera/Photo Library + File Sharing te Info.plist
         run: bash mjeku-desktop/ci_scripts/patch_ios_plist.sh mjeku-desktop/src-tauri/gen/apple
-
-      - name: DEBUG gjatesia e secret-ave (hiqet pas diagnostikimit)
-        env:
-          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
-          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
-        run: |
-          echo "IOS_CERTIFICATE gjatesia: ${#IOS_CERTIFICATE} (pritet 4336)"
-          echo "IOS_CERTIFICATE_PASSWORD gjatesia: ${#IOS_CERTIFICATE_PASSWORD} (pritet 32)"
-          echo "IOS_MOBILE_PROVISION gjatesia: ${#IOS_MOBILE_PROVISION}"
-          echo "$IOS_CERTIFICATE" | base64 -d > /tmp/test_cert.p12 2>&1 && echo "base64 decode: OK" || echo "base64 decode: DESHTOI"
-          security import /tmp/test_cert.p12 -k login.keychain -P "$IOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign 2>&1 || echo "security import test DESHTOI (kjo pritet nese login.keychain s'eshte i unlocked, injoroje nese gjatesite jane korrekte)"
 
       - name: tauri ios build (.ipa)
         working-directory: mjeku-desktop
