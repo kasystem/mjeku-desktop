@@ -102,6 +102,10 @@ jobs:
         run: >
           npx tauri ios build --ci --target aarch64
           --export-method ${{ github.event.inputs.export_method || 'release-testing' }}
+          -- CODE_SIGN_STYLE=Manual
+          PROVISIONING_PROFILE_SPECIFIER="Mjeku App Store"
+          DEVELOPMENT_TEAM=79HPB8A463
+          CODE_SIGN_IDENTITY="Apple Distribution"
 
       - name: Ngarko .ipa si artifact
         uses: actions/upload-artifact@v4
