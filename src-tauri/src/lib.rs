@@ -92,6 +92,23 @@ fn add_days_to_iso(ts: &str, days: i64) -> Option<String> {
     Some(next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
+/// Krahason dy versione "x.y.z" numerikisht — kthen true vetëm nëse `remote`
+/// është STRIKT më i ri se `local`. Kjo shmang rastin kur manifesti i update-it
+/// mbetet i ngrirë/gabuar në një version më të vjetër (p.sh. "0.4.9") dhe kyçi
+/// i vjetër `!=` e trajtonte gabimisht si "update i ri" edhe pse ishte më i vjetër.
+fn version_is_newer(remote: &str, local: &str) -> bool {
+    fn parse(v: &str) -> (u64, u64, u64) {
+        let v = v.trim().trim_start_matches('v');
+        let mut parts = v.split('.').map(|p| p.trim().parse::<u64>().unwrap_or(0));
+        (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        )
+    }
+    parse(remote) > parse(local)
+}
+
 fn compute_desktop_update_policy_from_db(
     db: &Db,
     current_version: &str,
@@ -135,7 +152,7 @@ fn compute_desktop_update_policy_from_db(
 
     let latest_is_new = latest
         .as_deref()
-        .map(|x| x.trim().trim_start_matches('v') != current_version.trim().trim_start_matches('v'))
+        .map(|x| version_is_newer(x, current_version))
         .unwrap_or(false);
     if !available || !latest_is_new {
         return Ok((false, latest, None, last_manual));
