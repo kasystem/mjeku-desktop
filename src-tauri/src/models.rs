@@ -620,3 +620,42 @@ pub struct FiscalJob {
     #[serde(default)]
     pub deleted: i64,
 }
+
+/// Profil i njohur i një analizuesi laboratorik (marka/modeli). Jo i ruajtur
+/// në DB — listë statike e ndërtuar nga specifikimet publike ASTM E1394-97,
+/// të cilat prodhues të ndryshëm i implementojnë me variacione të vogla
+/// (baud rate, checksum strict/relaxed). Duhet verifikuar kundër dokumentit
+/// ICD të vetë pajisjes fizike përpara përdorimit real klinik.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzerProfile {
+    pub id: String,
+    pub brand: String,
+    pub model: String,
+    pub protocol: String, // astm_e1394
+    pub baud_rate: u32,
+    pub data_bits: u8,
+    pub parity: String, // none | even | odd
+    pub stop_bits: u8,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabDeviceStatus {
+    pub connected: bool,
+    pub port_name: Option<String>,
+    pub profile_id: Option<String>,
+    pub last_error: Option<String>,
+    pub last_message_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabInboxItem {
+    pub id: String,
+    pub profile_id: String,
+    pub patient_ref_raw: String,
+    pub formatted_text: String,
+    pub matched_client_id: Option<String>,
+    pub matched_visit_id: Option<String>,
+    pub status: String, // unmatched | assigned
+    pub received_at: String,
+}

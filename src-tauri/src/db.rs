@@ -334,6 +334,22 @@ CREATE TABLE IF NOT EXISTS offer_items (
   updated_at TEXT NOT NULL DEFAULT '',
   deleted_at TEXT
 );
+
+-- Rezultate te ardhura nga analizuesi laboratorik i lidhur me pajisjen (RS232/ASTM).
+-- Vetem lokale (jo e sinkronizuar) - eshte specifike per hardware-in e lidhur
+-- ne kete PC. Kur nje rezultat perputhet/caktohet ne nje vizite, teksti i
+-- formatuar shtohet te visits.analyses (ai fushe sinkronizohet normalisht).
+CREATE TABLE IF NOT EXISTS lab_inbox (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL DEFAULT '',
+  patient_ref_raw TEXT NOT NULL DEFAULT '',
+  formatted_text TEXT NOT NULL DEFAULT '',
+  raw_message TEXT NOT NULL DEFAULT '',
+  matched_client_id TEXT,
+  matched_visit_id TEXT,
+  status TEXT NOT NULL DEFAULT 'unmatched',
+  received_at TEXT NOT NULL DEFAULT ''
+);
 "#;
 
 pub struct Db {
@@ -5740,6 +5756,148 @@ impl Db {
         let tx = conn.transaction()?;
         Self::queue_replace_pending_tx(&tx, "offer_items", &item.id, "upsert", &payload, &item.updated_at)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn lab_inbox_insert(
+        &self,
+        profile_id: &str,
+        patient_ref_raw: &str,
+        formatted_text: &str,
+        raw_message: &str,
+    ) -> anyhow::Result<crate::models::LabInboxItem> {
+        let conn = self.conn()?;
+        let id = Uuid::new_v4().to_string();
+        let received_at = now_iso();
+        conn.execute(
+            "INSERT INTO lab_inbox (id, profile_id, patient_ref_raw, formatted_text, raw_message, status, received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'unmatched', ?6)",
+            params![id, profile_id, patient_ref_raw, formatted_text, raw_message, received_at],
+        )?;
+        Ok(crate::models::LabInboxItem {
+            id,
+            profile_id: profile_id.to_string(),
+            patient_ref_raw: patient_ref_raw.to_string(),
+            formatted_text: formatted_text.to_string(),
+            matched_client_id: None,
+            matched_visit_id: None,
+            status: "unmatched".to_string(),
+            received_at,
+        })
+    }
+
+    pub fn lab_inbox_list(&self, only_unmatched: bool) -> anyhow::Result<Vec<crate::models::LabInboxItem>> {
+        let conn = self.conn()?;
+        let sql = if only_unmatched {
+            "SELECT id, profile_id, patient_ref_raw, formatted_text, matched_client_id, matched_visit_id, status, received_at
+             FROM lab_inbox WHERE status = 'unmatched' ORDER BY received_at DESC"
+        } else {
+            "SELECT id, profile_id, patient_ref_raw, formatted_text, matched_client_id, matched_visit_id, status, received_at
+             FROM lab_inbox ORDER BY received_at DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::models::LabInboxItem {
+                id: row.get(0)?,
+                profile_id: row.get(1)?,
+                patient_ref_raw: row.get(2)?,
+                formatted_text: row.get(3)?,
+                matched_client_id: row.get(4)?,
+                matched_visit_id: row.get(5)?,
+                status: row.get(6)?,
+                received_at: row.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Bashkangjit tekstin e formatuar te fusha `analyses` e vizites se dhene
+    /// (permes visits_upsert ekzistues, qe kujdeset vete per sync_queue), dhe
+    /// e shenon rezultatin si 'assigned' ne lab_inbox.
+    pub fn lab_inbox_assign_to_visit(&self, inbox_id: &str, visit_id: &str) -> anyhow::Result<()> {
+        let item = {
+            let conn = self.conn()?;
+            conn.query_row(
+                "SELECT profile_id, patient_ref_raw, formatted_text, matched_client_id, matched_visit_id, status, received_at
+                 FROM lab_inbox WHERE id = ?1",
+                params![inbox_id],
+                |row| {
+                    Ok(crate::models::LabInboxItem {
+                        id: inbox_id.to_string(),
+                        profile_id: row.get(0)?,
+                        patient_ref_raw: row.get(1)?,
+                        formatted_text: row.get(2)?,
+                        matched_client_id: row.get(3)?,
+                        matched_visit_id: row.get(4)?,
+                        status: row.get(5)?,
+                        received_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?
+        };
+        let item = item.ok_or_else(|| anyhow!("lab_inbox item not found: {inbox_id}"))?;
+
+        let visit = self
+            .visits_get(visit_id)?
+            .ok_or_else(|| anyhow!("visit not found: {visit_id}"))?;
+
+        let merged_analyses = match &visit.analyses {
+            Some(existing) if !existing.trim().is_empty() => {
+                format!("{existing}\n\n{}", item.formatted_text)
+            }
+            _ => item.formatted_text.clone(),
+        };
+
+        let matched_client_id = visit.client_id.clone();
+        let input = crate::models::VisitUpsertInput {
+            id: Some(visit.id.clone()),
+            client_id: visit.client_id,
+            doctor_id: visit.doctor_id,
+            date: visit.date,
+            visit_time: visit.visit_time,
+            status: visit.status,
+            notes: visit.notes,
+            body_weight: visit.body_weight,
+            body_weight_unit: visit.body_weight_unit,
+            body_height: visit.body_height,
+            body_height_unit: visit.body_height_unit,
+            head_circumference: visit.head_circumference,
+            head_circumference_unit: visit.head_circumference_unit,
+            body_temperature: visit.body_temperature,
+            body_temperature_unit: visit.body_temperature_unit,
+            blood_oxygen: visit.blood_oxygen,
+            blood_oxygen_unit: visit.blood_oxygen_unit,
+            glycemia: visit.glycemia,
+            glycemia_unit: visit.glycemia_unit,
+            pulse: visit.pulse,
+            pulse_unit: visit.pulse_unit,
+            bmi: visit.bmi,
+            blood_pressure_systolic: visit.blood_pressure_systolic,
+            blood_pressure_diastolic: visit.blood_pressure_diastolic,
+            blood_pressure_unit: visit.blood_pressure_unit,
+            complaints: visit.complaints,
+            additional_notes: visit.additional_notes,
+            controls: visit.controls,
+            remarks: visit.remarks,
+            analyses: Some(merged_analyses),
+            advice: visit.advice,
+            therapies: visit.therapies,
+            diagnosis: visit.diagnosis,
+            examinations: visit.examinations,
+            specialty_report: visit.specialty_report,
+        };
+        self.visits_upsert(input)?;
+
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE lab_inbox SET status = 'assigned', matched_visit_id = ?2, matched_client_id = ?3 WHERE id = ?1",
+            params![inbox_id, visit_id, matched_client_id],
+        )?;
         Ok(())
     }
 }

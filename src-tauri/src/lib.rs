@@ -3,6 +3,7 @@ mod db;
 mod desktop_updates;
 mod error_logs;
 mod invoice;
+mod lab_devices;
 mod license_engine;
 mod models;
 mod sync_engine;
@@ -50,6 +51,8 @@ const KEY_DESKTOP_UPDATE_LAST_MANUAL_CHECK_AT: &str = "desktop_update_last_manua
 const KEY_DESKTOP_UPDATE_LATEST_VERSION: &str = "desktop_update_latest_version";
 const KEY_DESKTOP_UPDATE_AVAILABLE: &str = "desktop_update_available";
 const KEY_DESKTOP_UPDATE_FIRST_SEEN_AT: &str = "desktop_update_first_seen_at";
+const KEY_LAB_DEVICE_PROFILE_ID: &str = "lab_device_profile_id";
+const KEY_LAB_DEVICE_PORT_NAME: &str = "lab_device_port_name";
 const DESKTOP_UPDATE_FORCE_AFTER_DAYS: i64 = 7;
 const DEFAULT_SUPABASE_URL: &str = "https://occzpzryzxabajtmdaas.supabase.co";
 const DEFAULT_SUPABASE_API_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9jY3pwenJ5enhhYmFqdG1kYWFzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA2NTQxMjksImV4cCI6MjA4NjIzMDEyOX0.Fq2bTsVLPpRhoLe845Lf-kMsy8rmPF2ijMZCWBb1zHc";
@@ -65,6 +68,7 @@ struct AppState {
     updates: Arc<UpdatesEngine>,
     license: Arc<LicenseEngine>,
     error_log_path: PathBuf,
+    lab_serial: Arc<lab_devices::LabSerialManager>,
 }
 
 fn err_string(e: impl std::fmt::Display) -> String {
@@ -1259,6 +1263,116 @@ async fn settings_set(
 
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.setting_set(&k, &v))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
+#[tauri::command]
+fn lab_devices_list_profiles() -> Vec<crate::models::AnalyzerProfile> {
+    lab_devices::known_profiles()
+}
+
+#[tauri::command]
+async fn lab_serial_ports_list() -> Result<Vec<String>, String> {
+    Ok(lab_devices::list_serial_ports())
+}
+
+#[derive(serde::Serialize)]
+struct LabDeviceDefault {
+    profile_id: Option<String>,
+    port_name: Option<String>,
+}
+
+#[tauri::command]
+async fn lab_device_get_default(
+    state: tauri::State<'_, AppState>,
+) -> Result<LabDeviceDefault, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let profile_id = db.setting_get(KEY_LAB_DEVICE_PROFILE_ID)?;
+        let port_name = db.setting_get(KEY_LAB_DEVICE_PORT_NAME)?;
+        Ok::<_, anyhow::Error>(LabDeviceDefault {
+            profile_id,
+            port_name,
+        })
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn lab_device_set_default(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    port_name: String,
+) -> Result<(), String> {
+    if lab_devices::find_profile(&profile_id).is_none() {
+        return Err("profil i panjohur i analizuesit".to_string());
+    }
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.setting_set(KEY_LAB_DEVICE_PROFILE_ID, &profile_id)?;
+        db.setting_set(KEY_LAB_DEVICE_PORT_NAME, &port_name)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn lab_device_connect(
+    state: tauri::State<'_, AppState>,
+    port_name: String,
+    profile_id: String,
+) -> Result<(), String> {
+    let profile = lab_devices::find_profile(&profile_id).ok_or("profil i panjohur i analizuesit")?;
+    let db = state.db.clone();
+    let lab_serial = state.lab_serial.clone();
+    tokio::task::spawn_blocking(move || lab_serial.connect(db, port_name, profile))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
+#[tauri::command]
+async fn lab_device_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let lab_serial = state.lab_serial.clone();
+    tokio::task::spawn_blocking(move || lab_serial.disconnect())
+        .await
+        .map_err(err_string)
+}
+
+#[tauri::command]
+async fn lab_device_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::models::LabDeviceStatus, String> {
+    Ok(state.lab_serial.status())
+}
+
+#[tauri::command]
+async fn lab_inbox_list(
+    state: tauri::State<'_, AppState>,
+    only_unmatched: Option<bool>,
+) -> Result<Vec<crate::models::LabInboxItem>, String> {
+    let db = state.db.clone();
+    let only_unmatched = only_unmatched.unwrap_or(true);
+    tokio::task::spawn_blocking(move || db.lab_inbox_list(only_unmatched))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
+#[tauri::command]
+async fn lab_inbox_assign(
+    state: tauri::State<'_, AppState>,
+    inbox_id: String,
+    visit_id: String,
+) -> Result<(), String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.lab_inbox_assign_to_visit(&inbox_id, &visit_id))
         .await
         .map_err(err_string)?
         .map_err(err_string)
@@ -3641,6 +3755,7 @@ pub fn run() {
                 updates,
                 license,
                 error_log_path,
+                lab_serial: Arc::new(lab_devices::LabSerialManager::new()),
             });
 
             // Silent background updater: check once on startup, download+install, then restart.
@@ -3731,6 +3846,15 @@ pub fn run() {
             visit_items_list,
             visit_items_upsert,
             visit_items_delete,
+            lab_devices_list_profiles,
+            lab_serial_ports_list,
+            lab_device_get_default,
+            lab_device_set_default,
+            lab_device_connect,
+            lab_device_disconnect,
+            lab_device_status,
+            lab_inbox_list,
+            lab_inbox_assign,
             client_photos_list,
             client_photo_add,
             client_photo_data,
