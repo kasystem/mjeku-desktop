@@ -50,8 +50,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIzQTAwMTY5N0ExRkIzN0MKUldSOHN4OTZhUUdnSStZMzZiZ09IY3NQSXNNUVZrbnBOZjdqNWFLbDgvNEZCTjNVSFpjNlhBQ0IK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZFNkNEMjA1NjBEOUI4NjkKUldScHVObGdCZEpzYmhsYTBoeExqZkxtWG5MU3lkMGZON3Zzc2VidzJqSmZLcnFZQ2RlZ0NKaisK",
       "endpoints": [
+        "https://github.com/kasystem/mjeku-desktop/releases/latest/download/desktop-update.json",
         "https://mjeku-ui.vercel.app/desktop-update.json"
       ],
       "dialog": false

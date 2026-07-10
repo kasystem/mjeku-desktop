@@ -38,9 +38,12 @@ echo [mjeku-desktop] Starting tauri build (release)...
 echo [mjeku-desktop] Using cargo:
 %CARGO_EXE% -V
 
-rem Signing key for Tauri Updater (produces .nsis.zip + .nsis.zip.sig alongside setup.exe)
-set TAURI_SIGNING_PRIVATE_KEY_PATH=C:\Users\FATLIN~1\.tauri\mjeku.key
-set TAURI_SIGNING_PRIVATE_KEY_PASSWORD=mjeku2026
+rem Signing key for Tauri Updater (produces .nsis.zip + .nsis.zip.sig alongside setup.exe).
+rem NOTE: TAURI_SIGNING_PRIVATE_KEY_PATH is NOT honored by the bundler's signing step in
+rem this Tauri CLI version - it silently falls through to "no private key". Must load the
+rem key file's content directly into TAURI_SIGNING_PRIVATE_KEY instead.
+for /f "delims=" %%K in (C:\Users\FATLIN~1\.tauri\mjeku.key) do set TAURI_SIGNING_PRIVATE_KEY=%%K
+set TAURI_SIGNING_PRIVATE_KEY_PASSWORD=MjekuUpdate2026x9
 
 rem Use release override config to avoid re-running UI build inside Tauri CLI.
 "%NODE20%" node_modules\@tauri-apps\cli\tauri.js build --verbose --runner %CARGO_EXE% --config src-tauri/tauri.release.conf.json
