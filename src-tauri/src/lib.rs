@@ -56,7 +56,8 @@ const KEY_LAB_DEVICE_PORT_NAME: &str = "lab_device_port_name";
 const DESKTOP_UPDATE_FORCE_AFTER_DAYS: i64 = 7;
 const DEFAULT_SUPABASE_URL: &str = "https://occzpzryzxabajtmdaas.supabase.co";
 const DEFAULT_SUPABASE_API_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9jY3pwenJ5enhhYmFqdG1kYWFzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA2NTQxMjksImV4cCI6MjA4NjIzMDEyOX0.Fq2bTsVLPpRhoLe845Lf-kMsy8rmPF2ijMZCWBb1zHc";
-const DEFAULT_UPDATE_BASE_URL: &str = "https://mjeku-ui.vercel.app";
+const DEFAULT_UPDATE_BASE_URL: &str = "https://mjeku-ui.onrender.com";
+const OLD_DEFAULT_UPDATE_BASE_URL: &str = "https://mjeku-ui.vercel.app";
 
 const TOKEN_MODE_EXISTING: &str = "existing";
 const TOKEN_MODE_NEW: &str = "new";
@@ -3685,6 +3686,15 @@ pub fn run() {
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_API_KEY, DEFAULT_SUPABASE_API_KEY)?;
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_ANON_KEY, DEFAULT_SUPABASE_API_KEY)?;
             ensure_setting_if_empty(db.as_ref(), "update_base_url", DEFAULT_UPDATE_BASE_URL)?;
+            // Migrim: klientët ekzistues e kishin "update_base_url" të vendosur eksplicit
+            // (jo bosh) te Vercel-i i vjetër - ensure_setting_if_empty s'e prek atë. E
+            // kalojmë te Render nëse ende ka vlerën default të vjetër (jo një URL të
+            // personalizuar nga useri).
+            if let Ok(Some(cur)) = db.setting_get("update_base_url") {
+                if cur.trim().trim_end_matches('/') == OLD_DEFAULT_UPDATE_BASE_URL {
+                    let _ = db.setting_set("update_base_url", DEFAULT_UPDATE_BASE_URL);
+                }
+            }
             if let Err(e) = db.fiscal_clear_article_on_app_open() {
                 eprintln!("startup clear article failed: {e}");
             }

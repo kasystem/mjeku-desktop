@@ -12,7 +12,8 @@ use zip::ZipArchive;
 
 use crate::db::Db;
 
-const DEFAULT_UPDATE_BASE_URL: &str = "https://mjeku-ui.vercel.app";
+const DEFAULT_UPDATE_BASE_URL: &str = "https://mjeku-ui.onrender.com";
+const FALLBACK_UPDATE_BASE_URL: &str = "https://mjeku-ui.vercel.app";
 
 const KEY_UPDATE_BASE_URL: &str = "update_base_url";
 
@@ -145,27 +146,51 @@ impl UpdatesEngine {
 
         ensure_ui_dirs(app)?;
 
-        let base = self
+        let configured = self
             .db
             .setting_get(KEY_UPDATE_BASE_URL)?
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_UPDATE_BASE_URL.to_string());
-        let base = base.trim_end_matches('/').to_string();
+        let configured = configured.trim_end_matches('/').to_string();
 
-        let manifest_url = format!("{base}/manifest.json");
-        let resp = self
-            .client
-            .get(&manifest_url)
-            .send()
-            .await
-            .context("fetch manifest")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!("manifest fetch failed: {status} {body}");
+        // Provo bazën e konfiguruar/default (Render), pastaj Vercel si fallback nëse
+        // e para dështon (rrjet, 402 faturimi, etj.) - njësoj si endpoint-et e EXE updater-it.
+        let mut candidates = vec![configured];
+        if candidates.iter().all(|b| b != FALLBACK_UPDATE_BASE_URL) {
+            candidates.push(FALLBACK_UPDATE_BASE_URL.to_string());
         }
-        let manifest: UpdateManifest =
-            serde_json::from_str(&body).context("parse manifest.json")?;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut found: Option<(String, UpdateManifest)> = None;
+        for base in &candidates {
+            let manifest_url = format!("{base}/manifest.json");
+            let attempt = async {
+                let resp = self
+                    .client
+                    .get(&manifest_url)
+                    .send()
+                    .await
+                    .context("fetch manifest")?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    bail!("manifest fetch failed: {status} {body}");
+                }
+                serde_json::from_str::<UpdateManifest>(&body).context("parse manifest.json")
+            }
+            .await;
+            match attempt {
+                Ok(m) => {
+                    found = Some((base.clone(), m));
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let (base, manifest) = match found {
+            Some(x) => x,
+            None => return Err(last_err.unwrap_or_else(|| anyhow!("manifest fetch failed"))),
+        };
 
         let latest = manifest.latest_version.trim().to_string();
         if latest.is_empty() {
