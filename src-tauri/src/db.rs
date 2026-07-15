@@ -379,6 +379,21 @@ impl Db {
         })
     }
 
+    /// Baze SQLite vetem ne memorie - perdoret nga "Demo Mode" (mobile-only):
+    /// e njejta skeme/logjike si Db::new, por asgje s'shkruhet ne disk dhe
+    /// gjithcka zhduket kur mbyllet procesi. `db_path()` mbetet bosh - askush
+    /// s'duhet ta perdore per demo mode (sync/backup logic e injoron).
+    pub fn new_in_memory() -> anyhow::Result<Self> {
+        let conn = Connection::open_in_memory().context("open in-memory sqlite")?;
+        conn.execute_batch(MIGRATION_SQL)?;
+        Self::run_migrations(&conn)?;
+
+        Ok(Self {
+            db_path: PathBuf::new(),
+            conn: Mutex::new(conn),
+        })
+    }
+
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }

@@ -20,6 +20,8 @@ pub struct AppInfo {
     pub desktop_update_latest_version: Option<String>,
     pub desktop_update_force_deadline_at: Option<String>,
     pub desktop_update_last_manual_check_at: Option<String>,
+    #[serde(default)]
+    pub is_demo_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

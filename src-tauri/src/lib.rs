@@ -70,6 +70,7 @@ struct AppState {
     license: Arc<LicenseEngine>,
     error_log_path: PathBuf,
     lab_serial: Arc<lab_devices::LabSerialManager>,
+    is_demo_mode: bool,
 }
 
 fn err_string(e: impl std::fmt::Display) -> String {
@@ -537,11 +538,11 @@ async fn get_app_info(
     Ok(AppInfo {
         version,
         ui_version,
-        sync_status: sync_status.sync_status,
+        sync_status: if state.is_demo_mode { "synced".to_string() } else { sync_status.sync_status },
         last_sync_time,
         last_sync_error: sync_status.last_sync_error,
-        license_ok: lic.ok,
-        license_status: lic.status,
+        license_ok: state.is_demo_mode || lic.ok,
+        license_status: if state.is_demo_mode { "ok".to_string() } else { lic.status },
         license_active_until: lic.active_until,
         license_last_checked_at: lic.last_checked_at,
         license_seconds_left,
@@ -549,6 +550,7 @@ async fn get_app_info(
         desktop_update_latest_version,
         desktop_update_force_deadline_at,
         desktop_update_last_manual_check_at,
+        is_demo_mode: state.is_demo_mode,
     })
 }
 
@@ -589,14 +591,31 @@ async fn auth_setup(
     Ok(out)
 }
 
+const DEMO_MODE_TOKEN: &str = "DEMOPROGRAMERI";
+
 #[tauri::command]
 async fn provision_apply_token(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     token: String,
 ) -> Result<AuthStateInfo, String> {
     let token_code = normalize_provision_token(&token);
     if token_code.is_empty() {
         return Err("tokeni eshte i detyrueshem".to_string());
+    }
+
+    // "Demo Mode" (vetem mobile, per kerkesen e App Review 2.1(a)): token special
+    // qe s'aktivizon nje klinike reale - shkruan nje marker lokal dhe rinis app-in;
+    // ne startup-in tjeter, run() e sheh markerin dhe hap baze te dhenash ne memorie.
+    #[cfg(mobile)]
+    if token_code == DEMO_MODE_TOKEN {
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?;
+        std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+        std::fs::write(data_dir.join("demo_mode.flag"), b"1").map_err(|e| e.to_string())?;
+        app.restart();
     }
 
     let db = state.db.clone();
@@ -1496,10 +1515,19 @@ async fn clients_upsert(
 ) -> Result<Client, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.clients_upsert(client))
-        .await
-        .map_err(err_string)?
-        .map_err(err_string)
+    let is_demo_mode = state.is_demo_mode;
+    tokio::task::spawn_blocking(move || {
+        if is_demo_mode && client.id.is_none() {
+            let existing = db.clients_list(None)?;
+            if existing.iter().any(|c| c.deleted == 0) {
+                bail!("Modaliteti Demo lejon vetëm 1 pacient. Fshi pacientin ekzistues për të shtuar një tjetër.");
+            }
+        }
+        db.clients_upsert(client)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 
 #[tauri::command]
@@ -3653,7 +3681,30 @@ pub fn run() {
                 let _ = std::fs::remove_dir_all(data_dir.join("assets"));
                 let _ = std::fs::remove_file(&reset_flag);
             }
-            let db = Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?);
+            // "Demo Mode" (mobile-only, per App Store review requirement): kur eshte
+            // futur token-i special (shih provision_apply_token) ne nje ekzekutim te
+            // meparshem, marker-i eshte shkruar ketu dhe app-i eshte rinisur - baza e
+            // te dhenave hapet ne memorie (asgje s'shkruhet ne disk, zhduket kur mbyllet
+            // procesi) dhe klinika demo konfigurohet automatikisht me login te hapur.
+            #[cfg(mobile)]
+            let is_demo_mode = data_dir.join("demo_mode.flag").exists();
+            #[cfg(not(mobile))]
+            let is_demo_mode = false;
+
+            let db = if is_demo_mode {
+                Arc::new(Db::new_in_memory()?)
+            } else {
+                Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?)
+            };
+            if is_demo_mode && !crate::auth::is_configured(&db)? {
+                crate::auth::setup_v2(
+                    &db,
+                    "Demo Klinika PROGRAMERI",
+                    "demo123456",
+                    "demo1234",
+                    None,
+                )?;
+            }
             if db
                 .setting_get(FISCAL_PRINTER_PROVIDER_KEY)?
                 .unwrap_or_default()
@@ -3719,7 +3770,12 @@ pub fn run() {
                 })?;
             }
 
-            let session = crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None);
+            let session = if is_demo_mode {
+                // Reviewer-i futet direkt ne app, pa pasur nevoje te shkruaje asgje.
+                SessionKind::User { role: crate::auth::UserRole::Owner }
+            } else {
+                crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None)
+            };
             let auth = Arc::new(AuthState::new(session));
             let sync = Arc::new(SyncEngine::new(db.clone())?);
             let updates = Arc::new(UpdatesEngine::new(db.clone())?);
@@ -3728,7 +3784,11 @@ pub fn run() {
             UpdatesEngine::apply_pending_on_startup(&handle)?;
             UpdatesEngine::ensure_seed_installed(&handle)?;
 
-            sync.clone().spawn_background();
+            // Demo mode s'ka clinic_id/license real dhe s'duhet te kontaktoje asnje
+            // server - sync/license mbeten krejtesisht te fikur.
+            if !is_demo_mode {
+                sync.clone().spawn_background();
+            }
 
             // Procesori i radhës fiskale: çdo 15s proceson job-et 'pending' më të reja se 2 orë.
             // Më të vjetrat presin aprovim manual te Sporteli (mbrojtje nga printimet aksidentale).
@@ -3760,7 +3820,9 @@ pub fn run() {
                 });
             }
             updates.clone().spawn_background(handle.clone());
-            license.clone().spawn_background();
+            if !is_demo_mode {
+                license.clone().spawn_background();
+            }
             {
                 let db_bg = db.clone();
                 let handle_bg = handle.clone();
@@ -3783,6 +3845,7 @@ pub fn run() {
                 license,
                 error_log_path,
                 lab_serial: Arc::new(lab_devices::LabSerialManager::new()),
+                is_demo_mode,
             });
 
             // Silent background updater: check once on startup, download+install, then restart.
