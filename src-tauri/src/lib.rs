@@ -607,7 +607,7 @@ async fn provision_apply_token(
     // "Demo Mode" (vetem mobile, per kerkesen e App Review 2.1(a)): token special
     // qe s'aktivizon nje klinike reale - shkruan nje marker lokal dhe rinis app-in;
     // ne startup-in tjeter, run() e sheh markerin dhe hap baze te dhenash ne memorie.
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
     if token_code == DEMO_MODE_TOKEN {
         let data_dir = app
             .path()
@@ -616,6 +616,25 @@ async fn provision_apply_token(
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
         std::fs::write(data_dir.join("demo_mode.flag"), b"1").map_err(|e| e.to_string())?;
         app.restart();
+    }
+
+    // iOS s'ka asnje API per nje app qe ta rinise veten (ndryshe nga desktop/Android) - app.restart()
+    // aty aborton (SIGABRT), gje qe App Review e regjistroi si "app crashed" (Guideline 2.1(a),
+    // refuzuar 2026-08-20, submission f6dc766c). Flag-u shkruhet ne disk normalisht (run() e ardhshme
+    // e sheh dhe hap demo mode automatikisht); ne vend te restart() thjesht i kerkojme rishikuesit/
+    // perdoruesit ta mbylle plotesisht app-in dhe ta rihape vete, pa asnje crash apo exit i papritur.
+    #[cfg(target_os = "ios")]
+    if token_code == DEMO_MODE_TOKEN {
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?;
+        std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+        std::fs::write(data_dir.join("demo_mode.flag"), b"1").map_err(|e| e.to_string())?;
+        return Err(
+            "Demo mode activated. Please fully close this app (swipe it away in the app switcher) and reopen it to continue."
+                .to_string(),
+        );
     }
 
     let db = state.db.clone();
