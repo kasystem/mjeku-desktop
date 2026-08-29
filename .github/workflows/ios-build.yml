@@ -47,6 +47,11 @@ on:
           - release-testing
           - app-store-connect
           - debugging
+      simulate_schedule:
+        description: "Simulo rrugen e planifikuar (TestFlight refresh - rrit versionin dhe ngarkon si te ishte cron-i mujor)"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "0 6 1 * *"
 
@@ -77,7 +82,7 @@ jobs:
       # unik (Apple s'lejon ringarkim te te njejtit numer versioni). Nisjet manuale
       # (workflow_dispatch) s'e prekin versionin fare.
       - name: Rrit versionin (vetëm rruga e planifikuar - TestFlight refresh)
-        if: github.event_name == 'schedule'
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.simulate_schedule == 'true' }}
         working-directory: mjeku-desktop
         run: |
           set -e
@@ -186,7 +191,7 @@ jobs:
           IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
         run: >
           npx tauri ios build --ci --target aarch64
-          --export-method ${{ github.event_name == 'schedule' && 'app-store-connect' || github.event.inputs.export_method || 'release-testing' }}
+          --export-method ${{ (github.event_name == 'schedule' || github.event.inputs.simulate_schedule == 'true') && 'app-store-connect' || github.event.inputs.export_method || 'release-testing' }}
 
       - name: Ngarko .ipa si artifact
         uses: actions/upload-artifact@v4
@@ -200,7 +205,7 @@ jobs:
       # pa Mac/Transporter. Kerkon 3 GitHub Secrets: APP_STORE_CONNECT_KEY_ID,
       # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_API_KEY_P8 (base64 i .p8).
       - name: Ngarko ne TestFlight (App Store Connect)
-        if: ${{ github.event_name == 'schedule' || github.event.inputs.export_method == 'app-store-connect' }}
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.simulate_schedule == 'true' || github.event.inputs.export_method == 'app-store-connect' }}
         env:
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -219,7 +224,7 @@ jobs:
       # dijenine e askujt, prandaj hapim nje GitHub Issue te dukshem ne vend qe te mbeshtetemi
       # vetem te email-i default i GitHub-it per workflow-e te deshtuara.
       - name: Njofto deshtimin (vetem rruga e planifikuar)
-        if: ${{ failure() && github.event_name == 'schedule' }}
+        if: ${{ failure() && (github.event_name == 'schedule' || github.event.inputs.simulate_schedule == 'true') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
