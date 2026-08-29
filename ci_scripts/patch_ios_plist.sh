@@ -22,6 +22,12 @@ while IFS= read -r plist; do
     /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$plist"
   /usr/libexec/PlistBuddy -c "Set :LSSupportsOpeningDocumentsInPlace true" "$plist" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$plist"
+  # App-i s'perdor enkriptim jo-standard (vetem HTTPS/TLS standarde) - pa kete çelës,
+  # çdo build i ngarkuar mbetet i bllokuar per testues/review derisa dikush te pergjigjet
+  # manualisht ne App Store Connect (ndodhi per build-in 0.5.13). Duke e vendosur direkt
+  # ne Info.plist, Apple e lexon automatikisht ne kohen e ngarkimit.
+  /usr/libexec/PlistBuddy -c "Set :ITSAppUsesNonExemptEncryption false" "$plist" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$plist"
 done < <(find "$APPLE_DIR" -name "Info.plist" -not -path "*/Pods/*")
 
 if [ "$found" -eq 0 ]; then

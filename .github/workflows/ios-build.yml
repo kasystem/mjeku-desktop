@@ -24,6 +24,15 @@
 # "MAC verification failed" edhe kur fjalëkalimi është korrekt.
 #
 # Nisja: GitHub → Actions → "iOS build (.ipa)" → Run workflow
+#
+# TRIGGER I PLANIFIKUAR (schedule): rindërton dhe ringarkon vetvetiu në TestFlight çdo muaj
+# (1 herë/muaj, shumë brenda margjinës së skadimit 90-ditor të TestFlight) — kjo mban
+# gjallë distribuimin External TestFlight pa ndërprerje edhe pse Mjeku s'është ende në
+# App Store publik (i bllokuar nga Guideline 5.1.1(ix)/3.2, gusht 2026 — kërkon llogari
+# Organization, jo Individual). Në rrugën e planifikuar: rrit vetë versionin (patch+1) dhe
+# e commit-on ndryshimin, e forcon export_method=app-store-connect, dhe hap një GitHub
+# Issue nëse dështon diçka — pasi dështim i heshtur këtu do të thotë të gjitha klinikat
+# humbasin qasje njëkohësisht pas 90 ditësh pa dijeninë e askujt.
 name: iOS build (.ipa)
 
 on:
@@ -38,6 +47,12 @@ on:
           - release-testing
           - app-store-connect
           - debugging
+  schedule:
+    - cron: "0 6 1 * *"
+
+permissions:
+  contents: write
+  issues: write
 
 jobs:
   ios-build:
@@ -55,6 +70,36 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: mjeku-desktop
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Rruga e planifikuar (schedule) e vetme: rrit versionin patch (0.5.13 -> 0.5.14) dhe
+      # e commit-on direkt ne main, keshtu qe build-i i ri qe ngarkohet ka nje CFBundleVersion
+      # unik (Apple s'lejon ringarkim te te njejtit numer versioni). Nisjet manuale
+      # (workflow_dispatch) s'e prekin versionin fare.
+      - name: Rrit versionin (vetëm rruga e planifikuar - TestFlight refresh)
+        if: github.event_name == 'schedule'
+        working-directory: mjeku-desktop
+        run: |
+          set -e
+          CONF="src-tauri/tauri.conf.json"
+          CURRENT=$(node -p "require('./$CONF').version")
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+          NEXT="$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "Version: $CURRENT -> $NEXT"
+          node -e "
+            const fs = require('fs');
+            const p = '$CONF';
+            const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+            j.version = '$NEXT';
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+          "
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$CONF"
+          git commit -m "chore: bump version $CURRENT -> $NEXT (automated TestFlight refresh)"
+          git push origin HEAD:main
 
       - name: Checkout mjeku-ui (repo simotër)
         uses: actions/checkout@v4
@@ -141,7 +186,7 @@ jobs:
           IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
         run: >
           npx tauri ios build --ci --target aarch64
-          --export-method ${{ github.event.inputs.export_method || 'release-testing' }}
+          --export-method ${{ github.event_name == 'schedule' && 'app-store-connect' || github.event.inputs.export_method || 'release-testing' }}
 
       - name: Ngarko .ipa si artifact
         uses: actions/upload-artifact@v4
@@ -155,7 +200,7 @@ jobs:
       # pa Mac/Transporter. Kerkon 3 GitHub Secrets: APP_STORE_CONNECT_KEY_ID,
       # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_API_KEY_P8 (base64 i .p8).
       - name: Ngarko ne TestFlight (App Store Connect)
-        if: ${{ github.event.inputs.export_method == 'app-store-connect' }}
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.export_method == 'app-store-connect' }}
         env:
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -168,3 +213,19 @@ jobs:
           xcrun altool --upload-app -f "$IPA_PATH" -t ios \
             --apiKey "$APP_STORE_CONNECT_KEY_ID" \
             --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+
+      # Vetem rruga e planifikuar: dashtim i heshtur ketu do te thote qe brenda 90 ditesh
+      # TE GJITHA klinikat humbasin qasje njekohesisht (build-i TestFlight skadon) pa
+      # dijenine e askujt, prandaj hapim nje GitHub Issue te dukshem ne vend qe te mbeshtetemi
+      # vetem te email-i default i GitHub-it per workflow-e te deshtuara.
+      - name: Njofto deshtimin (vetem rruga e planifikuar)
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          BODY="Build-i mujor automatik i planifikuar per Mjeku (TestFlight refresh) deshtoi.\n\nRun: ${RUN_URL}\n\nURGJENT: nese kjo s'zgjidhet perpara skadimit 90-ditor te build-it te fundit ne TestFlight, TE GJITHA klinikat do te humbasin qasje ne app te njekohesisht. Kontrollo logun e run-it me lart per shkakun (certifikate e skaduar, provisioning profile, credential-e te App Store Connect, etj.) dhe rindiz workflow-in manualisht pasi te rregullohet."
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "iOS TestFlight refresh DESHTOI - $(date -u +%Y-%m-%d)" \
+            --body "$(printf '%b' "$BODY")"
