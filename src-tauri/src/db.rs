@@ -5918,3 +5918,60 @@ impl Db {
         Ok(())
     }
 }
+
+impl Db {
+    pub fn clinical_conditions_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        if patient_id.trim().is_empty() { bail!("patient_id required"); }
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT id, patient_id, code, code_system, code_version, display, clinical_status, verification_status, clinician_id, encounter_id, onset_date, resolved_date, notes FROM clinical_conditions WHERE patient_id = ?1 ORDER BY updated_at DESC, id DESC")?;
+        let rows = stmt.query_map(params![patient_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?, "patientId": row.get::<_, String>(1)?,
+                "code": row.get::<_, String>(2)?, "codeSystem": row.get::<_, String>(3)?,
+                "codeVersion": row.get::<_, String>(4)?, "display": row.get::<_, String>(5)?,
+                "clinicalStatus": row.get::<_, String>(6)?, "verificationStatus": row.get::<_, String>(7)?,
+                "clinicianId": row.get::<_, String>(8)?, "encounterId": row.get::<_, Option<String>>(9)?,
+                "onsetDate": row.get::<_, Option<String>>(10)?, "resolvedDate": row.get::<_, Option<String>>(11)?,
+                "notes": row.get::<_, String>(12)?
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn clinical_condition_create(&self, value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let field = |name: &str| -> anyhow::Result<String> {
+            let text = value.get(name).and_then(|v| v.as_str()).unwrap_or("").trim();
+            if text.is_empty() { bail!("missing {}", name); }
+            Ok(text.to_owned())
+        };
+        let id = Uuid::new_v4().to_string();
+        let patient_id = field("patientId")?;
+        let code = field("code")?;
+        let system = field("codeSystem")?;
+        let version = field("codeVersion")?;
+        let display = field("display")?;
+        let clinician = field("clinicianId")?;
+        let status = field("clinicalStatus")?;
+        let verification = field("verificationStatus")?;
+        if !["active","inactive","resolved","history","entered_in_error"].contains(&status.as_str()) { bail!("invalid clinical status"); }
+        if !["unconfirmed","provisional","confirmed","refuted","entered_in_error"].contains(&verification.as_str()) { bail!("invalid verification status"); }
+        if (status == "entered_in_error") != (verification == "entered_in_error") { bail!("inconsistent entered-in-error status"); }
+        let encounter = value.get("encounterId").and_then(|v|v.as_str());
+        let onset = value.get("onsetDate").and_then(|v|v.as_str());
+        let resolved = value.get("resolvedDate").and_then(|v|v.as_str());
+        if status == "resolved" && resolved.is_none() { bail!("resolution date required"); }
+        if let (Some(a),Some(b))=(onset,resolved) { if b<a { bail!("resolution precedes onset"); } }
+        let notes = value.get("notes").and_then(|v|v.as_str()).unwrap_or("");
+        let now = now_iso();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let existing: i64 = tx.query_row("SELECT COUNT(*) FROM clinical_conditions WHERE patient_id=?1 AND code=?2 AND code_system=?3 AND code_version=?4 AND clinical_status='active'", params![patient_id,code,system,version], |r|r.get(0))?;
+        if existing > 0 && status=="active" { bail!("active condition already exists; review and link existing record"); }
+        tx.execute("INSERT INTO clinical_conditions(id,patient_id,code,code_system,code_version,display,clinical_status,verification_status,clinician_id,encounter_id,onset_date,resolved_date,notes,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",params![id,patient_id,code,system,version,display,status,verification,clinician,encounter,onset,resolved,notes,now])?;
+        tx.execute("INSERT INTO clinical_condition_events(id,condition_id,author_id,recorded_at,event_type,new_value) VALUES (?1,?2,?3,?4,'created',?5)",params![Uuid::new_v4().to_string(),id,clinician,now,value.to_string()])?;
+        tx.commit()?;
+        let mut output=value;
+        output["id"]=serde_json::Value::String(id);
+        Ok(output)
+    }
+}
