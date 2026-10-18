@@ -1864,6 +1864,23 @@ async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> R
     .map_err(err_string)
 }
 
+
+#[tauri::command]
+async fn clinical_conditions_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.clinical_conditions_list(&patient_id)).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn clinical_condition_create(state: tauri::State<'_, AppState>, condition: serde_json::Value) -> Result<serde_json::Value, String> {
+    let session = require_login(&state).await?;
+    if let SessionKind::Doctor { doctor_id, is_admin: false } = &session {
+        if condition.get("clinicianId").and_then(|v|v.as_str()) != Some(doctor_id.as_str()) { return Err("Clinician identity mismatch".into()); }
+    }
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.clinical_condition_create(condition)).await.map_err(err_string)?.map_err(err_string)
+}
+
 #[tauri::command]
 async fn visits_list(
     state: tauri::State<'_, AppState>,
@@ -3949,6 +3966,8 @@ pub fn run() {
             appointments_list,
             appointments_upsert,
             appointments_delete,
+            clinical_conditions_list,
+            clinical_condition_create,
             visits_list,
             visits_upsert,
             visits_delete,
