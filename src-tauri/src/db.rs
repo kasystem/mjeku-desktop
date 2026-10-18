@@ -372,6 +372,7 @@ impl Db {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(MIGRATION_SQL)?;
         Self::run_migrations(&conn)?;
+        conn.execute_batch(include_str!("../migrations/general_practice_core.sql"))?;
 
         Ok(Self {
             db_path,
@@ -387,6 +388,7 @@ impl Db {
         let conn = Connection::open_in_memory().context("open in-memory sqlite")?;
         conn.execute_batch(MIGRATION_SQL)?;
         Self::run_migrations(&conn)?;
+        conn.execute_batch(include_str!("../migrations/general_practice_core.sql"))?;
 
         Ok(Self {
             db_path: PathBuf::new(),
