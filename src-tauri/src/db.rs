@@ -6039,6 +6039,19 @@ mod dental_findings_tests {
     }
 
     #[test]
+    fn periodontal_schema_is_present_in_memory() {
+        let db=Db::new_in_memory().expect("migrations should initialize");
+        let conn=db.conn().expect("sqlite connection");
+        for table in ["dental_periodontal_exams_v1","dental_periodontal_sites_v1"] {
+            let count:i64=conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table],|row|row.get(0)
+            ).expect("schema lookup");
+            assert_eq!(count,1,"missing {}",table);
+        }
+    }
+
+    #[test]
     fn periodontal_rejects_duplicate_sites_and_invalid_fdi() {
         let db=Db::new_in_memory().expect("in-memory migration");
         let site=serde_json::json!({
