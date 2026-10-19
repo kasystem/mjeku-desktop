@@ -6016,6 +6016,29 @@ mod dental_findings_tests {
     }
 
     #[test]
+    fn dental_rejects_invalid_kind_and_status() {
+        let db=Db::new_in_memory().expect("in-memory DB migration");
+        let mut finding=input("16",Some("O"));
+        finding["kind"]=serde_json::json!("unsupported");
+        assert!(db.dental_finding_create(finding,"doctor-test").is_err());
+        let mut planned=input("16",Some("O"));
+        planned["kind"]=serde_json::json!("missing");
+        planned["surface"]=serde_json::Value::Null;
+        planned["status"]=serde_json::json!("planned");
+        assert!(db.dental_finding_create(planned,"doctor-test").is_err());
+    }
+
+    #[test]
+    fn dental_correction_requires_original_record() {
+        let db=Db::new_in_memory().expect("in-memory DB migration");
+        let correction=serde_json::json!({
+            "findingId":"nonexistent","reason":"Documentation error",
+            "kind":"caries","status":"existing","surface":"O","notes":null
+        });
+        assert!(db.dental_finding_correct(correction,"doctor-test").is_err());
+    }
+
+    #[test]
     fn dental_schema_migration_is_idempotent() {
         let db=Db::new_in_memory().expect("in-memory DB migration");
         let conn=db.conn().unwrap();
