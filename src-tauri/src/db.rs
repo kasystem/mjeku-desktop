@@ -5975,3 +5975,55 @@ impl Db {
         Ok(output)
     }
 }
+
+impl Db {
+    pub fn clinical_notes_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        if patient_id.trim().is_empty() { bail!("patient_id required"); }
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT id, patient_id, encounter_id, author_id, version, status, subjective, objective, assessment, plan, previous_version_id FROM clinical_notes WHERE patient_id=?1 ORDER BY created_at DESC,id DESC")?;
+        let rows = stmt.query_map(params![patient_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?, "patientId":r.get::<_,String>(1)?,
+            "encounterId":r.get::<_,String>(2)?, "authorId":r.get::<_,String>(3)?,
+            "version":r.get::<_,i64>(4)?, "status":r.get::<_,String>(5)?,
+            "sections":{"subjective":r.get::<_,String>(6)?,"objective":r.get::<_,String>(7)?,"assessment":r.get::<_,String>(8)?,"plan":r.get::<_,String>(9)?},
+            "previousVersionId":r.get::<_,Option<String>>(10)?
+        })))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn clinical_note_create(&self, value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let required = |key: &str| -> anyhow::Result<String> {
+            let text=value.get(key).and_then(|v|v.as_str()).unwrap_or("").trim();
+            if text.is_empty() { bail!("missing {}",key); }
+            Ok(text.to_owned())
+        };
+        let patient=required("patientId")?;
+        let encounter=required("encounterId")?;
+        let author=required("authorId")?;
+        let status=required("status")?;
+        if status!="draft" && status!="in_review" && status!="finalized" { bail!("invalid initial note status"); }
+        let sections=value.get("sections").ok_or_else(||anyhow!("sections required"))?;
+        let get_section=|key: &str| -> anyhow::Result<String> {
+            Ok(sections.get(key).and_then(|v|v.as_str()).ok_or_else(||anyhow!("missing {}",key))?.to_string())
+        };
+        let subjective=get_section("subjective")?;
+        let objective=get_section("objective")?;
+        let assessment=get_section("assessment")?;
+        let plan=get_section("plan")?;
+        if status=="finalized" && [&subjective,&objective,&assessment,&plan].iter().any(|s|s.trim().is_empty()) { bail!("finalized SOAP requires all sections"); }
+        let id=Uuid::new_v4().to_string();
+        let now=now_iso();
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let belongs: i64=tx.query_row("SELECT COUNT(*) FROM visits WHERE id=?1 AND client_id=?2 AND deleted=0",params![encounter,patient],|r|r.get(0))?;
+        if belongs!=1 { bail!("encounter does not belong to patient"); }
+        tx.execute("INSERT INTO clinical_notes(id,patient_id,encounter_id,author_id,version,status,subjective,objective,assessment,plan,created_at,updated_at) VALUES (?1,?2,?3,?4,1,?5,?6,?7,?8,?9,?10,?10)",
+            params![id,patient,encounter,author,status,subjective,objective,assessment,plan,now])?;
+        tx.commit()?;
+        let mut result=value;
+        result["id"]=serde_json::Value::String(id);
+        result["version"]=serde_json::json!(1);
+        result["previousVersionId"]=serde_json::Value::Null;
+        Ok(result)
+    }
+}
