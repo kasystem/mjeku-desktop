@@ -5920,6 +5920,11 @@ impl Db {
 }
 
 impl Db {
+    pub fn dental_patient_access(&self,patient_id:&str,doctor_id:&str)->anyhow::Result<bool>{
+        let conn=self.conn()?;
+        let count:i64=conn.query_row("SELECT COUNT(*) FROM visits WHERE client_id=?1 AND doctor_id=?2 AND deleted=0",params![patient_id,doctor_id],|r|r.get(0))?;
+        Ok(count>0)
+    }
     pub fn dental_findings_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
         if patient_id.trim().is_empty() { bail!("Patient required"); }
         let conn=self.conn()?;
