@@ -5920,6 +5920,23 @@ impl Db {
 }
 
 impl Db {
+    pub fn clinician_can_access_patient(&self, clinician_id: &str, patient_id: &str) -> anyhow::Result<bool> {
+        let conn=self.conn()?;
+        let count:i64=conn.query_row(
+            "SELECT COUNT(*) FROM visits WHERE client_id=?1 AND doctor_id=?2 AND deleted=0",
+            params![patient_id,clinician_id], |r|r.get(0))?;
+        Ok(count>0)
+    }
+    pub fn clinician_owns_visit(&self, clinician_id: &str, patient_id: &str, visit_id: &str) -> anyhow::Result<bool> {
+        let conn=self.conn()?;
+        let count:i64=conn.query_row(
+            "SELECT COUNT(*) FROM visits WHERE id=?1 AND client_id=?2 AND doctor_id=?3 AND deleted=0",
+            params![visit_id,patient_id,clinician_id], |r|r.get(0))?;
+        Ok(count==1)
+    }
+}
+
+impl Db {
     pub fn clinical_conditions_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
         if patient_id.trim().is_empty() { bail!("patient_id required"); }
         let conn = self.conn()?;
