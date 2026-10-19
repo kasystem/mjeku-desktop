@@ -372,6 +372,7 @@ impl Db {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(MIGRATION_SQL)?;
         Self::run_migrations(&conn)?;
+        conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
         Ok(Self {
             db_path,
@@ -387,6 +388,7 @@ impl Db {
         let conn = Connection::open_in_memory().context("open in-memory sqlite")?;
         conn.execute_batch(MIGRATION_SQL)?;
         Self::run_migrations(&conn)?;
+        conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
         Ok(Self {
             db_path: PathBuf::new(),
@@ -5914,5 +5916,62 @@ impl Db {
             params![inbox_id, visit_id, matched_client_id],
         )?;
         Ok(())
+    }
+}
+
+impl Db {
+    pub fn dental_findings_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        if patient_id.trim().is_empty() { bail!("Patient required"); }
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare("SELECT id,patient_id,tooth_fdi,surface,kind,status,visit_id,clinician_id,recorded_at,notes FROM dental_findings_v1 WHERE patient_id=?1 ORDER BY recorded_at DESC,id DESC")?;
+        let rows=stmt.query_map(params![patient_id],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"patientId":r.get::<_,String>(1)?,
+            "tooth":r.get::<_,String>(2)?,"surface":r.get::<_,Option<String>>(3)?,
+            "kind":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,
+            "visitId":r.get::<_,String>(6)?,"clinicianId":r.get::<_,String>(7)?,
+            "recordedAt":r.get::<_,String>(8)?,"notes":r.get::<_,Option<String>>(9)?
+        })))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn dental_finding_create(&self, value:serde_json::Value, actor_id:&str)->anyhow::Result<serde_json::Value>{
+        let required=|key:&str|->anyhow::Result<String>{
+            let t=value.get(key).and_then(|v|v.as_str()).unwrap_or("").trim();
+            if t.is_empty(){bail!("Missing {}",key);}Ok(t.to_owned())
+        };
+        let patient=required("patientId")?;
+        let visit=required("visitId")?;
+        let tooth=required("tooth")?;
+        let kind=required("kind")?;
+        let status=required("status")?;
+        let surface=value.get("surface").and_then(|v|v.as_str());
+        let notes=value.get("notes").and_then(|v|v.as_str());
+        if !["existing","planned","completed"].contains(&status.as_str()){bail!("Invalid status");}
+        if !["healthy","caries","missing","extracted","impacted","restoration","crown","bridge","implant","root_canal","fracture","temporary_restoration","prosthetic","other"].contains(&kind.as_str()){bail!("Invalid finding kind");}
+        let chars:Vec<char>=tooth.chars().collect();
+        if chars.len()!=2 || !chars.iter().all(|c|c.is_ascii_digit()){bail!("Invalid FDI");}
+        let q=chars[0].to_digit(10).unwrap();
+        let n=chars[1].to_digit(10).unwrap();
+        if !((1..=4).contains(&q)&&(1..=8).contains(&n)||(5..=8).contains(&q)&&(1..=5).contains(&n)){bail!("Invalid FDI tooth");}
+        if let Some(sf)=surface {
+            if !["M","D","B","L","O","I"].contains(&sf){bail!("Invalid surface");}
+            if (1..=3).contains(&n)&&sf=="O" || n>=4&&sf=="I"{bail!("Surface does not match tooth anatomy");}
+        }
+        let id=Uuid::new_v4().to_string();
+        let now=now_iso();
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let exists:i64=tx.query_row("SELECT COUNT(*) FROM visits WHERE id=?1 AND client_id=?2 AND doctor_id=?3 AND deleted=0",params![visit,patient,actor_id],|r|r.get(0))?;
+        if exists!=1{bail!("Visit must belong to patient and acting clinician");}
+        tx.execute("INSERT INTO dental_findings_v1(id,patient_id,visit_id,clinician_id,tooth_fdi,surface,kind,status,notes,recorded_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![id,patient,visit,actor_id,tooth,surface,kind,status,notes,now])?;
+        tx.execute("INSERT INTO dental_finding_events_v1(id,finding_id,actor_id,event_type,occurred_at,payload_json) VALUES (?1,?2,?3,'created',?4,?5)",
+            params![Uuid::new_v4().to_string(),id,actor_id,now,value.to_string()])?;
+        tx.commit()?;
+        let mut out=value;
+        out["id"]=serde_json::json!(id);
+        out["clinicianId"]=serde_json::json!(actor_id);
+        out["recordedAt"]=serde_json::json!(now);
+        Ok(out)
     }
 }
