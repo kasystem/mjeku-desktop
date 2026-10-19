@@ -6044,3 +6044,36 @@ impl Db {
         Ok(result)
     }
 }
+
+impl Db {
+    pub fn clinical_allergies_list(&self, patient_id:&str)->anyhow::Result<Vec<serde_json::Value>>{
+        if patient_id.trim().is_empty(){bail!("patient required");}
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare("SELECT id,patient_id,substance,category,verification,reaction FROM clinical_allergies WHERE patient_id=?1 ORDER BY updated_at DESC")?;
+        let rows=stmt.query_map(params![patient_id],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"patientId":r.get::<_,String>(1)?,
+            "substance":r.get::<_,String>(2)?,"category":r.get::<_,String>(3)?,
+            "verification":r.get::<_,String>(4)?,"reaction":r.get::<_,Option<String>>(5)?
+        })))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+    pub fn clinical_allergy_create(&self, value:serde_json::Value)->anyhow::Result<serde_json::Value>{
+        let required=|key:&str|->anyhow::Result<String>{
+            let text=value.get(key).and_then(|v|v.as_str()).unwrap_or("").trim();
+            if text.is_empty(){bail!("missing {}",key);}Ok(text.to_owned())
+        };
+        let patient=required("patientId")?;
+        let substance=required("substance")?;
+        let category=required("category")?;
+        let verification=required("verification")?;
+        if !["allergy","intolerance","unknown"].contains(&category.as_str()){bail!("invalid category");}
+        if !["unconfirmed","confirmed","refuted"].contains(&verification.as_str()){bail!("invalid verification");}
+        let reaction=value.get("reaction").and_then(|v|v.as_str());
+        let id=Uuid::new_v4().to_string();let now=now_iso();
+        let mut conn=self.conn()?;let tx=conn.transaction()?;
+        tx.execute("INSERT INTO clinical_allergies(id,patient_id,substance,category,verification,reaction,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![id,patient,substance,category,verification,reaction,now])?;
+        tx.commit()?;
+        let mut result=value;result["id"]=serde_json::json!(id);Ok(result)
+    }
+}
