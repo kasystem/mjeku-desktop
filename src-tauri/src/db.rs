@@ -6039,6 +6039,19 @@ mod dental_findings_tests {
     }
 
     #[test]
+    fn periodontal_rejects_missing_clinician_and_invalid_flags() {
+        let db=Db::new_in_memory().expect("in-memory migration");
+        let mut input=serde_json::json!({
+            "patientId":"p","visitId":"v","dentition":"permanent",
+            "measurements":[{"tooth":"16","site":"MB","probingDepthMm":3,
+                "gingivalMarginMm":null,"bleeding":true,"plaque":null,"suppuration":null}]
+        });
+        assert!(db.dental_periodontal_exam_create(input.clone()," ").is_err());
+        input["measurements"][0]["bleeding"]=serde_json::json!("yes");
+        assert!(db.dental_periodontal_exam_create(input,"doctor").is_err());
+    }
+
+    #[test]
     fn periodontal_exam_round_trip_preserves_nullable_sites() {
         let db=Db::new_in_memory().expect("in-memory migration");
         {
@@ -6194,6 +6207,7 @@ impl Db {
             let s=value.get(k).and_then(|v|v.as_str()).unwrap_or("").trim();
             if s.is_empty(){bail!("Missing {}",k);}Ok(s.to_owned())
         };
+        if actor.trim().is_empty(){bail!("Clinician required");}
         let patient=get("patientId")?;
         let visit=get("visitId")?;
         let dentition=get("dentition")?;
