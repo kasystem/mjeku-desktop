@@ -6042,6 +6042,7 @@ impl Db {
         if !["healthy","caries","missing","extracted","impacted","restoration","crown","bridge","implant","root_canal","fracture","temporary_restoration","prosthetic","other"].contains(&kind.as_str()){bail!("Invalid kind");}
         if let Some(sf)=surface{if !["M","D","B","L","O","I"].contains(&sf){bail!("Invalid surface");}}
         if ["missing","extracted","impacted"].contains(&kind.as_str()) && surface.is_some(){bail!("Whole-tooth finding cannot have a surface");}
+        if ["healthy","missing","extracted"].contains(&kind.as_str()) && status=="planned"{bail!("This finding cannot be planned");}
         let mut conn=self.conn()?;let tx=conn.transaction()?;
         let (tooth,owner):(String,String)=tx.query_row(
             "SELECT tooth_fdi,clinician_id FROM dental_findings_v1 WHERE id=?1",
