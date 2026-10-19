@@ -5987,3 +5987,39 @@ impl Db {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod dental_findings_tests {
+    use super::*;
+
+    fn input(tooth:&str,surface:Option<&str>)->serde_json::Value {
+        serde_json::json!({
+            "patientId":"patient-test","visitId":"visit-test","tooth":tooth,
+            "surface":surface,"kind":"caries","status":"existing","notes":"test"
+        })
+    }
+
+    #[test]
+    fn dental_rejects_invalid_fdi_and_surfaces() {
+        let db=Db::new_in_memory().expect("in-memory DB migration");
+        assert!(db.dental_finding_create(input("99",None),"doctor-test").is_err());
+        assert!(db.dental_finding_create(input("16",Some("I")),"doctor-test").is_err());
+        assert!(db.dental_finding_create(input("11",Some("O")),"doctor-test").is_err());
+        assert!(db.dental_finding_create(input("55",Some("O")),"doctor-test").is_err());
+    }
+
+    #[test]
+    fn dental_rejects_unassigned_visit() {
+        let db=Db::new_in_memory().expect("in-memory DB migration");
+        assert!(db.dental_finding_create(input("16",Some("O")),"doctor-test").is_err());
+        assert!(db.dental_findings_list("patient-test").unwrap().is_empty());
+    }
+
+    #[test]
+    fn dental_schema_migration_is_idempotent() {
+        let db=Db::new_in_memory().expect("in-memory DB migration");
+        let conn=db.conn().unwrap();
+        conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql")).unwrap();
+    }
+}
