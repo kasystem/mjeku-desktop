@@ -6039,6 +6039,35 @@ mod dental_findings_tests {
     }
 
     #[test]
+    fn periodontal_rejects_duplicate_sites_and_invalid_fdi() {
+        let db=Db::new_in_memory().expect("in-memory migration");
+        let site=serde_json::json!({
+            "tooth":"16","site":"MB","probingDepthMm":4.0,
+            "gingivalMarginMm":1.0,"bleeding":true,"plaque":false,"suppuration":null
+        });
+        let mut exam=serde_json::json!({
+            "patientId":"patient-test","visitId":"visit-test","dentition":"permanent",
+            "notes":"","measurements":[site.clone(),site]
+        });
+        assert!(db.dental_periodontal_exam_create(exam.clone(),"doctor-test").is_err());
+        exam["measurements"][1]["tooth"]=serde_json::json!("99");
+        assert!(db.dental_periodontal_exam_create(exam,"doctor-test").is_err());
+    }
+
+    #[test]
+    fn periodontal_rejects_unassigned_visit_and_out_of_range_depth() {
+        let db=Db::new_in_memory().expect("in-memory migration");
+        let mut exam=serde_json::json!({
+            "patientId":"patient-test","visitId":"visit-test","dentition":"permanent",
+            "notes":"","measurements":[{"tooth":"16","site":"MB","probingDepthMm":4.0,
+                "gingivalMarginMm":1.0,"bleeding":true,"plaque":null,"suppuration":null}]
+        });
+        assert!(db.dental_periodontal_exam_create(exam.clone(),"doctor-test").is_err());
+        exam["measurements"][0]["probingDepthMm"]=serde_json::json!(31.0);
+        assert!(db.dental_periodontal_exam_create(exam,"doctor-test").is_err());
+    }
+
+    #[test]
     fn dental_schema_migration_is_idempotent() {
         let db=Db::new_in_memory().expect("in-memory DB migration");
         let conn=db.conn().unwrap();
