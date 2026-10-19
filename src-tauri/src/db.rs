@@ -5962,6 +5962,13 @@ impl Db {
             if !["M","D","B","L","O","I"].contains(&sf){bail!("Invalid surface");}
             if (1..=3).contains(&n)&&sf=="O" || n>=4&&sf=="I"{bail!("Surface does not match tooth anatomy");}
         }
+        if ["missing","extracted","impacted"].contains(&kind.as_str()) && surface.is_some() {
+            bail!("Whole-tooth finding cannot have a surface");
+        }
+        if ["healthy","missing","extracted"].contains(&kind.as_str()) && status=="planned" {
+            bail!("This finding cannot be a planned procedure");
+        }
+        if let Some(n)=notes { if n.len()>10_000 { bail!("Notes too long"); } }
         let id=Uuid::new_v4().to_string();
         let now=now_iso();
         let mut conn=self.conn()?;
