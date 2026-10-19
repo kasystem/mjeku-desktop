@@ -1875,9 +1875,7 @@ async fn dental_findings_list(state:tauri::State<'_,AppState>,patient_id:String)
     let db=state.db.clone();
     tokio::task::spawn_blocking(move||{
         if !is_admin {
-            let conn=db.conn()?;
-            let allowed:i64=conn.query_row("SELECT COUNT(*) FROM visits WHERE client_id=?1 AND doctor_id=?2 AND deleted=0",rusqlite::params![patient_id,doctor_id],|r|r.get(0))?;
-            if allowed==0{bail!("Patient access denied");}
+            if !db.dental_patient_access(&patient_id,&doctor_id)?{bail!("Patient access denied");}
         }
         db.dental_findings_list(&patient_id)
     }).await.map_err(err_string)?.map_err(err_string)
