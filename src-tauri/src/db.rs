@@ -6039,6 +6039,35 @@ mod dental_findings_tests {
     }
 
     #[test]
+    fn periodontal_exam_round_trip_preserves_nullable_sites() {
+        let db=Db::new_in_memory().expect("in-memory migration");
+        {
+            let conn=db.conn().expect("connection");
+            conn.execute("INSERT INTO clients(id,name,deleted) VALUES ('perio-patient','Patient',0)",[])
+                .expect("patient fixture");
+            conn.execute("INSERT INTO visits(id,client_id,doctor_id,status,deleted) VALUES ('perio-visit','perio-patient','perio-doctor','open',0)",[])
+                .expect("visit fixture");
+        }
+        let input=serde_json::json!({
+            "patientId":"perio-patient","visitId":"perio-visit","dentition":"permanent",
+            "notes":"Baseline","measurements":[
+                {"tooth":"16","site":"MB","probingDepthMm":4.0,"gingivalMarginMm":1.0,
+                 "bleeding":true,"plaque":false,"suppuration":null},
+                {"tooth":"16","site":"B","probingDepthMm":null,"gingivalMarginMm":-1.0,
+                 "bleeding":null,"plaque":true,"suppuration":false}
+            ]
+        });
+        let saved=db.dental_periodontal_exam_create(input,"perio-doctor").expect("create exam");
+        let history=db.dental_periodontal_exams_list("perio-patient").expect("history");
+        assert_eq!(history.len(),1);
+        assert_eq!(history[0]["id"],saved["id"]);
+        assert_eq!(history[0]["measurements"].as_array().unwrap().len(),2);
+        assert_eq!(history[0]["measurements"][0]["bleeding"],serde_json::json!(true));
+        assert!(history[0]["measurements"][1]["probingDepthMm"].is_null());
+        assert_eq!(history[0]["measurements"][1]["gingivalMarginMm"],serde_json::json!(-1.0));
+    }
+
+    #[test]
     fn periodontal_schema_is_present_in_memory() {
         let db=Db::new_in_memory().expect("migrations should initialize");
         let conn=db.conn().expect("sqlite connection");
