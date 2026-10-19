@@ -1864,6 +1864,36 @@ async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> R
     .map_err(err_string)
 }
 
+
+#[tauri::command]
+async fn dental_findings_list(state:tauri::State<'_,AppState>,patient_id:String)->Result<Vec<serde_json::Value>,String>{
+    let session=require_login(&state).await?;
+    let (doctor_id,is_admin)=match session{
+        SessionKind::Doctor{doctor_id,is_admin}=>(doctor_id,is_admin),
+        _=>return Err("Doctor session required".into())
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move||{
+        if !is_admin {
+            let conn=db.conn()?;
+            let allowed:i64=conn.query_row("SELECT COUNT(*) FROM visits WHERE client_id=?1 AND doctor_id=?2 AND deleted=0",rusqlite::params![patient_id,doctor_id],|r|r.get(0))?;
+            if allowed==0{bail!("Patient access denied");}
+        }
+        db.dental_findings_list(&patient_id)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn dental_finding_create(state:tauri::State<'_,AppState>,finding:serde_json::Value)->Result<serde_json::Value,String>{
+    let session=require_login(&state).await?;
+    let doctor_id=match session{
+        SessionKind::Doctor{doctor_id,..}=>doctor_id,
+        _=>return Err("Doctor session required".into())
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move||db.dental_finding_create(finding,&doctor_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
 #[tauri::command]
 async fn visits_list(
     state: tauri::State<'_, AppState>,
@@ -3949,6 +3979,8 @@ pub fn run() {
             appointments_list,
             appointments_upsert,
             appointments_delete,
+            dental_findings_list,
+            dental_finding_create,
             visits_list,
             visits_upsert,
             visits_delete,
