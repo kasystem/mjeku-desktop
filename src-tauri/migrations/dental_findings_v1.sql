@@ -1,0 +1,21 @@
+-- Dental finding ledger. Additive and idempotent, shares existing clients/visits.
+CREATE TABLE IF NOT EXISTS dental_findings_v1 (
+ id TEXT PRIMARY KEY,
+ patient_id TEXT NOT NULL REFERENCES clients(id),
+ visit_id TEXT NOT NULL REFERENCES visits(id),
+ clinician_id TEXT NOT NULL,
+ tooth_fdi TEXT NOT NULL,
+ surface TEXT,
+ kind TEXT NOT NULL,
+ status TEXT NOT NULL,
+ notes TEXT,
+ recorded_at TEXT NOT NULL,
+ CHECK(status IN ('existing','planned','completed')),
+ CHECK(surface IS NULL OR surface IN ('M','D','B','L','O','I'))
+);
+CREATE INDEX IF NOT EXISTS idx_dental_findings_patient_tooth ON dental_findings_v1(patient_id,tooth_fdi,recorded_at);
+CREATE TABLE IF NOT EXISTS dental_finding_events_v1 (
+ id TEXT PRIMARY KEY, finding_id TEXT NOT NULL REFERENCES dental_findings_v1(id),
+ actor_id TEXT NOT NULL, event_type TEXT NOT NULL,
+ occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL
+);
