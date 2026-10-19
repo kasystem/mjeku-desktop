@@ -6159,7 +6159,7 @@ impl Db {
         let notes=value.get("notes").and_then(|v|v.as_str()).unwrap_or("");
         if notes.len()>10000{bail!("Notes too long");}
         let measures=value.get("measurements").and_then(|v|v.as_array()).ok_or_else(||anyhow!("Measurements array required"))?;
-        if measures.is_empty()||measures.len()>192{bail!("Invalid measurement count");}
+        if measures.is_empty()||measures.len()>(if dentition=="permanent"{192}else{120}){bail!("Invalid measurement count");}
         let mut seen=std::collections::HashSet::new();
         for m in measures {
             let tooth=m.get("tooth").and_then(|v|v.as_str()).ok_or_else(||anyhow!("Missing tooth"))?;
@@ -6173,6 +6173,9 @@ impl Db {
                       else{(5..=8).contains(&q)&&(1..=5).contains(&n)};
             if !valid{bail!("Invalid tooth for dentition");}
             if !seen.insert(format!("{}:{}",tooth,site)){bail!("Duplicate periodontal site");}
+            if ["probingDepthMm","gingivalMarginMm","bleeding","plaque","suppuration"].iter().all(|key|m.get(*key).map_or(true,|v|v.is_null())) {
+                bail!("Empty periodontal site must not be stored");
+            }
             for key in ["probingDepthMm","gingivalMarginMm"] {
                 if let Some(v)=m.get(key).filter(|v|!v.is_null()){
                     let n=v.as_f64().ok_or_else(||anyhow!("Invalid numeric measurement"))?;
