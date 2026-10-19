@@ -1866,6 +1866,27 @@ async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> R
 
 
 
+
+#[tauri::command]
+async fn clinical_allergies_list(state:tauri::State<'_,AppState>,patient_id:String)->Result<Vec<serde_json::Value>,String>{
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move||{
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)?{bail!("Patient access denied");}
+        db.clinical_allergies_list(&patient_id)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn clinical_allergy_create(state:tauri::State<'_,AppState>,allergy:serde_json::Value)->Result<serde_json::Value,String>{
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let patient_id=allergy.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move||{
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)?{bail!("Patient access denied");}
+        db.clinical_allergy_create(allergy)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+
 // Clinical commands are restricted to authenticated clinicians.
 // Non-admin doctors may access only patients with an assigned visit.
 async fn clinical_actor(state: &tauri::State<'_, AppState>) -> Result<(String,bool),String> {
@@ -4005,6 +4026,8 @@ pub fn run() {
             appointments_list,
             appointments_upsert,
             appointments_delete,
+            clinical_allergies_list,
+            clinical_allergy_create,
             clinical_notes_list,
             clinical_note_create,
             clinical_conditions_list,
