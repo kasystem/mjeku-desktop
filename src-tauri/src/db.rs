@@ -6023,3 +6023,48 @@ mod dental_findings_tests {
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql")).unwrap();
     }
 }
+
+impl Db {
+    pub fn dental_finding_correct(&self,value:serde_json::Value,actor_id:&str)->anyhow::Result<serde_json::Value>{
+        let get=|k:&str|->anyhow::Result<String>{
+            let v=value.get(k).and_then(|x|x.as_str()).unwrap_or("").trim();
+            if v.is_empty(){bail!("Missing {}",k);}Ok(v.to_owned())
+        };
+        let finding_id=get("findingId")?;
+        let reason=get("reason")?;
+        let kind=get("kind")?;
+        let status=get("status")?;
+        let surface=value.get("surface").and_then(|x|x.as_str());
+        let notes=value.get("notes").and_then(|x|x.as_str());
+        if reason.len()>2000{bail!("Reason too long");}
+        if notes.map_or(false,|n|n.len()>10000){bail!("Notes too long");}
+        if !["existing","planned","completed"].contains(&status.as_str()){bail!("Invalid status");}
+        if !["healthy","caries","missing","extracted","impacted","restoration","crown","bridge","implant","root_canal","fracture","temporary_restoration","prosthetic","other"].contains(&kind.as_str()){bail!("Invalid kind");}
+        if let Some(sf)=surface{if !["M","D","B","L","O","I"].contains(&sf){bail!("Invalid surface");}}
+        if ["missing","extracted","impacted"].contains(&kind.as_str()) && surface.is_some(){bail!("Whole-tooth finding cannot have a surface");}
+        let mut conn=self.conn()?;let tx=conn.transaction()?;
+        let (tooth,owner):(String,String)=tx.query_row(
+            "SELECT tooth_fdi,clinician_id FROM dental_findings_v1 WHERE id=?1",
+            params![finding_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if owner!=actor_id{bail!("Only the recording clinician can correct this finding");}
+        let n=tooth.chars().nth(1).unwrap_or('0').to_digit(10).unwrap_or(0);
+        if let Some(sf)=surface{if (n<=3&&sf=="O")||(n>=4&&sf=="I"){bail!("Invalid tooth surface");}}
+        let id=Uuid::new_v4().to_string();let now=now_iso();
+        tx.execute("INSERT INTO dental_finding_corrections_v1(id,finding_id,actor_id,reason,corrected_kind,corrected_status,corrected_surface,corrected_notes,corrected_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![id,finding_id,actor_id,reason,kind,status,surface,notes,now])?;
+        tx.execute("INSERT INTO dental_finding_events_v1(id,finding_id,actor_id,event_type,occurred_at,payload_json) VALUES (?1,?2,?3,'corrected',?4,?5)",
+            params![Uuid::new_v4().to_string(),finding_id,actor_id,now,value.to_string()])?;
+        tx.commit()?;
+        let mut out=value;out["id"]=serde_json::json!(id);out["correctedAt"]=serde_json::json!(now);Ok(out)
+    }
+    pub fn dental_finding_corrections_list(&self,patient_id:&str)->anyhow::Result<Vec<serde_json::Value>>{
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare("SELECT c.id,c.finding_id,c.actor_id,c.reason,c.corrected_kind,c.corrected_status,c.corrected_surface,c.corrected_notes,c.corrected_at FROM dental_finding_corrections_v1 c JOIN dental_findings_v1 f ON f.id=c.finding_id WHERE f.patient_id=?1 ORDER BY c.corrected_at,c.id")?;
+        let rows=stmt.query_map(params![patient_id],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"findingId":r.get::<_,String>(1)?,"actorId":r.get::<_,String>(2)?,
+            "reason":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,
+            "surface":r.get::<_,Option<String>>(6)?,"notes":r.get::<_,Option<String>>(7)?,"correctedAt":r.get::<_,String>(8)?
+        })))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+}
