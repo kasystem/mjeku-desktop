@@ -6092,3 +6092,85 @@ impl Db {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 }
+
+impl Db {
+    pub fn dental_periodontal_exams_list(&self,patient_id:&str)->anyhow::Result<Vec<serde_json::Value>> {
+        if patient_id.trim().is_empty(){bail!("Patient required");}
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare("SELECT id,patient_id,visit_id,clinician_id,dentition,recorded_at,notes FROM dental_periodontal_exams_v1 WHERE patient_id=?1 ORDER BY recorded_at DESC,id DESC")?;
+        let exams=stmt.query_map(params![patient_id],|r|Ok((
+            r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,
+            r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?
+        )))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut output=Vec::new();
+        for (id,patient,visit,clinician,dentition,recorded,notes) in exams {
+            let mut sites=conn.prepare("SELECT tooth_fdi,site,probing_depth_mm,gingival_margin_mm,bleeding,plaque,suppuration FROM dental_periodontal_sites_v1 WHERE exam_id=?1 ORDER BY tooth_fdi,site")?;
+            let measures=sites.query_map(params![id],|r|Ok(serde_json::json!({
+                "tooth":r.get::<_,String>(0)?,"site":r.get::<_,String>(1)?,
+                "probingDepthMm":r.get::<_,Option<f64>>(2)?,"gingivalMarginMm":r.get::<_,Option<f64>>(3)?,
+                "bleeding":r.get::<_,Option<i64>>(4)?.map(|x|x==1),
+                "plaque":r.get::<_,Option<i64>>(5)?.map(|x|x==1),
+                "suppuration":r.get::<_,Option<i64>>(6)?.map(|x|x==1)
+            })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            output.push(serde_json::json!({"id":id,"patientId":patient,"visitId":visit,
+                "clinicianId":clinician,"dentition":dentition,"recordedAt":recorded,"notes":notes,"measurements":measures}));
+        }
+        Ok(output)
+    }
+
+    pub fn dental_periodontal_exam_create(&self,value:serde_json::Value,actor:&str)->anyhow::Result<serde_json::Value>{
+        let get=|k:&str|->anyhow::Result<String>{
+            let s=value.get(k).and_then(|v|v.as_str()).unwrap_or("").trim();
+            if s.is_empty(){bail!("Missing {}",k);}Ok(s.to_owned())
+        };
+        let patient=get("patientId")?;
+        let visit=get("visitId")?;
+        let dentition=get("dentition")?;
+        if !["permanent","primary"].contains(&dentition.as_str()){bail!("Invalid dentition");}
+        let notes=value.get("notes").and_then(|v|v.as_str()).unwrap_or("");
+        if notes.len()>10000{bail!("Notes too long");}
+        let measures=value.get("measurements").and_then(|v|v.as_array()).ok_or_else(||anyhow!("Measurements array required"))?;
+        if measures.is_empty()||measures.len()>192{bail!("Invalid measurement count");}
+        let mut seen=std::collections::HashSet::new();
+        for m in measures {
+            let tooth=m.get("tooth").and_then(|v|v.as_str()).ok_or_else(||anyhow!("Missing tooth"))?;
+            let site=m.get("site").and_then(|v|v.as_str()).ok_or_else(||anyhow!("Missing site"))?;
+            if !["MB","B","DB","ML","L","DL"].contains(&site){bail!("Invalid periodontal site");}
+            let chars:Vec<char>=tooth.chars().collect();
+            if chars.len()!=2||!chars.iter().all(|c|c.is_ascii_digit()){bail!("Invalid FDI");}
+            let q=chars[0].to_digit(10).unwrap();
+            let n=chars[1].to_digit(10).unwrap();
+            let valid=if dentition=="permanent"{(1..=4).contains(&q)&&(1..=8).contains(&n)}
+                      else{(5..=8).contains(&q)&&(1..=5).contains(&n)};
+            if !valid{bail!("Invalid tooth for dentition");}
+            if !seen.insert(format!("{}:{}",tooth,site)){bail!("Duplicate periodontal site");}
+            for key in ["probingDepthMm","gingivalMarginMm"] {
+                if let Some(v)=m.get(key).filter(|v|!v.is_null()){
+                    let n=v.as_f64().ok_or_else(||anyhow!("Invalid numeric measurement"))?;
+                    if !n.is_finite() || (key=="probingDepthMm"&&(n<0.0||n>30.0))
+                        || (key=="gingivalMarginMm"&&n.abs()>30.0){bail!("Measurement out of range");}
+                }
+            }
+            for key in ["bleeding","plaque","suppuration"] {
+                if let Some(v)=m.get(key).filter(|v|!v.is_null()){
+                    if !v.is_boolean(){bail!("Invalid boolean measurement");}
+                }
+            }
+        }
+        let id=Uuid::new_v4().to_string();let now=now_iso();
+        let mut conn=self.conn()?;let tx=conn.transaction()?;
+        let owned:i64=tx.query_row("SELECT COUNT(*) FROM visits WHERE id=?1 AND client_id=?2 AND doctor_id=?3 AND deleted=0",params![visit,patient,actor],|r|r.get(0))?;
+        if owned!=1{bail!("Visit must belong to patient and acting clinician");}
+        tx.execute("INSERT INTO dental_periodontal_exams_v1(id,patient_id,visit_id,clinician_id,dentition,recorded_at,notes) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![id,patient,visit,actor,dentition,now,notes])?;
+        for m in measures {
+            let flag=|k:&str|m.get(k).and_then(|v|v.as_bool()).map(|v|if v{1_i64}else{0_i64});
+            tx.execute("INSERT INTO dental_periodontal_sites_v1(exam_id,tooth_fdi,site,probing_depth_mm,gingival_margin_mm,bleeding,plaque,suppuration) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![id,m["tooth"].as_str(),m["site"].as_str(),m["probingDepthMm"].as_f64(),m["gingivalMarginMm"].as_f64(),
+                    flag("bleeding"),flag("plaque"),flag("suppuration")])?;
+        }
+        tx.commit()?;
+        Ok(serde_json::json!({"id":id,"patientId":patient,"visitId":visit,"clinicianId":actor,
+            "dentition":dentition,"recordedAt":now,"notes":notes,"measurements":measures}))
+    }
+}
