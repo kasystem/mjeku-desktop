@@ -6262,3 +6262,33 @@ impl Db {
             "dentition":dentition,"recordedAt":now,"notes":notes,"measurements":measures}))
     }
 }
+
+
+impl Db {
+    pub fn dental_treatment_plans_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        if patient_id.trim().is_empty() { bail!("Patient required"); }
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare("SELECT id,visit_id,clinician_id,version,status,title,currency,notes,created_at,updated_at FROM dental_treatment_plans_v1 WHERE patient_id=?1 ORDER BY created_at DESC")?;
+        let plans=stmt.query_map(params![patient_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"patientId":patient_id,"visitId":r.get::<_,String>(1)?,
+            "clinicianId":r.get::<_,String>(2)?,"version":r.get::<_,i64>(3)?,
+            "status":r.get::<_,String>(4)?,"title":r.get::<_,String>(5)?,
+            "currency":r.get::<_,String>(6)?,"notes":r.get::<_,String>(7)?,
+            "createdAt":r.get::<_,String>(8)?,"updatedAt":r.get::<_,String>(9)?
+        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut result=Vec::new();
+        for mut plan in plans {
+            let id=plan["id"].as_str().unwrap_or("").to_owned();
+            let mut items=conn.prepare("SELECT id,phase_number,tooth_fdi,procedure_name,quantity,unit_price_cents,position,notes FROM dental_treatment_plan_items_v1 WHERE plan_id=?1 ORDER BY phase_number,position")?;
+            let rows=items.query_map(params![id],|r|Ok(serde_json::json!({
+                "id":r.get::<_,String>(0)?,"phaseNumber":r.get::<_,i64>(1)?,
+                "tooth":r.get::<_,Option<String>>(2)?,"procedureName":r.get::<_,String>(3)?,
+                "quantity":r.get::<_,f64>(4)?,"unitPriceCents":r.get::<_,i64>(5)?,
+                "position":r.get::<_,i64>(6)?,"notes":r.get::<_,String>(7)?
+            })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            plan["items"]=serde_json::json!(rows);
+            result.push(plan);
+        }
+        Ok(result)
+    }
+}
