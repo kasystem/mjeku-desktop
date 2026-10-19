@@ -1866,37 +1866,58 @@ async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> R
 
 
 
-#[tauri::command]
-async fn clinical_notes_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>, String> {
-    let _ = require_login(&state).await?;
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.clinical_notes_list(&patient_id)).await.map_err(err_string)?.map_err(err_string)
-}
-
-#[tauri::command]
-async fn clinical_note_create(state: tauri::State<'_, AppState>, note: serde_json::Value) -> Result<serde_json::Value, String> {
-    let session=require_login(&state).await?;
-    if let SessionKind::Doctor { doctor_id, is_admin: false } = &session {
-        if note.get("authorId").and_then(|v|v.as_str())!=Some(doctor_id.as_str()) { return Err("Author identity mismatch".into()); }
+// Clinical commands are restricted to authenticated clinicians.
+// Non-admin doctors may access only patients with an assigned visit.
+async fn clinical_actor(state: &tauri::State<'_, AppState>) -> Result<(String,bool),String> {
+    match require_login(state).await? {
+        SessionKind::Doctor { doctor_id, is_admin } => Ok((doctor_id,is_admin)),
+        _ => Err("Clinical access requires a doctor session".into())
     }
+}
+#[tauri::command]
+async fn clinical_notes_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>,String> {
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
     let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.clinical_note_create(note)).await.map_err(err_string)?.map_err(err_string)
-}
-
-#[tauri::command]
-async fn clinical_conditions_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>, String> {
-    let _ = require_login(&state).await?;
-    let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.clinical_conditions_list(&patient_id)).await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
+        db.clinical_notes_list(&patient_id)
+    }).await.map_err(err_string)?.map_err(err_string)
 }
 #[tauri::command]
-async fn clinical_condition_create(state: tauri::State<'_, AppState>, condition: serde_json::Value) -> Result<serde_json::Value, String> {
-    let session = require_login(&state).await?;
-    if let SessionKind::Doctor { doctor_id, is_admin: false } = &session {
-        if condition.get("clinicianId").and_then(|v|v.as_str()) != Some(doctor_id.as_str()) { return Err("Clinician identity mismatch".into()); }
-    }
-    let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.clinical_condition_create(condition)).await.map_err(err_string)?.map_err(err_string)
+async fn clinical_note_create(state: tauri::State<'_, AppState>, note: serde_json::Value) -> Result<serde_json::Value,String> {
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let patient_id=note.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
+    let visit_id=note.get("encounterId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
+    if note.get("authorId").and_then(|v|v.as_str())!=Some(doctor_id.as_str()) { return Err("Author identity mismatch".into()); }
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.clinician_owns_visit(&doctor_id,&patient_id,&visit_id)? { bail!("Encounter access denied"); }
+        db.clinical_note_create(note)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn clinical_conditions_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>,String> {
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
+        db.clinical_conditions_list(&patient_id)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn clinical_condition_create(state: tauri::State<'_, AppState>, condition: serde_json::Value) -> Result<serde_json::Value,String> {
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    if condition.get("clinicianId").and_then(|v|v.as_str())!=Some(doctor_id.as_str()) { return Err("Clinician identity mismatch".into()); }
+    let patient_id=condition.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
+    let encounter=condition.get("encounterId").and_then(|v|v.as_str()).map(str::to_owned);
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
+        if let Some(ref visit_id)=encounter {
+            if !is_admin && !db.clinician_owns_visit(&doctor_id,&patient_id,visit_id)? { bail!("Encounter access denied"); }
+        }
+        db.clinical_condition_create(condition)
+    }).await.map_err(err_string)?.map_err(err_string)
 }
 
 #[tauri::command]
