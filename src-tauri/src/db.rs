@@ -6005,7 +6005,7 @@ mod dental_findings_tests {
         assert!(db.dental_finding_create(input("99",None),"doctor-test").is_err());
         assert!(db.dental_finding_create(input("16",Some("I")),"doctor-test").is_err());
         assert!(db.dental_finding_create(input("11",Some("O")),"doctor-test").is_err());
-        assert!(db.dental_finding_create(input("55",Some("O")),"doctor-test").is_err());
+        assert!(db.dental_finding_create(input("56",Some("O")),"doctor-test").is_err());
     }
 
     #[test]
