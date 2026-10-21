@@ -38,8 +38,6 @@ use crate::models::{
 use crate::sync_engine::SyncEngine;
 use crate::updates::UpdatesEngine;
 
-const LOGS_ADMIN_USER: &str = "fatlindadmin";
-const LOGS_ADMIN_PASS: &str = "Fatlind0)";
 const FISCAL_PRINTER_PROVIDER_KEY: &str = "fiscal_printer_provider";
 const SEF_PRINTER_NAME_KEY: &str = "sef_printer_name";
 const KEY_SUPABASE_URL: &str = "supabase_url";
@@ -1035,36 +1033,21 @@ async fn auth_user_login(
     Ok(true)
 }
 
+// Legacy standalone logs-admin password login is intentionally disabled.
+// Logs administrators must authenticate through the existing role-based user login.
+// Never reintroduce a shared credential compiled into the executable.
 #[tauri::command]
 async fn auth_logs_admin_login(
     state: tauri::State<'_, AppState>,
-    username: String,
-    password: String,
+    _username: String,
+    _password: String,
 ) -> Result<bool, String> {
-    let user = username.trim().to_lowercase();
-    let pass = password.trim();
-    if user != LOGS_ADMIN_USER || pass != LOGS_ADMIN_PASS {
-        append_error_log(
-            state.inner(),
-            "auth_logs_admin_login",
-            "hyrje e pasakte per logs_admin",
-        );
-        return Ok(false);
-    }
-
-    let db = state.db.clone();
-    tokio::task::spawn_blocking(move || crate::auth::session_set_logs_admin(&db))
-        .await
-        .map_err(err_string)?
-        .map_err(err_string)?;
-
-    state
-        .auth
-        .set_session(SessionKind::User {
-            role: crate::auth::UserRole::LogsAdmin,
-        })
-        .await;
-    Ok(true)
+    append_error_log(
+        state.inner(),
+        "auth_logs_admin_login",
+        "legacy logs-admin login rejected",
+    );
+    Ok(false)
 }
 
 #[tauri::command]
