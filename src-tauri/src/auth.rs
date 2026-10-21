@@ -401,27 +401,18 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
     let raw = db.setting_get(KEY_SESSION)?.unwrap_or_default();
     let raw = raw.trim();
     if raw.is_empty() {
-        // Legacy fallback.
-        if db
-            .setting_get(KEY_USER_LOGGED_IN)?
-            .unwrap_or_default()
-            .trim()
-            == "1"
-        {
-            let _ = db.setting_set(KEY_SESSION, "owner");
-            return Ok(SessionKind::User {
-                role: UserRole::Owner,
-            });
+        // Never promote the legacy login flag into an authenticated owner session.
+        // Old installations must log in again using their real password.
+        if db.setting_get(KEY_USER_LOGGED_IN)?.as_deref() == Some("1") {
+            session_clear(db)?;
         }
         return Ok(SessionKind::None);
     }
 
     if raw.eq_ignore_ascii_case("user") {
-        // Legacy value.
-        let _ = db.setting_set(KEY_SESSION, "owner");
-        return Ok(SessionKind::User {
-            role: UserRole::Owner,
-        });
+        // A legacy generic session marker must not imply owner privileges.
+        session_clear(db)?;
+        return Ok(SessionKind::None);
     }
     if raw.eq_ignore_ascii_case("owner") {
         return Ok(SessionKind::User {
@@ -606,6 +597,23 @@ mod security_session_tests {
         assert!(matches!(user_verify_role(&db, "owner-test-123").unwrap(), Some(UserRole::Owner)));
         assert!(matches!(user_verify_role(&db, "cashier-test-123").unwrap(), Some(UserRole::Cashier)));
         assert!(user_verify_role(&db, "incorrect").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_login_flag_does_not_grant_owner_access() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "").unwrap();
+        db.setting_set(KEY_USER_LOGGED_IN, "1").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_USER_LOGGED_IN).unwrap().as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn legacy_generic_user_marker_does_not_grant_owner_access() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "user").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
     }
 
     #[test]
