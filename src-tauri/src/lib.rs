@@ -953,6 +953,9 @@ async fn auth_admin_unlock(
     state: tauri::State<'_, AppState>,
     password: String,
 ) -> Result<bool, String> {
+    let _ = require_login(&state).await?;
+    // A failed attempt must not preserve a previously unlocked admin state.
+    state.auth.admin_lock().await;
     let db = state.db.clone();
     let ok = tokio::task::spawn_blocking(move || crate::auth::admin_verify(&db, &password))
         .await
