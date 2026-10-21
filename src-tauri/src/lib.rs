@@ -1202,9 +1202,9 @@ async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKi
 }
 
 async fn require_logs_admin(state: &tauri::State<'_, AppState>) -> Result<(), String> {
-    // The legacy logs-admin identity is no longer issued by any login path.
-    // Allow only an active licensed session with explicit admin unlock.
-    let _ = require_login(state).await?;
+    // Error logs contain potentially sensitive diagnostic and patient metadata.
+    // Require both an owner-level role and a separate admin unlock.
+    let _ = require_owner(state).await?;
     if !state.auth.is_admin_unlocked().await {
         return Err("nuk ke akses ne error logs".to_string());
     }
