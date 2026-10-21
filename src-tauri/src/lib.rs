@@ -554,9 +554,19 @@ async fn get_app_info(
 
 #[tauri::command]
 async fn auth_get_state(state: tauri::State<'_, AppState>) -> Result<AuthStateInfo, String> {
+    // Revalidate persisted session expiry on every state refresh instead of
+    // trusting an indefinitely cached in-memory role.
     let db = state.db.clone();
+    let session = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    state.auth.set_session(session.clone()).await;
+    if matches!(session, SessionKind::None) {
+        state.auth.admin_lock().await;
+    }
     let admin_unlocked = state.auth.is_admin_unlocked().await;
-    let session = state.auth.session().await;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || crate::auth::read_state(&db, admin_unlocked, session))
         .await
         .map_err(err_string)?
