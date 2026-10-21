@@ -1307,28 +1307,25 @@ async fn settings_set(
             | "session"
     );
     if protected {
-        if !state.auth.is_admin_unlocked().await {
-            // During first-time setup (app not configured yet), allow bootstrap of
-            // vendor-sensitive connectivity keys without admin unlock.
-            let setup_bootstrap_key = matches!(
-                k.as_str(),
-                "supabase_url"
-                    | "supabase_api_key"
-                    | "supabase_anon_key"
-                    | "update_base_url"
-                    | "desktop_update_api"
-            );
-            if setup_bootstrap_key {
-                let db = state.db.clone();
-                let configured =
-                    tokio::task::spawn_blocking(move || crate::auth::is_configured(&db))
-                        .await
-                        .map_err(err_string)?
-                        .map_err(err_string)?;
-                if configured {
-                    return Err("kjo vlere kerkon hyrje si admin".to_string());
-                }
-            } else {
+        // For an already configured installation, vendor-admin unlock alone is
+        // insufficient: also require an active, licensed login session.
+        // Preserve first-time bootstrap only for the explicitly allowed keys.
+        let db = state.db.clone();
+        let configured = tokio::task::spawn_blocking(move || crate::auth::is_configured(&db))
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?;
+        let setup_bootstrap_key = matches!(
+            k.as_str(),
+            "supabase_url"
+                | "supabase_api_key"
+                | "supabase_anon_key"
+                | "update_base_url"
+                | "desktop_update_api"
+        );
+        if configured || !setup_bootstrap_key {
+            let _ = require_login(&state).await?;
+            if !state.auth.is_admin_unlocked().await {
                 return Err("kjo vlere kerkon hyrje si admin".to_string());
             }
         }
