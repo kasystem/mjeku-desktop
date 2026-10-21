@@ -1036,16 +1036,8 @@ async fn auth_user_login(
                 .await;
         }
         crate::auth::UserRole::LogsAdmin => {
-            tokio::task::spawn_blocking(move || crate::auth::session_set_logs_admin(&db2))
-                .await
-                .map_err(err_string)?
-                .map_err(err_string)?;
-            state
-                .auth
-                .set_session(SessionKind::User {
-                    role: crate::auth::UserRole::LogsAdmin,
-                })
-                .await;
+            // Legacy privileged identity must never be granted through normal login.
+            return Err("ky rol nuk lejohet per hyrje".to_string());
         }
     }
 
@@ -1185,7 +1177,7 @@ async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind
         SessionKind::None => Err("duhet te hysh per te vazhduar".to_string()),
         SessionKind::User {
             role: crate::auth::UserRole::LogsAdmin,
-        } => Ok(s),
+        } => Err("ky rol nuk lejohet per hyrje".to_string()),
         _ => {
             if !state.license.is_ok().await {
                 return Err("licenca skadoi ose eshte e bllokuar".to_string());
