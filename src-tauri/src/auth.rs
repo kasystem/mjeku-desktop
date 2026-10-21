@@ -20,6 +20,8 @@ const KEY_USER_LOGGED_IN: &str = "user_logged_in";
 // Session is persisted so the app keeps working fully offline across restarts.
 // Values: "" | "owner" | "cashier" | "doctor:<doctor_id>"
 const KEY_SESSION: &str = "session";
+const KEY_SESSION_EXPIRES_AT: &str = "session_expires_at";
+const SESSION_LIFETIME_HOURS: i64 = 12;
 
 #[derive(Debug, Clone)]
 pub enum UserRole {
@@ -400,28 +402,29 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
 
     let raw = db.setting_get(KEY_SESSION)?.unwrap_or_default();
     let raw = raw.trim();
+    if !raw.is_empty() {
+        let expires = db.setting_get(KEY_SESSION_EXPIRES_AT)?.unwrap_or_default();
+        let valid = chrono::DateTime::parse_from_rfc3339(expires.trim())
+            .map(|t| t.with_timezone(&chrono::Utc) > chrono::Utc::now())
+            .unwrap_or(false);
+        if !valid {
+            session_clear(db)?;
+            return Ok(SessionKind::None);
+        }
+    }
     if raw.is_empty() {
-        // Legacy fallback.
-        if db
-            .setting_get(KEY_USER_LOGGED_IN)?
-            .unwrap_or_default()
-            .trim()
-            == "1"
-        {
-            let _ = db.setting_set(KEY_SESSION, "owner");
-            return Ok(SessionKind::User {
-                role: UserRole::Owner,
-            });
+        // Never promote the legacy login flag into an authenticated owner session.
+        // Old installations must log in again using their real password.
+        if db.setting_get(KEY_USER_LOGGED_IN)?.as_deref() == Some("1") {
+            session_clear(db)?;
         }
         return Ok(SessionKind::None);
     }
 
     if raw.eq_ignore_ascii_case("user") {
-        // Legacy value.
-        let _ = db.setting_set(KEY_SESSION, "owner");
-        return Ok(SessionKind::User {
-            role: UserRole::Owner,
-        });
+        // A legacy generic session marker must not imply owner privileges.
+        session_clear(db)?;
+        return Ok(SessionKind::None);
     }
     if raw.eq_ignore_ascii_case("owner") {
         return Ok(SessionKind::User {
@@ -434,14 +437,16 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
         });
     }
     if raw.eq_ignore_ascii_case("logs_admin") {
-        return Ok(SessionKind::User {
-            role: UserRole::LogsAdmin,
-        });
+        // The legacy shared-credential login was retired. Never restore a
+        // privileged session persisted by an older application version.
+        session_clear(db)?;
+        return Ok(SessionKind::None);
     }
 
     if let Some(rest) = raw.strip_prefix("doctor:") {
         let doctor_id = rest.trim().to_string();
         if doctor_id.is_empty() {
+            session_clear(db)?;
             return Ok(SessionKind::None);
         }
 
@@ -467,10 +472,19 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
         });
     }
 
+    // Unknown or corrupted session values must not remain persisted.
+    session_clear(db)?;
     Ok(SessionKind::None)
 }
 
+fn session_set_expiry(db: &Db) -> anyhow::Result<()> {
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(SESSION_LIFETIME_HOURS)).to_rfc3339();
+    db.setting_set(KEY_SESSION_EXPIRES_AT, &expiry)?;
+    Ok(())
+}
+
 pub fn session_set_user(db: &Db) -> anyhow::Result<()> {
+    session_set_expiry(db)?;
     db.setting_set(KEY_SESSION, "owner")?;
     // Legacy key for older UI bundles.
     db.setting_set(KEY_USER_LOGGED_IN, "1")?;
@@ -478,12 +492,14 @@ pub fn session_set_user(db: &Db) -> anyhow::Result<()> {
 }
 
 pub fn session_set_cashier(db: &Db) -> anyhow::Result<()> {
+    session_set_expiry(db)?;
     db.setting_set(KEY_SESSION, "cashier")?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(())
 }
 
 pub fn session_set_logs_admin(db: &Db) -> anyhow::Result<()> {
+    session_set_expiry(db)?;
     db.setting_set(KEY_SESSION, "logs_admin")?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(())
@@ -498,6 +514,7 @@ pub fn session_set_doctor(db: &Db, doctor_id: &str) -> anyhow::Result<SessionKin
         .doctor_account_get(doctor_id)?
         .map(|(_, _, a)| a)
         .unwrap_or(false);
+    session_set_expiry(db)?;
     db.setting_set(KEY_SESSION, &format!("doctor:{doctor_id}"))?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(SessionKind::Doctor {
@@ -507,6 +524,7 @@ pub fn session_set_doctor(db: &Db, doctor_id: &str) -> anyhow::Result<SessionKin
 }
 
 pub fn session_clear(db: &Db) -> anyhow::Result<()> {
+    db.setting_set(KEY_SESSION_EXPIRES_AT, "")?;
     db.setting_set(KEY_SESSION, "")?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(())
@@ -575,4 +593,98 @@ pub fn doctor_account_update(
     };
     db.doctor_account_set(doctor_id, &salt, &hash, is_admin, &now)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod security_session_tests {
+    use super::*;
+
+    fn configured_db() -> Db {
+        let db = Db::new_in_memory().expect("in-memory database");
+        setup_v2(&db, "Test clinic", "vendor-admin-test-123", "owner-test-123", Some("cashier-test-123"))
+            .expect("configure test clinic");
+        db
+    }
+
+    #[test]
+    fn persisted_legacy_logs_admin_is_revoked() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "logs_admin").unwrap();
+        db.setting_set(KEY_USER_LOGGED_IN, "1").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+        assert_eq!(db.setting_get(KEY_USER_LOGGED_IN).unwrap().as_deref(), Some("0"));
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+    }
+
+    #[test]
+    fn regular_role_login_remains_available() {
+        let db = configured_db();
+        assert!(matches!(user_verify_role(&db, "owner-test-123").unwrap(), Some(UserRole::Owner)));
+        assert!(matches!(user_verify_role(&db, "cashier-test-123").unwrap(), Some(UserRole::Cashier)));
+        assert!(user_verify_role(&db, "incorrect").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_login_flag_does_not_grant_owner_access() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "").unwrap();
+        db.setting_set(KEY_USER_LOGGED_IN, "1").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_USER_LOGGED_IN).unwrap().as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn legacy_generic_user_marker_does_not_grant_owner_access() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "user").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn malformed_doctor_session_is_cleared() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "doctor:").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn unknown_session_marker_is_cleared() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "unrecognized_role").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn expired_owner_session_is_revoked() {
+        let db = configured_db();
+        session_set_user(&db).unwrap();
+        db.setting_set(KEY_SESSION_EXPIRES_AT, "2000-01-01T00:00:00Z").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn session_without_expiry_requires_reauthentication() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "owner").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+    }
+
+    #[test]
+    fn cashier_session_receives_expiry() {
+        let db = configured_db();
+        session_set_cashier(&db).unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { role: UserRole::Cashier }));
+    }
+
+    #[test]
+    fn owner_session_is_not_revoked_by_legacy_admin_cleanup() {
+        let db = configured_db();
+        session_set_user(&db).unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { role: UserRole::Owner }));
+    }
 }

@@ -38,8 +38,6 @@ use crate::models::{
 use crate::sync_engine::SyncEngine;
 use crate::updates::UpdatesEngine;
 
-const LOGS_ADMIN_USER: &str = "fatlindadmin";
-const LOGS_ADMIN_PASS: &str = "Fatlind0)";
 const FISCAL_PRINTER_PROVIDER_KEY: &str = "fiscal_printer_provider";
 const SEF_PRINTER_NAME_KEY: &str = "sef_printer_name";
 const KEY_SUPABASE_URL: &str = "supabase_url";
@@ -556,9 +554,19 @@ async fn get_app_info(
 
 #[tauri::command]
 async fn auth_get_state(state: tauri::State<'_, AppState>) -> Result<AuthStateInfo, String> {
+    // Revalidate persisted session expiry on every state refresh instead of
+    // trusting an indefinitely cached in-memory role.
     let db = state.db.clone();
+    let session = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    state.auth.set_session(session.clone()).await;
+    if matches!(session, SessionKind::None) {
+        state.auth.admin_lock().await;
+    }
     let admin_unlocked = state.auth.is_admin_unlocked().await;
-    let session = state.auth.session().await;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || crate::auth::read_state(&db, admin_unlocked, session))
         .await
         .map_err(err_string)?
@@ -969,6 +977,10 @@ async fn auth_admin_change_password(
     state: tauri::State<'_, AppState>,
     new_password: String,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    if !state.auth.is_admin_unlocked().await {
+        return Err("kjo veprim kerkon hyrje si admin".to_string());
+    }
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || crate::auth::admin_change_password(&db, &new_password))
         .await
@@ -1035,36 +1047,21 @@ async fn auth_user_login(
     Ok(true)
 }
 
+// Legacy standalone logs-admin password login is intentionally disabled.
+// Logs administrators must authenticate through the existing role-based user login.
+// Never reintroduce a shared credential compiled into the executable.
 #[tauri::command]
 async fn auth_logs_admin_login(
     state: tauri::State<'_, AppState>,
-    username: String,
-    password: String,
+    _username: String,
+    _password: String,
 ) -> Result<bool, String> {
-    let user = username.trim().to_lowercase();
-    let pass = password.trim();
-    if user != LOGS_ADMIN_USER || pass != LOGS_ADMIN_PASS {
-        append_error_log(
-            state.inner(),
-            "auth_logs_admin_login",
-            "hyrje e pasakte per logs_admin",
-        );
-        return Ok(false);
-    }
-
-    let db = state.db.clone();
-    tokio::task::spawn_blocking(move || crate::auth::session_set_logs_admin(&db))
-        .await
-        .map_err(err_string)?
-        .map_err(err_string)?;
-
-    state
-        .auth
-        .set_session(SessionKind::User {
-            role: crate::auth::UserRole::LogsAdmin,
-        })
-        .await;
-    Ok(true)
+    append_error_log(
+        state.inner(),
+        "auth_logs_admin_login",
+        "legacy logs-admin login rejected",
+    );
+    Ok(false)
 }
 
 #[tauri::command]
@@ -1167,7 +1164,16 @@ async fn doctor_account_update(
 }
 
 async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
-    let s = state.auth.session().await;
+    // Recheck expiry and account validity at the command authorization boundary.
+    let db = state.db.clone();
+    let s = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    if matches!(s, SessionKind::None) {
+        state.auth.set_session(SessionKind::None).await;
+        state.auth.admin_lock().await;
+    }
     match s {
         SessionKind::None => Err("duhet te hysh per te vazhduar".to_string()),
         SessionKind::User {
@@ -1197,7 +1203,12 @@ async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKi
 }
 
 async fn require_logs_admin(state: &tauri::State<'_, AppState>) -> Result<(), String> {
-    let s = state.auth.session().await;
+    // The legacy logs-admin login is disabled; never trust an in-memory role.
+    let db = state.db.clone();
+    let s = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
     match s {
         SessionKind::User {
             role: crate::auth::UserRole::LogsAdmin,
@@ -1221,6 +1232,7 @@ async fn require_owner(state: &tauri::State<'_, AppState>) -> Result<SessionKind
 async fn settings_get_all(
     state: tauri::State<'_, AppState>,
 ) -> Result<HashMap<String, String>, String> {
+    let _ = require_login(&state).await?;
     let db = state.db.clone();
     let is_admin = state.auth.is_admin_unlocked().await;
     let mut map = tokio::task::spawn_blocking(move || db.settings_get_all())
@@ -1244,6 +1256,7 @@ async fn settings_get_all(
             "cashier_hash",
             "user_logged_in",
             "session",
+            "session_expires_at",
         ] {
             map.remove(k);
         }
@@ -1263,6 +1276,17 @@ async fn settings_set(
         return Err("key is required".to_string());
     }
     let mut v = value;
+
+    // Authentication/session state must only be changed through auth commands.
+    // Vendor admin unlock must not permit arbitrary session or password-hash writes.
+    if matches!(
+        k.as_str(),
+        "admin_salt" | "admin_hash" | "user_salt" | "user_hash"
+            | "cashier_salt" | "cashier_hash" | "user_logged_in"
+            | "session" | "session_expires_at"
+    ) {
+        return Err("ky konfigurim menaxhohet vetem nga autentikimi".to_string());
+    }
 
     let protected = matches!(
         k.as_str(),
@@ -1330,7 +1354,8 @@ fn lab_devices_list_profiles() -> Vec<crate::models::AnalyzerProfile> {
 }
 
 #[tauri::command]
-async fn lab_serial_ports_list() -> Result<Vec<String>, String> {
+async fn lab_serial_ports_list(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let _ = require_login(&state).await?;
     Ok(lab_devices::list_serial_ports())
 }
 
@@ -1344,6 +1369,7 @@ struct LabDeviceDefault {
 async fn lab_device_get_default(
     state: tauri::State<'_, AppState>,
 ) -> Result<LabDeviceDefault, String> {
+    let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
         let profile_id = db.setting_get(KEY_LAB_DEVICE_PROFILE_ID)?;
@@ -1364,6 +1390,7 @@ async fn lab_device_set_default(
     profile_id: String,
     port_name: String,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     if lab_devices::find_profile(&profile_id).is_none() {
         return Err("profil i panjohur i analizuesit".to_string());
     }
@@ -1384,6 +1411,7 @@ async fn lab_device_connect(
     port_name: String,
     profile_id: String,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     let profile = lab_devices::find_profile(&profile_id).ok_or("profil i panjohur i analizuesit")?;
     let db = state.db.clone();
     let lab_serial = state.lab_serial.clone();
@@ -1395,6 +1423,7 @@ async fn lab_device_connect(
 
 #[tauri::command]
 async fn lab_device_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     let lab_serial = state.lab_serial.clone();
     tokio::task::spawn_blocking(move || lab_serial.disconnect())
         .await
@@ -1405,6 +1434,7 @@ async fn lab_device_disconnect(state: tauri::State<'_, AppState>) -> Result<(), 
 async fn lab_device_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::models::LabDeviceStatus, String> {
+    let _ = require_login(&state).await?;
     Ok(state.lab_serial.status())
 }
 
@@ -1413,6 +1443,7 @@ async fn lab_inbox_list(
     state: tauri::State<'_, AppState>,
     only_unmatched: Option<bool>,
 ) -> Result<Vec<crate::models::LabInboxItem>, String> {
+    let _ = require_login(&state).await?;
     let db = state.db.clone();
     let only_unmatched = only_unmatched.unwrap_or(true);
     tokio::task::spawn_blocking(move || db.lab_inbox_list(only_unmatched))
@@ -1427,6 +1458,7 @@ async fn lab_inbox_assign(
     inbox_id: String,
     visit_id: String,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.lab_inbox_assign_to_visit(&inbox_id, &visit_id))
         .await
@@ -2562,6 +2594,7 @@ async fn admin_reset_clinic(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     if !state.auth.is_admin_unlocked().await {
         return Err("kjo veprim kerkon hyrje si admin".to_string());
     }
