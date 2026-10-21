@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -374,6 +374,8 @@ impl Db {
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
+        conn.execute_batch(include_str!("../migrations/general_practice_core.sql"))?;
+
         Ok(Self {
             db_path,
             conn: Mutex::new(conn),
@@ -389,6 +391,8 @@ impl Db {
         conn.execute_batch(MIGRATION_SQL)?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
+
+        conn.execute_batch(include_str!("../migrations/general_practice_core.sql"))?;
 
         Ok(Self {
             db_path: PathBuf::new(),
@@ -750,7 +754,7 @@ impl Db {
     }
 
     pub fn row_updated_at(&self, table: &str, id: &str) -> anyhow::Result<Option<String>> {
-        // Only whitelisted tables — table name is never user input.
+        // Only whitelisted tables â€” table name is never user input.
         let sql = match table {
             "prescriptions" => "SELECT updated_at FROM prescriptions WHERE id=?1",
             "fiscal_jobs" => "SELECT updated_at FROM fiscal_jobs WHERE id=?1",
@@ -5584,7 +5588,7 @@ impl Db {
         Ok(())
     }
 
-    // ─── Offers ───────────────────────────────────────────────────────────────
+    // â”€â”€â”€ Offers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn next_offer_number(&self, month: u32, year: i32) -> anyhow::Result<String> {
         let conn = self.conn.lock().unwrap();
@@ -5935,6 +5939,91 @@ impl Db {
             "kind":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,
             "visitId":r.get::<_,String>(6)?,"clinicianId":r.get::<_,String>(7)?,
             "recordedAt":r.get::<_,String>(8)?,"notes":r.get::<_,Option<String>>(9)?
+
+    pub fn clinician_can_access_patient(&self, clinician_id: &str, patient_id: &str) -> anyhow::Result<bool> {
+        let conn=self.conn()?;
+        let count:i64=conn.query_row(
+            "SELECT COUNT(*) FROM visits WHERE client_id=?1 AND doctor_id=?2 AND deleted=0",
+            params![patient_id,clinician_id], |r|r.get(0))?;
+        Ok(count>0)
+    }
+    pub fn clinician_owns_visit(&self, clinician_id: &str, patient_id: &str, visit_id: &str) -> anyhow::Result<bool> {
+        let conn=self.conn()?;
+        let count:i64=conn.query_row(
+            "SELECT COUNT(*) FROM visits WHERE id=?1 AND client_id=?2 AND doctor_id=?3 AND deleted=0",
+            params![visit_id,patient_id,clinician_id], |r|r.get(0))?;
+        Ok(count==1)
+    }
+}
+
+impl Db {
+    pub fn clinical_conditions_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        if patient_id.trim().is_empty() { bail!("patient_id required"); }
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT id, patient_id, code, code_system, code_version, display, clinical_status, verification_status, clinician_id, encounter_id, onset_date, resolved_date, notes FROM clinical_conditions WHERE patient_id = ?1 ORDER BY updated_at DESC, id DESC")?;
+        let rows = stmt.query_map(params![patient_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?, "patientId": row.get::<_, String>(1)?,
+                "code": row.get::<_, String>(2)?, "codeSystem": row.get::<_, String>(3)?,
+                "codeVersion": row.get::<_, String>(4)?, "display": row.get::<_, String>(5)?,
+                "clinicalStatus": row.get::<_, String>(6)?, "verificationStatus": row.get::<_, String>(7)?,
+                "clinicianId": row.get::<_, String>(8)?, "encounterId": row.get::<_, Option<String>>(9)?,
+                "onsetDate": row.get::<_, Option<String>>(10)?, "resolvedDate": row.get::<_, Option<String>>(11)?,
+                "notes": row.get::<_, String>(12)?
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn clinical_condition_create(&self, value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let field = |name: &str| -> anyhow::Result<String> {
+            let text = value.get(name).and_then(|v| v.as_str()).unwrap_or("").trim();
+            if text.is_empty() { bail!("missing {}", name); }
+            Ok(text.to_owned())
+        };
+        let id = Uuid::new_v4().to_string();
+        let patient_id = field("patientId")?;
+        let code = field("code")?;
+        let system = field("codeSystem")?;
+        let version = field("codeVersion")?;
+        let display = field("display")?;
+        let clinician = field("clinicianId")?;
+        let status = field("clinicalStatus")?;
+        let verification = field("verificationStatus")?;
+        if !["active","inactive","resolved","history","entered_in_error"].contains(&status.as_str()) { bail!("invalid clinical status"); }
+        if !["unconfirmed","provisional","confirmed","refuted","entered_in_error"].contains(&verification.as_str()) { bail!("invalid verification status"); }
+        if (status == "entered_in_error") != (verification == "entered_in_error") { bail!("inconsistent entered-in-error status"); }
+        let encounter = value.get("encounterId").and_then(|v|v.as_str());
+        let onset = value.get("onsetDate").and_then(|v|v.as_str());
+        let resolved = value.get("resolvedDate").and_then(|v|v.as_str());
+        if status == "resolved" && resolved.is_none() { bail!("resolution date required"); }
+        if let (Some(a),Some(b))=(onset,resolved) { if b<a { bail!("resolution precedes onset"); } }
+        let notes = value.get("notes").and_then(|v|v.as_str()).unwrap_or("");
+        let now = now_iso();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let existing: i64 = tx.query_row("SELECT COUNT(*) FROM clinical_conditions WHERE patient_id=?1 AND code=?2 AND code_system=?3 AND code_version=?4 AND clinical_status='active'", params![patient_id,code,system,version], |r|r.get(0))?;
+        if existing > 0 && status=="active" { bail!("active condition already exists; review and link existing record"); }
+        tx.execute("INSERT INTO clinical_conditions(id,patient_id,code,code_system,code_version,display,clinical_status,verification_status,clinician_id,encounter_id,onset_date,resolved_date,notes,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",params![id,patient_id,code,system,version,display,status,verification,clinician,encounter,onset,resolved,notes,now])?;
+        tx.execute("INSERT INTO clinical_condition_events(id,condition_id,author_id,recorded_at,event_type,new_value) VALUES (?1,?2,?3,?4,'created',?5)",params![Uuid::new_v4().to_string(),id,clinician,now,value.to_string()])?;
+        tx.commit()?;
+        let mut output=value;
+        output["id"]=serde_json::Value::String(id);
+        Ok(output)
+    }
+}
+
+impl Db {
+    pub fn clinical_notes_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        if patient_id.trim().is_empty() { bail!("patient_id required"); }
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT id, patient_id, encounter_id, author_id, version, status, subjective, objective, assessment, plan, previous_version_id FROM clinical_notes WHERE patient_id=?1 ORDER BY created_at DESC,id DESC")?;
+        let rows = stmt.query_map(params![patient_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?, "patientId":r.get::<_,String>(1)?,
+            "encounterId":r.get::<_,String>(2)?, "authorId":r.get::<_,String>(3)?,
+            "version":r.get::<_,i64>(4)?, "status":r.get::<_,String>(5)?,
+            "sections":{"subjective":r.get::<_,String>(6)?,"objective":r.get::<_,String>(7)?,"assessment":r.get::<_,String>(8)?,"plan":r.get::<_,String>(9)?},
+            "previousVersionId":r.get::<_,Option<String>>(10)?
         })))?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
@@ -5969,6 +6058,27 @@ impl Db {
             bail!("This finding cannot be a planned procedure");
         }
         if let Some(n)=notes { if n.len()>10_000 { bail!("Notes too long"); } }
+
+    pub fn clinical_note_create(&self, value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let required = |key: &str| -> anyhow::Result<String> {
+            let text=value.get(key).and_then(|v|v.as_str()).unwrap_or("").trim();
+            if text.is_empty() { bail!("missing {}",key); }
+            Ok(text.to_owned())
+        };
+        let patient=required("patientId")?;
+        let encounter=required("encounterId")?;
+        let author=required("authorId")?;
+        let status=required("status")?;
+        if status!="draft" && status!="in_review" && status!="finalized" { bail!("invalid initial note status"); }
+        let sections=value.get("sections").ok_or_else(||anyhow!("sections required"))?;
+        let get_section=|key: &str| -> anyhow::Result<String> {
+            Ok(sections.get(key).and_then(|v|v.as_str()).ok_or_else(||anyhow!("missing {}",key))?.to_string())
+        };
+        let subjective=get_section("subjective")?;
+        let objective=get_section("objective")?;
+        let assessment=get_section("assessment")?;
+        let plan=get_section("plan")?;
+        if status=="finalized" && [&subjective,&objective,&assessment,&plan].iter().any(|s|s.trim().is_empty()) { bail!("finalized SOAP requires all sections"); }
         let id=Uuid::new_v4().to_string();
         let now=now_iso();
         let mut conn=self.conn()?;
@@ -6290,5 +6400,51 @@ impl Db {
             result.push(plan);
         }
         Ok(result)
+    }
+}
+
+        let belongs: i64=tx.query_row("SELECT COUNT(*) FROM visits WHERE id=?1 AND client_id=?2 AND deleted=0",params![encounter,patient],|r|r.get(0))?;
+        if belongs!=1 { bail!("encounter does not belong to patient"); }
+        tx.execute("INSERT INTO clinical_notes(id,patient_id,encounter_id,author_id,version,status,subjective,objective,assessment,plan,created_at,updated_at) VALUES (?1,?2,?3,?4,1,?5,?6,?7,?8,?9,?10,?10)",
+            params![id,patient,encounter,author,status,subjective,objective,assessment,plan,now])?;
+        tx.commit()?;
+        let mut result=value;
+        result["id"]=serde_json::Value::String(id);
+        result["version"]=serde_json::json!(1);
+        result["previousVersionId"]=serde_json::Value::Null;
+        Ok(result)
+    }
+}
+
+impl Db {
+    pub fn clinical_allergies_list(&self, patient_id:&str)->anyhow::Result<Vec<serde_json::Value>>{
+        if patient_id.trim().is_empty(){bail!("patient required");}
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare("SELECT id,patient_id,substance,category,verification,reaction FROM clinical_allergies WHERE patient_id=?1 ORDER BY updated_at DESC")?;
+        let rows=stmt.query_map(params![patient_id],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"patientId":r.get::<_,String>(1)?,
+            "substance":r.get::<_,String>(2)?,"category":r.get::<_,String>(3)?,
+            "verification":r.get::<_,String>(4)?,"reaction":r.get::<_,Option<String>>(5)?
+        })))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+    pub fn clinical_allergy_create(&self, value:serde_json::Value)->anyhow::Result<serde_json::Value>{
+        let required=|key:&str|->anyhow::Result<String>{
+            let text=value.get(key).and_then(|v|v.as_str()).unwrap_or("").trim();
+            if text.is_empty(){bail!("missing {}",key);}Ok(text.to_owned())
+        };
+        let patient=required("patientId")?;
+        let substance=required("substance")?;
+        let category=required("category")?;
+        let verification=required("verification")?;
+        if !["allergy","intolerance","unknown"].contains(&category.as_str()){bail!("invalid category");}
+        if !["unconfirmed","confirmed","refuted"].contains(&verification.as_str()){bail!("invalid verification");}
+        let reaction=value.get("reaction").and_then(|v|v.as_str());
+        let id=Uuid::new_v4().to_string();let now=now_iso();
+        let mut conn=self.conn()?;let tx=conn.transaction()?;
+        tx.execute("INSERT INTO clinical_allergies(id,patient_id,substance,category,verification,reaction,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![id,patient,substance,category,verification,reaction,now])?;
+        tx.commit()?;
+        let mut result=value;result["id"]=serde_json::json!(id);Ok(result)
     }
 }

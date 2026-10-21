@@ -1,4 +1,4 @@
-mod auth;
+﻿mod auth;
 mod db;
 mod desktop_updates;
 mod error_logs;
@@ -94,10 +94,10 @@ fn add_days_to_iso(ts: &str, days: i64) -> Option<String> {
     Some(next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-/// Krahason dy versione "x.y.z" numerikisht — kthen true vetëm nëse `remote`
-/// është STRIKT më i ri se `local`. Kjo shmang rastin kur manifesti i update-it
-/// mbetet i ngrirë/gabuar në një version më të vjetër (p.sh. "0.4.9") dhe kyçi
-/// i vjetër `!=` e trajtonte gabimisht si "update i ri" edhe pse ishte më i vjetër.
+/// Krahason dy versione "x.y.z" numerikisht â€” kthen true vetÃ«m nÃ«se `remote`
+/// Ã«shtÃ« STRIKT mÃ« i ri se `local`. Kjo shmang rastin kur manifesti i update-it
+/// mbetet i ngrirÃ«/gabuar nÃ« njÃ« version mÃ« tÃ« vjetÃ«r (p.sh. "0.4.9") dhe kyÃ§i
+/// i vjetÃ«r `!=` e trajtonte gabimisht si "update i ri" edhe pse ishte mÃ« i vjetÃ«r.
 fn version_is_newer(remote: &str, local: &str) -> bool {
     fn parse(v: &str) -> (u64, u64, u64) {
         let v = v.trim().trim_start_matches('v');
@@ -358,9 +358,9 @@ fn require_enternet_for_fiscal(provider: &str) -> Result<(), String> {
         return Ok(());
     }
     if provider == "global_eu" {
-        return Err("Printeri fiskal i zgjedhur është Global EU. Ky model do të implementohet më vonë; zgjidh ENTERNET te Cilësimet për printim .inp.".to_string());
+        return Err("Printeri fiskal i zgjedhur Ã«shtÃ« Global EU. Ky model do tÃ« implementohet mÃ« vonÃ«; zgjidh ENTERNET te CilÃ«simet pÃ«r printim .inp.".to_string());
     }
-    Err("Printeri fiskal nuk është i konfiguruar saktë. Te Cilësimet zgjidh ENTERNET, Global EU ose SEF.".to_string())
+    Err("Printeri fiskal nuk Ã«shtÃ« i konfiguruar saktÃ«. Te CilÃ«simet zgjidh ENTERNET, Global EU ose SEF.".to_string())
 }
 
 fn build_invoice_pdf_bytes_inner(
@@ -498,7 +498,7 @@ fn print_pdf_to_windows_printer(pdf_bytes: &[u8], printer_name: &str) -> anyhow:
 
     if !status.success() {
         anyhow::bail!(
-            "Printimi dështoi (kod {:?}). Kontrolloni emrin e printerit te Cilësimet.",
+            "Printimi dÃ«shtoi (kod {:?}). Kontrolloni emrin e printerit te CilÃ«simet.",
             status.code()
         );
     }
@@ -693,7 +693,7 @@ async fn provision_apply_token(
     }
     if format!("{}:{}", host, port).to_socket_addrs().is_err() {
         return Err(format!(
-            "token check network error: DNS dështoi për host '{}'. Kontrollo internetin/DNS dhe Supabase URL.",
+            "token check network error: DNS dÃ«shtoi pÃ«r host '{}'. Kontrollo internetin/DNS dhe Supabase URL.",
             host
         ));
     }
@@ -750,7 +750,7 @@ async fn provision_apply_token(
     let row = rows.remove(0);
 
     if row.disabled.unwrap_or(false) {
-        return Err("tokeni eshte i çaktivizuar".to_string());
+        return Err("tokeni eshte i Ã§aktivizuar".to_string());
     }
     if row.one_time.unwrap_or(true) && row.used_at.as_deref().unwrap_or("").trim().len() > 0 {
         return Err("tokeni eshte perdorur me pare".to_string());
@@ -1313,7 +1313,7 @@ async fn settings_set(
 
     if k == FISCAL_PRINTER_PROVIDER_KEY {
         v = normalize_fiscal_printer_provider(&v).ok_or_else(|| {
-            "vlera e printerit fiskal duhet të jetë ENTERNET, Global EU ose SEF".to_string()
+            "vlera e printerit fiskal duhet tÃ« jetÃ« ENTERNET, Global EU ose SEF".to_string()
         })?;
     }
 
@@ -1539,7 +1539,7 @@ async fn clients_upsert(
         if is_demo_mode && client.id.is_none() {
             let existing = db.clients_list(None)?;
             if existing.iter().any(|c| c.deleted == 0) {
-                bail!("Modaliteti Demo lejon vetëm 1 pacient. Fshi pacientin ekzistues për të shtuar një tjetër.");
+                bail!("Modaliteti Demo lejon vetÃ«m 1 pacient. Fshi pacientin ekzistues pÃ«r tÃ« shtuar njÃ« tjetÃ«r.");
             }
         }
         db.clients_upsert(client)
@@ -1953,6 +1953,79 @@ async fn dental_finding_create(state:tauri::State<'_,AppState>,finding:serde_jso
         .await.map_err(err_string)?.map_err(err_string)
 }
 
+async fn clinical_allergies_list(state:tauri::State<'_,AppState>,patient_id:String)->Result<Vec<serde_json::Value>,String>{
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move||{
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)?{bail!("Patient access denied");}
+        db.clinical_allergies_list(&patient_id)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn clinical_allergy_create(state:tauri::State<'_,AppState>,allergy:serde_json::Value)->Result<serde_json::Value,String>{
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let patient_id=allergy.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move||{
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)?{bail!("Patient access denied");}
+        db.clinical_allergy_create(allergy)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+
+// Clinical commands are restricted to authenticated clinicians.
+// Non-admin doctors may access only patients with an assigned visit.
+async fn clinical_actor(state: &tauri::State<'_, AppState>) -> Result<(String,bool),String> {
+    match require_login(state).await? {
+        SessionKind::Doctor { doctor_id, is_admin } => Ok((doctor_id,is_admin)),
+        _ => Err("Clinical access requires a doctor session".into())
+    }
+}
+#[tauri::command]
+async fn clinical_notes_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>,String> {
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
+        db.clinical_notes_list(&patient_id)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn clinical_note_create(state: tauri::State<'_, AppState>, note: serde_json::Value) -> Result<serde_json::Value,String> {
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let patient_id=note.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
+    let visit_id=note.get("encounterId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
+    if note.get("authorId").and_then(|v|v.as_str())!=Some(doctor_id.as_str()) { return Err("Author identity mismatch".into()); }
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.clinician_owns_visit(&doctor_id,&patient_id,&visit_id)? { bail!("Encounter access denied"); }
+        db.clinical_note_create(note)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn clinical_conditions_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>,String> {
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
+        db.clinical_conditions_list(&patient_id)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+#[tauri::command]
+async fn clinical_condition_create(state: tauri::State<'_, AppState>, condition: serde_json::Value) -> Result<serde_json::Value,String> {
+    let (doctor_id,is_admin)=clinical_actor(&state).await?;
+    if condition.get("clinicianId").and_then(|v|v.as_str())!=Some(doctor_id.as_str()) { return Err("Clinician identity mismatch".into()); }
+    let patient_id=condition.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
+    let encounter=condition.get("encounterId").and_then(|v|v.as_str()).map(str::to_owned);
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
+        if let Some(ref visit_id)=encounter {
+            if !is_admin && !db.clinician_owns_visit(&doctor_id,&patient_id,visit_id)? { bail!("Encounter access denied"); }
+        }
+        db.clinical_condition_create(condition)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
+
 #[tauri::command]
 async fn visits_list(
     state: tauri::State<'_, AppState>,
@@ -2330,11 +2403,11 @@ async fn invoice_export_fiscal_inp(
                 .unwrap_or_default();
             let printer_name = printer_name.trim().to_string();
             if printer_name.is_empty() {
-                return Err("Emri i printerit SEF nuk është konfiguruar. Shko te Cilësimet > Printer SEF dhe vendos emrin.".to_string());
+                return Err("Emri i printerit SEF nuk Ã«shtÃ« konfiguruar. Shko te CilÃ«simet > Printer SEF dhe vendos emrin.".to_string());
             }
             let pdf_bytes = build_invoice_pdf_bytes_inner(&db, &data_dir, &sale_id, false)?;
             print_pdf_to_windows_printer(&pdf_bytes, &printer_name).map_err(err_string)?;
-            Ok("Fatura u dërgua në printer.".to_string())
+            Ok("Fatura u dÃ«rgua nÃ« printer.".to_string())
         })
         .await
         .map_err(err_string)?;
@@ -2520,7 +2593,7 @@ async fn history_reset_all(state: tauri::State<'_, AppState>) -> Result<(), Stri
 
 // Ne mobile, document_dir() shkon te nje dosje private e app-it (Android/data/<pkg>/files/Documents)
 // qe Android 11+ e fsheh nga app-i standard "Files" (scoped storage). Prandaj ketu hapim save-dialog-un
-// nativ (SAF) qe useri te zgjedhe vete vendin — skedari garantohet i dukshem pas kesaj.
+// nativ (SAF) qe useri te zgjedhe vete vendin â€” skedari garantohet i dukshem pas kesaj.
 #[cfg(mobile)]
 fn save_pdf_via_dialog(app: &tauri::AppHandle, default_name: &str, pdf_bytes: &[u8]) -> Result<String, String> {
     use std::io::Write;
@@ -2779,12 +2852,12 @@ fn fiscal_job_process_inner(db: &Db, job: &crate::models::FiscalJob) -> Result<(
     let provider = normalize_fiscal_printer_provider(&provider_raw)
         .unwrap_or_else(|| provider_raw.trim().to_ascii_lowercase());
     if provider != "enternet" && provider != "global_eu" {
-        return Err("Provideri fiskal i këtij kompjuteri nuk është Enternet/Global EU".to_string());
+        return Err("Provideri fiskal i kÃ«tij kompjuteri nuk Ã«shtÃ« Enternet/Global EU".to_string());
     }
     #[cfg(target_os = "windows")]
     let out_dir = std::path::PathBuf::from(r"C:\Temp");
     #[cfg(not(target_os = "windows"))]
-    return Err("Fiskalizimi i radhës bëhet vetëm nga kompjuteri i klinikës".to_string());
+    return Err("Fiskalizimi i radhÃ«s bÃ«het vetÃ«m nga kompjuteri i klinikÃ«s".to_string());
     #[cfg(target_os = "windows")]
     {
         db.fiscal_receipt_generate_inp(&job.sale_id, &out_dir, true)
@@ -2803,7 +2876,7 @@ fn fiscal_job_mark(db: &Db, job: &crate::models::FiscalJob, status: &str, error:
     db.fiscal_job_upsert(&row)
 }
 
-const FISCAL_JOB_AUTO_MAX_AGE_SECS: i64 = 2 * 3600; // 2 orë — më të vjetrat kërkojnë aprovim manual
+const FISCAL_JOB_AUTO_MAX_AGE_SECS: i64 = 2 * 3600; // 2 orÃ« â€” mÃ« tÃ« vjetrat kÃ«rkojnÃ« aprovim manual
 
 fn fiscal_job_age_secs(created_at: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(created_at)
@@ -2887,7 +2960,7 @@ async fn fiscal_job_process(state: tauri::State<'_, AppState>, id: String) -> Re
             .map_err(err_string)?
             .ok_or_else(|| "Job-i nuk u gjet".to_string())?;
         if job.status != "pending" && job.status != "failed" {
-            return Err(format!("Job-i është '{}'", job.status));
+            return Err(format!("Job-i Ã«shtÃ« '{}'", job.status));
         }
         match fiscal_job_process_inner(&db, &job) {
             Ok(()) => fiscal_job_mark(&db, &job, "done", None).map_err(err_string),
@@ -3378,7 +3451,7 @@ async fn sale_items_replace(state: tauri::State<'_, AppState>, sale_id: String, 
         .await.map_err(err_string)?.map_err(err_string)
 }
 
-// ─── Offer commands ───────────────────────────────────────────────────────────
+// â”€â”€â”€ Offer commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[tauri::command]
 async fn offers_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate::models::Offer>, String> {
@@ -3845,9 +3918,9 @@ pub fn run() {
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_API_KEY, DEFAULT_SUPABASE_API_KEY)?;
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_ANON_KEY, DEFAULT_SUPABASE_API_KEY)?;
             ensure_setting_if_empty(db.as_ref(), "update_base_url", DEFAULT_UPDATE_BASE_URL)?;
-            // Migrim: klientët ekzistues e kishin "update_base_url" të vendosur eksplicit
-            // (jo bosh) te Vercel-i i vjetër - ensure_setting_if_empty s'e prek atë. E
-            // kalojmë te Render nëse ende ka vlerën default të vjetër (jo një URL të
+            // Migrim: klientÃ«t ekzistues e kishin "update_base_url" tÃ« vendosur eksplicit
+            // (jo bosh) te Vercel-i i vjetÃ«r - ensure_setting_if_empty s'e prek atÃ«. E
+            // kalojmÃ« te Render nÃ«se ende ka vlerÃ«n default tÃ« vjetÃ«r (jo njÃ« URL tÃ«
             // personalizuar nga useri).
             if let Ok(Some(cur)) = db.setting_get("update_base_url") {
                 if cur.trim().trim_end_matches('/') == OLD_DEFAULT_UPDATE_BASE_URL {
@@ -3860,7 +3933,7 @@ pub fn run() {
             let error_log_path = data_dir.join("logs").join("errors.log");
             db.setting_set("error_log_path", &error_log_path.display().to_string())?;
             let has_visit_service = db.services_list(None)?.into_iter().any(|s| {
-                let t = s.title.trim().to_ascii_lowercase().replace('ë', "e");
+                let t = s.title.trim().to_ascii_lowercase().replace('Ã«', "e");
                 t == "vizite" || t == "vizita"
             });
             if !has_visit_service {
@@ -3871,10 +3944,10 @@ pub fn run() {
                     == "1";
                 db.services_upsert(ServiceUpsertInput {
                     id: None,
-                    title: "Vizitë".to_string(),
+                    title: "VizitÃ«".to_string(),
                     default_price: 0.0,
                     vat_code: Some(if vat_registered { "A" } else { "C" }.to_string()),
-                    notes: Some("Shërbim bazë i vizitës".to_string()),
+                    notes: Some("ShÃ«rbim bazÃ« i vizitÃ«s".to_string()),
                 })?;
             }
 
@@ -3898,8 +3971,8 @@ pub fn run() {
                 sync.clone().spawn_background();
             }
 
-            // Procesori i radhës fiskale: çdo 15s proceson job-et 'pending' më të reja se 2 orë.
-            // Më të vjetrat presin aprovim manual te Sporteli (mbrojtje nga printimet aksidentale).
+            // Procesori i radhÃ«s fiskale: Ã§do 15s proceson job-et 'pending' mÃ« tÃ« reja se 2 orÃ«.
+            // MÃ« tÃ« vjetrat presin aprovim manual te Sporteli (mbrojtje nga printimet aksidentale).
             #[cfg(all(desktop, target_os = "windows"))]
             {
                 let db_fj = db.clone();
@@ -3915,7 +3988,7 @@ pub fn run() {
                             };
                             for job in jobs {
                                 if fiscal_job_age_secs(&job.created_at) > FISCAL_JOB_AUTO_MAX_AGE_SECS {
-                                    continue; // kërkon aprovim manual
+                                    continue; // kÃ«rkon aprovim manual
                                 }
                                 match fiscal_job_process_inner(&db2, &job) {
                                     Ok(()) => { let _ = fiscal_job_mark(&db2, &job, "done", None); }
@@ -4045,6 +4118,13 @@ pub fn run() {
             dental_finding_corrections_list,
             dental_findings_list,
             dental_finding_create,
+
+            clinical_allergies_list,
+            clinical_allergy_create,
+            clinical_notes_list,
+            clinical_note_create,
+            clinical_conditions_list,
+            clinical_condition_create,
             visits_list,
             visits_upsert,
             visits_delete,
