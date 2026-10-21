@@ -1160,7 +1160,16 @@ async fn doctor_account_update(
 }
 
 async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
-    let s = state.auth.session().await;
+    // Recheck expiry and account validity at the command authorization boundary.
+    let db = state.db.clone();
+    let s = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    if matches!(s, SessionKind::None) {
+        state.auth.set_session(SessionKind::None).await;
+        state.auth.admin_lock().await;
+    }
     match s {
         SessionKind::None => Err("duhet te hysh per te vazhduar".to_string()),
         SessionKind::User {
@@ -1190,7 +1199,12 @@ async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKi
 }
 
 async fn require_logs_admin(state: &tauri::State<'_, AppState>) -> Result<(), String> {
-    let s = state.auth.session().await;
+    // The legacy logs-admin login is disabled; never trust an in-memory role.
+    let db = state.db.clone();
+    let s = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
     match s {
         SessionKind::User {
             role: crate::auth::UserRole::LogsAdmin,
