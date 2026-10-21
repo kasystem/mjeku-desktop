@@ -1228,6 +1228,7 @@ async fn require_owner(state: &tauri::State<'_, AppState>) -> Result<SessionKind
 async fn settings_get_all(
     state: tauri::State<'_, AppState>,
 ) -> Result<HashMap<String, String>, String> {
+    let _ = require_login(&state).await?;
     let db = state.db.clone();
     let is_admin = state.auth.is_admin_unlocked().await;
     let mut map = tokio::task::spawn_blocking(move || db.settings_get_all())
@@ -1349,7 +1350,8 @@ fn lab_devices_list_profiles() -> Vec<crate::models::AnalyzerProfile> {
 }
 
 #[tauri::command]
-async fn lab_serial_ports_list() -> Result<Vec<String>, String> {
+async fn lab_serial_ports_list(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let _ = require_login(&state).await?;
     Ok(lab_devices::list_serial_ports())
 }
 
