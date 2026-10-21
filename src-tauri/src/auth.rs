@@ -434,6 +434,7 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
     if let Some(rest) = raw.strip_prefix("doctor:") {
         let doctor_id = rest.trim().to_string();
         if doctor_id.is_empty() {
+            session_clear(db)?;
             return Ok(SessionKind::None);
         }
 
@@ -459,6 +460,8 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
         });
     }
 
+    // Unknown or corrupted session values must not remain persisted.
+    session_clear(db)?;
     Ok(SessionKind::None)
 }
 
@@ -612,6 +615,22 @@ mod security_session_tests {
     fn legacy_generic_user_marker_does_not_grant_owner_access() {
         let db = configured_db();
         db.setting_set(KEY_SESSION, "user").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn malformed_doctor_session_is_cleared() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "doctor:").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn unknown_session_marker_is_cleared() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "unrecognized_role").unwrap();
         assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
         assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
     }
