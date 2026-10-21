@@ -977,6 +977,10 @@ async fn auth_admin_change_password(
     state: tauri::State<'_, AppState>,
     new_password: String,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    if !state.auth.is_admin_unlocked().await {
+        return Err("kjo veprim kerkon hyrje si admin".to_string());
+    }
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || crate::auth::admin_change_password(&db, &new_password))
         .await
@@ -2428,6 +2432,7 @@ async fn admin_reset_clinic(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     if !state.auth.is_admin_unlocked().await {
         return Err("kjo veprim kerkon hyrje si admin".to_string());
     }
