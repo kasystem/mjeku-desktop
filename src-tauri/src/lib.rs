@@ -1007,6 +1007,8 @@ async fn auth_user_login(
         return Ok(false);
     };
 
+    // A new authenticated identity must never inherit vendor-admin unlock.
+    state.auth.admin_lock().await;
     let db2 = state.db.clone();
     match role {
         crate::auth::UserRole::Owner => {
@@ -1125,6 +1127,8 @@ async fn auth_doctor_login(
         }
         crate::auth::DoctorVerify::WrongPassword => Ok(false),
         crate::auth::DoctorVerify::Ok { .. } => {
+            // Clear privileged unlock when switching to a doctor identity.
+            state.auth.admin_lock().await;
             let db2 = state.db.clone();
             let session =
                 tokio::task::spawn_blocking(move || crate::auth::session_set_doctor(&db2, &did))
