@@ -1234,7 +1234,23 @@ async fn settings_get_all(
         .map_err(err_string)?
         .map_err(err_string)?;
 
-    // Hide sensitive settings from non-admin users.
+    // Authentication secrets and session markers must never be returned
+    // through the generic settings API, including to admin-unlocked users.
+    for k in [
+        "admin_salt",
+        "admin_hash",
+        "user_salt",
+        "user_hash",
+        "cashier_salt",
+        "cashier_hash",
+        "user_logged_in",
+        "session",
+        "session_expires_at",
+    ] {
+        map.remove(k);
+    }
+
+    // Keep vendor/integration configuration visible only after admin unlock.
     if !is_admin {
         for k in [
             "supabase_url",
@@ -1242,15 +1258,6 @@ async fn settings_get_all(
             "supabase_anon_key",
             "update_base_url",
             "desktop_update_api",
-            "admin_salt",
-            "admin_hash",
-            "user_salt",
-            "user_hash",
-            "cashier_salt",
-            "cashier_hash",
-            "user_logged_in",
-            "session",
-            "session_expires_at",
         ] {
             map.remove(k);
         }
