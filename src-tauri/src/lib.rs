@@ -1363,6 +1363,7 @@ struct LabDeviceDefault {
 async fn lab_device_get_default(
     state: tauri::State<'_, AppState>,
 ) -> Result<LabDeviceDefault, String> {
+    let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
         let profile_id = db.setting_get(KEY_LAB_DEVICE_PROFILE_ID)?;
@@ -1383,6 +1384,7 @@ async fn lab_device_set_default(
     profile_id: String,
     port_name: String,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     if lab_devices::find_profile(&profile_id).is_none() {
         return Err("profil i panjohur i analizuesit".to_string());
     }
@@ -1403,6 +1405,7 @@ async fn lab_device_connect(
     port_name: String,
     profile_id: String,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     let profile = lab_devices::find_profile(&profile_id).ok_or("profil i panjohur i analizuesit")?;
     let db = state.db.clone();
     let lab_serial = state.lab_serial.clone();
@@ -1414,6 +1417,7 @@ async fn lab_device_connect(
 
 #[tauri::command]
 async fn lab_device_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     let lab_serial = state.lab_serial.clone();
     tokio::task::spawn_blocking(move || lab_serial.disconnect())
         .await
@@ -1424,6 +1428,7 @@ async fn lab_device_disconnect(state: tauri::State<'_, AppState>) -> Result<(), 
 async fn lab_device_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::models::LabDeviceStatus, String> {
+    let _ = require_login(&state).await?;
     Ok(state.lab_serial.status())
 }
 
@@ -1432,6 +1437,7 @@ async fn lab_inbox_list(
     state: tauri::State<'_, AppState>,
     only_unmatched: Option<bool>,
 ) -> Result<Vec<crate::models::LabInboxItem>, String> {
+    let _ = require_login(&state).await?;
     let db = state.db.clone();
     let only_unmatched = only_unmatched.unwrap_or(true);
     tokio::task::spawn_blocking(move || db.lab_inbox_list(only_unmatched))
@@ -1446,6 +1452,7 @@ async fn lab_inbox_assign(
     inbox_id: String,
     visit_id: String,
 ) -> Result<(), String> {
+    let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.lab_inbox_assign_to_visit(&inbox_id, &visit_id))
         .await
