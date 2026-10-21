@@ -20,6 +20,8 @@ const KEY_USER_LOGGED_IN: &str = "user_logged_in";
 // Session is persisted so the app keeps working fully offline across restarts.
 // Values: "" | "owner" | "cashier" | "doctor:<doctor_id>"
 const KEY_SESSION: &str = "session";
+const KEY_SESSION_EXPIRES_AT: &str = "session_expires_at";
+const SESSION_LIFETIME_HOURS: i64 = 12;
 
 #[derive(Debug, Clone)]
 pub enum UserRole {
@@ -400,6 +402,16 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
 
     let raw = db.setting_get(KEY_SESSION)?.unwrap_or_default();
     let raw = raw.trim();
+    if !raw.is_empty() {
+        let expires = db.setting_get(KEY_SESSION_EXPIRES_AT)?.unwrap_or_default();
+        let valid = chrono::DateTime::parse_from_rfc3339(expires.trim())
+            .map(|t| t.with_timezone(&chrono::Utc) > chrono::Utc::now())
+            .unwrap_or(false);
+        if !valid {
+            session_clear(db)?;
+            return Ok(SessionKind::None);
+        }
+    }
     if raw.is_empty() {
         // Never promote the legacy login flag into an authenticated owner session.
         // Old installations must log in again using their real password.
@@ -465,7 +477,14 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
     Ok(SessionKind::None)
 }
 
+fn session_set_expiry(db: &Db) -> anyhow::Result<()> {
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(SESSION_LIFETIME_HOURS)).to_rfc3339();
+    db.setting_set(KEY_SESSION_EXPIRES_AT, &expiry)?;
+    Ok(())
+}
+
 pub fn session_set_user(db: &Db) -> anyhow::Result<()> {
+    session_set_expiry(db)?;
     db.setting_set(KEY_SESSION, "owner")?;
     // Legacy key for older UI bundles.
     db.setting_set(KEY_USER_LOGGED_IN, "1")?;
@@ -473,12 +492,14 @@ pub fn session_set_user(db: &Db) -> anyhow::Result<()> {
 }
 
 pub fn session_set_cashier(db: &Db) -> anyhow::Result<()> {
+    session_set_expiry(db)?;
     db.setting_set(KEY_SESSION, "cashier")?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(())
 }
 
 pub fn session_set_logs_admin(db: &Db) -> anyhow::Result<()> {
+    session_set_expiry(db)?;
     db.setting_set(KEY_SESSION, "logs_admin")?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(())
@@ -493,6 +514,7 @@ pub fn session_set_doctor(db: &Db, doctor_id: &str) -> anyhow::Result<SessionKin
         .doctor_account_get(doctor_id)?
         .map(|(_, _, a)| a)
         .unwrap_or(false);
+    session_set_expiry(db)?;
     db.setting_set(KEY_SESSION, &format!("doctor:{doctor_id}"))?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(SessionKind::Doctor {
@@ -502,6 +524,7 @@ pub fn session_set_doctor(db: &Db, doctor_id: &str) -> anyhow::Result<SessionKin
 }
 
 pub fn session_clear(db: &Db) -> anyhow::Result<()> {
+    db.setting_set(KEY_SESSION_EXPIRES_AT, "")?;
     db.setting_set(KEY_SESSION, "")?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(())
@@ -633,6 +656,29 @@ mod security_session_tests {
         db.setting_set(KEY_SESSION, "unrecognized_role").unwrap();
         assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
         assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn expired_owner_session_is_revoked() {
+        let db = configured_db();
+        session_set_user(&db).unwrap();
+        db.setting_set(KEY_SESSION_EXPIRES_AT, "2000-01-01T00:00:00Z").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn session_without_expiry_requires_reauthentication() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "owner").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+    }
+
+    #[test]
+    fn cashier_session_receives_expiry() {
+        let db = configured_db();
+        session_set_cashier(&db).unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { role: UserRole::Cashier }));
     }
 
     #[test]
