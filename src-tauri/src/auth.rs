@@ -434,9 +434,10 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
         });
     }
     if raw.eq_ignore_ascii_case("logs_admin") {
-        return Ok(SessionKind::User {
-            role: UserRole::LogsAdmin,
-        });
+        // The legacy shared-credential login was retired. Never restore a
+        // privileged session persisted by an older application version.
+        session_clear(db)?;
+        return Ok(SessionKind::None);
     }
 
     if let Some(rest) = raw.strip_prefix("doctor:") {
