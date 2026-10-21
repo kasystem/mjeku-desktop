@@ -577,3 +577,41 @@ pub fn doctor_account_update(
     db.doctor_account_set(doctor_id, &salt, &hash, is_admin, &now)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod security_session_tests {
+    use super::*;
+
+    fn configured_db() -> Db {
+        let db = Db::new_in_memory().expect("in-memory database");
+        setup_v2(&db, "Test clinic", "vendor-admin-test-123", "owner-test-123", Some("cashier-test-123"))
+            .expect("configure test clinic");
+        db
+    }
+
+    #[test]
+    fn persisted_legacy_logs_admin_is_revoked() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "logs_admin").unwrap();
+        db.setting_set(KEY_USER_LOGGED_IN, "1").unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+        assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
+        assert_eq!(db.setting_get(KEY_USER_LOGGED_IN).unwrap().as_deref(), Some("0"));
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
+    }
+
+    #[test]
+    fn regular_role_login_remains_available() {
+        let db = configured_db();
+        assert!(matches!(user_verify_role(&db, "owner-test-123").unwrap(), Some(UserRole::Owner)));
+        assert!(matches!(user_verify_role(&db, "cashier-test-123").unwrap(), Some(UserRole::Cashier)));
+        assert!(user_verify_role(&db, "incorrect").unwrap().is_none());
+    }
+
+    #[test]
+    fn owner_session_is_not_revoked_by_legacy_admin_cleanup() {
+        let db = configured_db();
+        session_set_user(&db).unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { role: UserRole::Owner }));
+    }
+}
