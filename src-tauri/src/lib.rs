@@ -1202,18 +1202,13 @@ async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKi
 }
 
 async fn require_logs_admin(state: &tauri::State<'_, AppState>) -> Result<(), String> {
-    // The legacy logs-admin login is disabled; never trust an in-memory role.
-    let db = state.db.clone();
-    let s = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
-        .await
-        .map_err(err_string)?
-        .map_err(err_string)?;
-    match s {
-        SessionKind::User {
-            role: crate::auth::UserRole::LogsAdmin,
-        } => Ok(()),
-        _ => Err("nuk ke akses ne error logs".to_string()),
+    // The legacy logs-admin identity is no longer issued by any login path.
+    // Allow only an active licensed session with explicit admin unlock.
+    let _ = require_login(state).await?;
+    if !state.auth.is_admin_unlocked().await {
+        return Err("nuk ke akses ne error logs".to_string());
     }
+    Ok(())
 }
 
 async fn require_owner(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
