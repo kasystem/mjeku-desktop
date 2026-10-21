@@ -1251,6 +1251,7 @@ async fn settings_get_all(
             "cashier_hash",
             "user_logged_in",
             "session",
+            "session_expires_at",
         ] {
             map.remove(k);
         }
@@ -1270,6 +1271,17 @@ async fn settings_set(
         return Err("key is required".to_string());
     }
     let mut v = value;
+
+    // Authentication/session state must only be changed through auth commands.
+    // Vendor admin unlock must not permit arbitrary session or password-hash writes.
+    if matches!(
+        k.as_str(),
+        "admin_salt" | "admin_hash" | "user_salt" | "user_hash"
+            | "cashier_salt" | "cashier_hash" | "user_logged_in"
+            | "session" | "session_expires_at"
+    ) {
+        return Err("ky konfigurim menaxhohet vetem nga autentikimi".to_string());
+    }
 
     let protected = matches!(
         k.as_str(),
