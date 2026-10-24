@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
-  "productName": "Mjeku",
-  "version": "0.5.16",
+  "productName": "PROGRAMERI POS",
+  "version": "0.6.0",
   "identifier": "com.mjeku.desktop",
   "build": {
     "devUrl": "http://127.0.0.1:5173",
@@ -18,7 +18,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Mjeku",
+        "title": "PROGRAMERI POS",
         "width": 1100,
         "height": 720,
         "maximized": true,

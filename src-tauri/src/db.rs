@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -352,12 +352,162 @@ CREATE TABLE IF NOT EXISTS lab_inbox (
 );
 "#;
 
+/// Shitja e gatshme për thirrjen SEF `fiscalize` (shih `Db::sef_collect_sale`).
+#[derive(Debug, Clone)]
+pub struct SefSaleData {
+    pub sale: Sale,
+    pub items: Vec<VisitItem>,
+    pub used_non_fiscal_fallback: bool,
+    /// (metoda, shuma) e pagesave jo të fshira të shitjes.
+    pub payments: Vec<(String, f64)>,
+}
+
+/// Të dhënat e kuponit SEF që Mjeku ruan te shitja (burimi i së vërtetës: PROGRAMERI POS).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SefCouponInfo {
+    pub coupon_id: String,
+    pub daily_number: Option<i64>,
+    pub status: String,
+    pub verification_url: Option<String>,
+}
+
 pub struct Db {
     db_path: PathBuf,
     conn: Mutex<Connection>,
 }
 
+#[cfg(test)]
+mod vat_service_tests {
+    use super::*;
+
+    fn visit(vat_code: Option<&str>) -> ServiceUpsertInput {
+        ServiceUpsertInput {
+            id: None, title: "Vizitë".to_string(), default_price: 0.0,
+            vat_code: vat_code.map(str::to_string), notes: None,
+        }
+    }
+
+    #[test]
+    fn registered_business_preserves_all_four_categories_and_defaults_to_a() {
+        let db = Db::new_in_memory().unwrap();
+        db.setting_set("clinic_vat_registered", "1").unwrap();
+        for code in ["A", "C", "D", "E"] {
+            let saved = db.services_upsert(visit(Some(code))).unwrap();
+            assert_eq!(saved.vat_code, code);
+            let persisted = db.services_list(None).unwrap().into_iter().find(|row| row.id == saved.id).unwrap();
+            assert_eq!(persisted.vat_code, code);
+        }
+        assert_eq!(db.services_upsert(visit(None)).unwrap().vat_code, "A");
+        assert!(db.services_upsert(visit(Some("B"))).is_err());
+    }
+
+    #[test]
+    fn unregistered_business_uses_only_c() {
+        let db = Db::new_in_memory().unwrap();
+        for code in [None, Some("A"), Some("C"), Some("D"), Some("E")] {
+            assert_eq!(db.services_upsert(visit(code)).unwrap().vat_code, "C");
+        }
+    }
+}
+
 impl Db {
+    pub fn orthopedic_episodes_list(&self, client_id: Option<String>) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, client_id, diagnosis, region, laterality, status, notes, created_at, updated_at FROM orthopedic_episodes WHERE (?1 IS NULL OR client_id = ?1) ORDER BY updated_at DESC")?;
+        let rows = stmt.query_map([client_id], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"client_id":r.get::<_,String>(1)?,"diagnosis":r.get::<_,String>(2)?,"region":r.get::<_,String>(3)?,"laterality":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"notes":r.get::<_,String>(6)?,"created_at":r.get::<_,String>(7)?,"updated_at":r.get::<_,String>(8)?})))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn orthopedic_episode_upsert(&self, episode: &serde_json::Value) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("INSERT INTO orthopedic_episodes (id,client_id,diagnosis,region,laterality,status,notes,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET diagnosis=excluded.diagnosis,region=excluded.region,laterality=excluded.laterality,status=excluded.status,notes=excluded.notes,updated_at=excluded.updated_at", rusqlite::params![episode["id"].as_str().unwrap_or_default(),episode["client_id"].as_str().unwrap_or_default(),episode["diagnosis"].as_str().unwrap_or_default(),episode["region"].as_str().unwrap_or_default(),episode["laterality"].as_str().unwrap_or_default(),episode["status"].as_str().unwrap_or("active"),episode["notes"].as_str().unwrap_or_default(),episode["created_at"].as_str().unwrap_or_default(),episode["updated_at"].as_str().unwrap_or_default()])?;
+        drop(conn);
+        self.orthopedic_audit("episode", episode["id"].as_str().unwrap_or_default(), episode)
+    }
+
+    pub fn orthopedic_audit(&self, entity_type: &str, entity_id: &str, payload: &serde_json::Value) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let body = payload.to_string();
+        conn.execute("INSERT INTO orthopedic_audit_log(id,entity_type,entity_id,action,payload_json,created_at) VALUES(?1,?2,?3,'upsert',?4,datetime('now'))", rusqlite::params![uuid::Uuid::new_v4().to_string(), entity_type, entity_id, body.clone()])?;
+        conn.execute("DELETE FROM sync_queue WHERE table_name=?1 AND row_id=?2 AND status IN ('pending','failed')", rusqlite::params![format!("orthopedic_{}", entity_type), entity_id])?;
+        conn.execute("INSERT INTO sync_queue(id,table_name,row_id,op,payload,created_at,status) VALUES(?1,?2,?3,'upsert',?4,datetime('now'),'pending')", rusqlite::params![uuid::Uuid::new_v4().to_string(), format!("orthopedic_{}", entity_type), entity_id, body])?;
+        Ok(())
+    }
+
+    pub fn orthopedic_surgery_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
+        let c=self.conn.lock().unwrap(); let now=v["created_at"].as_str().unwrap_or_default();
+        c.execute("INSERT INTO orthopedic_surgeries(id,episode_id,procedure,status,side,site,team,consent_status,planned_date,preop_checklist,postop_plan,payload_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13) ON CONFLICT(id) DO UPDATE SET procedure=excluded.procedure,status=excluded.status,side=excluded.side,site=excluded.site,team=excluded.team,consent_status=excluded.consent_status,planned_date=excluded.planned_date,preop_checklist=excluded.preop_checklist,postop_plan=excluded.postop_plan,payload_json=excluded.payload_json,updated_at=excluded.updated_at", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["procedure"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("draft"),v["side"].as_str().unwrap_or_default(),v["site"].as_str().unwrap_or_default(),v["team"].as_str().unwrap_or_default(),v["consent_status"].as_str().unwrap_or("pending"),v["planned_date"].as_str().unwrap_or_default(),v["preop_checklist"].as_str().unwrap_or_default(),v["postop_plan"].as_str().unwrap_or_default(),v.to_string(),now])?; Ok(())
+    }
+    pub fn orthopedic_implant_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
+        let c=self.conn.lock().unwrap(); c.execute("INSERT INTO orthopedic_implants(id,surgery_id,udi,lot,serial,status,manufacturer,model,catalog_ref,udi_di,udi_pi,expiration_date,sterility_status,anatomical_site,implantation_date,removal_status,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(id) DO UPDATE SET serial=excluded.serial,status=excluded.status,manufacturer=excluded.manufacturer,model=excluded.model,catalog_ref=excluded.catalog_ref,udi_di=excluded.udi_di,udi_pi=excluded.udi_pi,expiration_date=excluded.expiration_date,sterility_status=excluded.sterility_status,anatomical_site=excluded.anatomical_site,implantation_date=excluded.implantation_date,removal_status=excluded.removal_status,payload_json=excluded.payload_json", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["surgery_id"].as_str().unwrap_or_default(),v["udi"].as_str().unwrap_or_default(),v["lot"].as_str().unwrap_or_default(),v["serial"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("reserved"),v["manufacturer"].as_str().unwrap_or_default(),v["model"].as_str().unwrap_or_default(),v["catalog_ref"].as_str().unwrap_or_default(),v["udi_di"].as_str().unwrap_or_default(),v["udi_pi"].as_str().unwrap_or_default(),v["expiration_date"].as_str().unwrap_or_default(),v["sterility_status"].as_str().unwrap_or_default(),v["anatomical_site"].as_str().unwrap_or_default(),v["implantation_date"].as_str().unwrap_or_default(),v["removal_status"].as_str().unwrap_or("in_body"),v.to_string(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+    }
+    pub fn orthopedic_rehab_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
+        let c=self.conn.lock().unwrap(); c.execute("INSERT INTO orthopedic_rehab_plans(id,episode_id,protocol,phase,load_restrictions,rom_restrictions,approving_surgeon,start_date,status,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET protocol=excluded.protocol,phase=excluded.phase,load_restrictions=excluded.load_restrictions,rom_restrictions=excluded.rom_restrictions,approving_surgeon=excluded.approving_surgeon,start_date=excluded.start_date,status=excluded.status,payload_json=excluded.payload_json", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["protocol"].as_str().unwrap_or_default(),v["phase"].as_str().unwrap_or("phase_1"),v["load_restrictions"].as_str().unwrap_or_default(),v["rom_restrictions"].as_str().unwrap_or_default(),v["approving_surgeon"].as_str().unwrap_or_default(),v["start_date"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("active"),v.to_string(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+    }
+
+    pub fn orthopedic_markers_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, episode_id, view, region, side, injury_type, note, x, y, created_at FROM orthopedic_markers WHERE episode_id=?1 ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![episode_id], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"episode_id":r.get::<_,String>(1)?,"view":r.get::<_,String>(2)?,"region":r.get::<_,String>(3)?,"side":r.get::<_,String>(4)?,"injury_type":r.get::<_,String>(5)?,"note":r.get::<_,String>(6)?,"x":r.get::<_,f64>(7)?,"y":r.get::<_,f64>(8)?,"created_at":r.get::<_,String>(9)?})))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn orthopedic_marker_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("INSERT INTO orthopedic_markers(id,episode_id,view,region,side,injury_type,note,x,y,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO UPDATE SET view=excluded.view,region=excluded.region,side=excluded.side,injury_type=excluded.injury_type,note=excluded.note,x=excluded.x,y=excluded.y", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["view"].as_str().unwrap_or("anterior"),v["region"].as_str().unwrap_or_default(),v["side"].as_str().unwrap_or_default(),v["injury_type"].as_str().unwrap_or_default(),v["note"].as_str().unwrap_or_default(),v["x"].as_f64().unwrap_or(0.0),v["y"].as_f64().unwrap_or(0.0),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+    }
+
+    pub fn orthopedic_assessments_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, episode_id, category, joint, movement, method, degrees, pain, test_name, test_result, note, created_at FROM orthopedic_assessments WHERE episode_id=?1 ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![episode_id], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"episode_id":r.get::<_,String>(1)?,"category":r.get::<_,String>(2)?,"joint":r.get::<_,String>(3)?,"movement":r.get::<_,String>(4)?,"method":r.get::<_,String>(5)?,"degrees":r.get::<_,String>(6)?,"pain":r.get::<_,String>(7)?,"test_name":r.get::<_,String>(8)?,"test_result":r.get::<_,String>(9)?,"note":r.get::<_,String>(10)?,"created_at":r.get::<_,String>(11)?})))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn orthopedic_assessment_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("INSERT INTO orthopedic_assessments(id,episode_id,payload_json,category,joint,movement,method,degrees,pain,test_name,test_result,note,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json,category=excluded.category,joint=excluded.joint,movement=excluded.movement,method=excluded.method,degrees=excluded.degrees,pain=excluded.pain,test_name=excluded.test_name,test_result=excluded.test_result,note=excluded.note", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v.to_string(),v["category"].as_str().unwrap_or("rom"),v["joint"].as_str().unwrap_or_default(),v["movement"].as_str().unwrap_or_default(),v["method"].as_str().unwrap_or("clinical"),v["degrees"].as_str().unwrap_or_default(),v["pain"].as_str().unwrap_or_default(),v["test_name"].as_str().unwrap_or_default(),v["test_result"].as_str().unwrap_or_default(),v["note"].as_str().unwrap_or_default(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+    }
+
+    pub fn orthopedic_fractures_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, episode_id, bone_region, laterality, segment, fracture_pattern, open_closed, displacement, classification, classification_source, injury_date, treatment_strategy, current_status, created_at FROM orthopedic_fractures WHERE episode_id=?1 ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![episode_id], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"episode_id":r.get::<_,String>(1)?,"bone_region":r.get::<_,String>(2)?,"laterality":r.get::<_,String>(3)?,"segment":r.get::<_,String>(4)?,"fracture_pattern":r.get::<_,String>(5)?,"open_closed":r.get::<_,String>(6)?,"displacement":r.get::<_,String>(7)?,"classification":r.get::<_,String>(8)?,"classification_source":r.get::<_,String>(9)?,"injury_date":r.get::<_,String>(10)?,"treatment_strategy":r.get::<_,String>(11)?,"current_status":r.get::<_,String>(12)?,"created_at":r.get::<_,String>(13)?})))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn orthopedic_fracture_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("INSERT INTO orthopedic_fractures(id,episode_id,payload_json,bone_region,laterality,segment,fracture_pattern,open_closed,displacement,classification,classification_source,injury_date,treatment_strategy,current_status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json,bone_region=excluded.bone_region,laterality=excluded.laterality,segment=excluded.segment,fracture_pattern=excluded.fracture_pattern,open_closed=excluded.open_closed,displacement=excluded.displacement,classification=excluded.classification,classification_source=excluded.classification_source,injury_date=excluded.injury_date,treatment_strategy=excluded.treatment_strategy,current_status=excluded.current_status", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v.to_string(),v["bone_region"].as_str().unwrap_or_default(),v["laterality"].as_str().unwrap_or_default(),v["segment"].as_str().unwrap_or_default(),v["fracture_pattern"].as_str().unwrap_or_default(),v["open_closed"].as_str().unwrap_or("closed"),v["displacement"].as_str().unwrap_or_default(),v["classification"].as_str().unwrap_or_default(),v["classification_source"].as_str().unwrap_or_default(),v["injury_date"].as_str().unwrap_or_default(),v["treatment_strategy"].as_str().unwrap_or_default(),v["current_status"].as_str().unwrap_or("unknown"),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+    }
+
+    pub fn orthopedic_imaging_links_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, episode_id, fracture_id, study_ref, modality, taken_at, reviewer_note, created_at FROM orthopedic_imaging_links WHERE episode_id=?1 ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![episode_id], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"episode_id":r.get::<_,String>(1)?,"fracture_id":r.get::<_,String>(2)?,"study_ref":r.get::<_,String>(3)?,"modality":r.get::<_,String>(4)?,"taken_at":r.get::<_,String>(5)?,"reviewer_note":r.get::<_,String>(6)?,"created_at":r.get::<_,String>(7)?})))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn orthopedic_imaging_link_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("INSERT INTO orthopedic_imaging_links(id,episode_id,fracture_id,study_ref,modality,taken_at,reviewer_note,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET fracture_id=excluded.fracture_id,study_ref=excluded.study_ref,modality=excluded.modality,taken_at=excluded.taken_at,reviewer_note=excluded.reviewer_note", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["fracture_id"].as_str().unwrap_or_default(),v["study_ref"].as_str().unwrap_or_default(),v["modality"].as_str().unwrap_or_default(),v["taken_at"].as_str().unwrap_or_default(),v["reviewer_note"].as_str().unwrap_or_default(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+    }
+
+    pub fn orthopedic_postop_visits_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, episode_id, surgery_id, visit_date, findings, complications, next_step, created_at FROM orthopedic_postop_visits WHERE episode_id=?1 ORDER BY visit_date DESC")?;
+        let rows = stmt.query_map(rusqlite::params![episode_id], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"episode_id":r.get::<_,String>(1)?,"surgery_id":r.get::<_,String>(2)?,"visit_date":r.get::<_,String>(3)?,"findings":r.get::<_,String>(4)?,"complications":r.get::<_,String>(5)?,"next_step":r.get::<_,String>(6)?,"created_at":r.get::<_,String>(7)?})))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn orthopedic_postop_visit_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("INSERT INTO orthopedic_postop_visits(id,episode_id,surgery_id,visit_date,findings,complications,next_step,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET surgery_id=excluded.surgery_id,visit_date=excluded.visit_date,findings=excluded.findings,complications=excluded.complications,next_step=excluded.next_step", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["surgery_id"].as_str().unwrap_or_default(),v["visit_date"].as_str().unwrap_or_default(),v["findings"].as_str().unwrap_or_default(),v["complications"].as_str().unwrap_or_default(),v["next_step"].as_str().unwrap_or_default(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+    }
+
+    /// Gjurmueshmëria e implanteve (kriteri i pranimit §6.2): kërkim ndër-pacientësh sipas lotit, serialit ose UDI.
+    pub fn orthopedic_implants_search(&self, query: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let like = format!("%{}%", query);
+        let mut stmt = conn.prepare("SELECT i.id, i.surgery_id, s.episode_id, i.udi, i.lot, i.serial, i.status, i.manufacturer, i.model, i.removal_status, i.implantation_date, i.created_at FROM orthopedic_implants i LEFT JOIN orthopedic_surgeries s ON s.id = i.surgery_id WHERE i.lot LIKE ?1 OR i.serial LIKE ?1 OR i.udi LIKE ?1 OR i.udi_di LIKE ?1 OR i.udi_pi LIKE ?1 OR i.manufacturer LIKE ?1 OR i.model LIKE ?1 ORDER BY i.created_at DESC LIMIT 200")?;
+        let rows = stmt.query_map(rusqlite::params![like], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"surgery_id":r.get::<_,String>(1)?,"episode_id":r.get::<_,Option<String>>(2)?,"udi":r.get::<_,String>(3)?,"lot":r.get::<_,String>(4)?,"serial":r.get::<_,String>(5)?,"status":r.get::<_,String>(6)?,"manufacturer":r.get::<_,String>(7)?,"model":r.get::<_,String>(8)?,"removal_status":r.get::<_,String>(9)?,"implantation_date":r.get::<_,String>(10)?,"created_at":r.get::<_,String>(11)?})))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
     pub fn new(db_path: PathBuf) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent)
@@ -373,8 +523,8 @@ impl Db {
         conn.execute_batch(MIGRATION_SQL)?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
-
-        conn.execute_batch(include_str!("../migrations/general_practice_core.sql"))?;
+        conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql"))?;
+        conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
 
         Ok(Self {
             db_path,
@@ -391,8 +541,8 @@ impl Db {
         conn.execute_batch(MIGRATION_SQL)?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
-
-        conn.execute_batch(include_str!("../migrations/general_practice_core.sql"))?;
+        conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql"))?;
+        conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
 
         Ok(Self {
             db_path: PathBuf::new(),
@@ -473,6 +623,16 @@ impl Db {
         Self::add_column_if_missing(conn, "sales", "fiscalized", "INTEGER NOT NULL DEFAULT 0")?;
         Self::add_column_if_missing(conn, "sales", "fiscalized_at", "TEXT")?;
         conn.execute("UPDATE sales SET fiscalized=0 WHERE fiscalized IS NULL", [])?;
+        // SEF (PROGRAMERI POS): kolona vetëm lokale (nuk sinkronizohen; struct Sale s'i ka).
+        for (col, ddl) in [
+            ("sef_coupon_id", "TEXT"),
+            ("sef_daily_number", "INTEGER"),
+            ("sef_status", "TEXT"),
+            ("sef_verification_url", "TEXT"),
+            ("sef_fiscalized_at", "TEXT"),
+        ] {
+            Self::add_column_if_missing(conn, "sales", col, ddl)?;
+        }
 
         // visits
         for (col, ddl) in [
@@ -598,6 +758,42 @@ impl Db {
 
         // Legacy recovery: older builds may have queued visit_items payloads with missing/null vat_code.
         Self::normalize_legacy_sync_payloads(conn)?;
+
+        // orthopedics: structured columns (additive; payload_json stays as a free-form fallback for older rows)
+        for (col, ddl) in [
+            ("category", "TEXT NOT NULL DEFAULT 'rom'"),
+            ("joint", "TEXT"), ("movement", "TEXT"), ("method", "TEXT"), ("degrees", "TEXT"),
+            ("pain", "TEXT"), ("test_name", "TEXT"), ("test_result", "TEXT"), ("note", "TEXT"),
+        ] {
+            Self::add_column_if_missing(conn, "orthopedic_assessments", col, ddl)?;
+        }
+        for (col, ddl) in [
+            ("bone_region", "TEXT"), ("laterality", "TEXT"), ("segment", "TEXT"), ("fracture_pattern", "TEXT"),
+            ("open_closed", "TEXT NOT NULL DEFAULT 'closed'"), ("displacement", "TEXT"), ("classification", "TEXT"),
+            ("classification_source", "TEXT"), ("injury_date", "TEXT"), ("treatment_strategy", "TEXT"),
+            ("current_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ] {
+            Self::add_column_if_missing(conn, "orthopedic_fractures", col, ddl)?;
+        }
+        for (col, ddl) in [
+            ("side", "TEXT"), ("site", "TEXT"), ("team", "TEXT"), ("consent_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("planned_date", "TEXT"), ("preop_checklist", "TEXT"), ("postop_plan", "TEXT"),
+        ] {
+            Self::add_column_if_missing(conn, "orthopedic_surgeries", col, ddl)?;
+        }
+        for (col, ddl) in [
+            ("manufacturer", "TEXT"), ("model", "TEXT"), ("catalog_ref", "TEXT"), ("udi_di", "TEXT"), ("udi_pi", "TEXT"),
+            ("expiration_date", "TEXT"), ("sterility_status", "TEXT"), ("anatomical_site", "TEXT"),
+            ("implantation_date", "TEXT"), ("removal_status", "TEXT NOT NULL DEFAULT 'in_body'"),
+        ] {
+            Self::add_column_if_missing(conn, "orthopedic_implants", col, ddl)?;
+        }
+        for (col, ddl) in [
+            ("load_restrictions", "TEXT"), ("rom_restrictions", "TEXT"), ("approving_surgeon", "TEXT"),
+            ("start_date", "TEXT"), ("status", "TEXT NOT NULL DEFAULT 'active'"),
+        ] {
+            Self::add_column_if_missing(conn, "orthopedic_rehab_plans", col, ddl)?;
+        }
 
         Ok(())
     }
@@ -754,7 +950,7 @@ impl Db {
     }
 
     pub fn row_updated_at(&self, table: &str, id: &str) -> anyhow::Result<Option<String>> {
-        // Only whitelisted tables â€” table name is never user input.
+        // Only whitelisted tables — table name is never user input.
         let sql = match table {
             "prescriptions" => "SELECT updated_at FROM prescriptions WHERE id=?1",
             "fiscal_jobs" => "SELECT updated_at FROM fiscal_jobs WHERE id=?1",
@@ -2425,6 +2621,290 @@ impl Db {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // SEF (PROGRAMERI POS) — përdoret vetëm kur fiscal_printer_provider=sef_programeri.
+    // Nuk prek rrugën ENTERNET (`fiscal_receipt_generate_inp`).
+    // -----------------------------------------------------------------------
+
+    fn sef_map_visit_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<VisitItem> {
+        Ok(VisitItem {
+            id: row.get(0)?,
+            visit_id: row.get(1)?,
+            client_id: row.get(2)?,
+            tooth: row.get(3)?,
+            title: row.get(4)?,
+            qty: row.get(5)?,
+            unit_price: row.get(6)?,
+            fiscal: row.get(7)?,
+            vat_code: row.get(8)?,
+            fiscalized: row.get(9)?,
+            fiscalized_at: row.get(10)?,
+            notes: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+            deleted: row.get(14)?,
+        })
+    }
+
+    /// Mbledh shitjen, rreshtat dhe pagesat për `fiscalize`, me të njëjtat rregulla
+    /// zgjedhjeje si `fiscal_receipt_generate_inp`: rreshtat fiskal të pafiskalizuar;
+    /// nëse s'ka dhe `allow_any_items_if_no_fiscal`, të gjithë rreshtat e pafiskalizuar.
+    pub fn sef_collect_sale(
+        &self,
+        sale_id: &str,
+        allow_any_items_if_no_fiscal: bool,
+    ) -> anyhow::Result<SefSaleData> {
+        let sale_id = sale_id.trim();
+        if sale_id.is_empty() {
+            bail!("sale_id eshte i detyrueshem");
+        }
+        let conn = self.conn()?;
+        let sale = conn
+            .query_row(
+                "SELECT id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted
+                 FROM sales WHERE id=?1",
+                params![sale_id],
+                |row| {
+                    Ok(Sale {
+                        id: row.get(0)?,
+                        client_id: row.get(1)?,
+                        date: row.get(2)?,
+                        total: row.get(3)?,
+                        notes: row.get(4)?,
+                        fiscalized: row.get(5)?,
+                        fiscalized_at: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        deleted: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("fatura nuk u gjet"))?;
+        if sale.deleted != 0 {
+            bail!("fatura eshte e fshire");
+        }
+        if sale.fiscalized != 0 {
+            bail!("fatura eshte fiskalizuar tashme");
+        }
+
+        let cols = "id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted";
+        let mut items: Vec<VisitItem> = Vec::new();
+        {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {cols} FROM visit_items
+                 WHERE visit_id=?1 AND deleted=0 AND fiscal=1 AND fiscalized=0
+                 ORDER BY created_at ASC"
+            ))?;
+            for r in stmt.query_map(params![sale_id], Self::sef_map_visit_item)? {
+                items.push(r?);
+            }
+        }
+        let mut used_non_fiscal_fallback = false;
+        if items.is_empty() && allow_any_items_if_no_fiscal {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {cols} FROM visit_items
+                 WHERE visit_id=?1 AND deleted=0 AND fiscalized=0
+                 ORDER BY created_at ASC"
+            ))?;
+            for r in stmt.query_map(params![sale_id], Self::sef_map_visit_item)? {
+                items.push(r?);
+            }
+            used_non_fiscal_fallback = !items.is_empty();
+        }
+        if items.is_empty() {
+            bail!("nuk ka rreshta fiskal pa fiskalizuar");
+        }
+
+        let mut payments: Vec<(String, f64)> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(method,'cash'), amount FROM payments
+                 WHERE sale_id=?1 AND deleted=0 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![sale_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            })?;
+            for r in rows {
+                payments.push(r?);
+            }
+        }
+
+        Ok(SefSaleData {
+            sale,
+            items,
+            used_non_fiscal_fallback,
+            payments,
+        })
+    }
+
+    /// Pas përgjigjes së suksesshme të `fiscalize` (FISCALIZED ose PENDING_OFFLINE):
+    /// shënon rreshtat dhe shitjen si të fiskalizuara (si rruga ENTERNET), ruan
+    /// pagesën automatike kur shitja s'ka pagesë, dhe ruan numrin/statusin e kuponit SEF.
+    pub fn sef_mark_fiscalized(
+        &self,
+        data: &SefSaleData,
+        total: f64,
+        coupon: &SefCouponInfo,
+    ) -> anyhow::Result<()> {
+        let now = now_iso();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+
+        let already: i64 = tx
+            .query_row(
+                "SELECT fiscalized FROM sales WHERE id=?1",
+                params![&data.sale.id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
+        tx.execute(
+            "UPDATE sales SET sef_coupon_id=?2, sef_daily_number=?3, sef_status=?4, sef_verification_url=?5, sef_fiscalized_at=?6 WHERE id=?1",
+            params![
+                &data.sale.id,
+                &coupon.coupon_id,
+                coupon.daily_number,
+                &coupon.status,
+                &coupon.verification_url,
+                &now
+            ],
+        )?;
+
+        if already != 0 {
+            // Një thirrje paralele e ka shënuar tashmë; ruajmë vetëm të dhënat e kuponit.
+            tx.commit()?;
+            return Ok(());
+        }
+
+        for it in &data.items {
+            let mut it = it.clone();
+            let updated_fiscal_flag = if data.used_non_fiscal_fallback {
+                1
+            } else {
+                it.fiscal
+            };
+            tx.execute(
+                "UPDATE visit_items SET fiscal=?3, fiscalized=1, fiscalized_at=?2, updated_at=?2 WHERE id=?1",
+                params![&it.id, &now, updated_fiscal_flag],
+            )?;
+            it.fiscal = updated_fiscal_flag;
+            it.fiscalized = 1;
+            it.fiscalized_at = Some(now.clone());
+            it.updated_at = now.clone();
+            let payload = serde_json::to_string(&it)?;
+            Self::queue_replace_pending_tx(&tx, "visit_items", &it.id, "upsert", &payload, &now)?;
+        }
+
+        tx.execute(
+            "UPDATE sales SET fiscalized=1, fiscalized_at=?2, updated_at=?2 WHERE id=?1",
+            params![&data.sale.id, &now],
+        )?;
+        let updated_sale = Sale {
+            fiscalized: 1,
+            fiscalized_at: Some(now.clone()),
+            updated_at: now.clone(),
+            ..data.sale.clone()
+        };
+        let payload = serde_json::to_string(&updated_sale)?;
+        Self::queue_replace_pending_tx(&tx, "sales", &updated_sale.id, "upsert", &payload, &now)?;
+
+        // Pagesa automatike si te ENTERNET: vetëm kur shitja s'ka asnjë pagesë.
+        let auto_note = "[AUTO-FISCAL] Kupon fiskal SEF";
+        let has_any_payment = tx
+            .query_row(
+                "SELECT 1 FROM payments WHERE sale_id=?1 AND deleted=0 LIMIT 1",
+                params![&updated_sale.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !has_any_payment {
+            let payment_date = updated_sale
+                .date
+                .clone()
+                .or_else(|| now.get(0..10).map(|x| x.to_string()));
+            let payment = Payment {
+                id: updated_sale.id.clone(),
+                client_id: updated_sale.client_id.clone(),
+                sale_id: Some(updated_sale.id.clone()),
+                date: payment_date,
+                amount: total,
+                method: "cash".to_string(),
+                notes: Some(auto_note.to_string()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                deleted: 0,
+            };
+            tx.execute(
+                "INSERT INTO payments (id, client_id, sale_id, date, amount, method, notes, created_at, updated_at, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+                 ON CONFLICT(id) DO UPDATE SET
+                   client_id=excluded.client_id,
+                   sale_id=excluded.sale_id,
+                   date=excluded.date,
+                   amount=excluded.amount,
+                   method=excluded.method,
+                   notes=excluded.notes,
+                   updated_at=excluded.updated_at,
+                   deleted=excluded.deleted",
+                params![
+                    &payment.id,
+                    &payment.client_id,
+                    &payment.sale_id,
+                    &payment.date,
+                    payment.amount,
+                    &payment.method,
+                    &payment.notes,
+                    &payment.created_at,
+                    &payment.updated_at
+                ],
+            )?;
+            let payment_payload = serde_json::to_string(&payment)?;
+            Self::queue_replace_pending_tx(
+                &tx,
+                "payments",
+                &payment.id,
+                "upsert",
+                &payment_payload,
+                &now,
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Të dhënat lokale SEF të një shitjeje (vetëm lexim, për UI).
+    pub fn sef_sale_coupon(&self, sale_id: &str) -> anyhow::Result<Option<SefCouponInfo>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT sef_coupon_id, sef_daily_number, sef_status, sef_verification_url
+                 FROM sales WHERE id=?1",
+                params![sale_id.trim()],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(id, n, s, u)| {
+            id.filter(|x| !x.trim().is_empty())
+                .map(|coupon_id| SefCouponInfo {
+                    coupon_id,
+                    daily_number: n,
+                    status: s.unwrap_or_default(),
+                    verification_url: u,
+                })
+        }))
+    }
+
     pub fn sales_mark_non_fiscal_manual(
         &self,
         sale_id: &str,
@@ -3234,17 +3714,13 @@ impl Db {
             .trim()
             .to_uppercase();
         if vat_registered {
-            // VAT registered: A (0% exempt), D (8%), E (18%).
+            // VAT registered: preserve both zero-rate categories A and C.
             if vat_code.is_empty() {
                 vat_code = "A".to_string();
             }
-            if vat_code == "C" {
-                // Convert legacy "not VAT" into 0% exempt.
-                vat_code = "A".to_string();
-            }
             match vat_code.as_str() {
-                "A" | "D" | "E" => {}
-                _ => bail!("vat_code duhet te jete A, D ose E (kur biznesi eshte ne TVSH)"),
+                "A" | "C" | "D" | "E" => {}
+                _ => bail!("vat_code duhet te jete A, C, D ose E (kur biznesi eshte ne TVSH)"),
             }
         } else {
             // Not VAT registered: always "C" (0% - not in VAT).
@@ -4327,12 +4803,9 @@ impl Db {
             if vat_code.is_empty() {
                 vat_code = "A".to_string();
             }
-            if vat_code == "C" {
-                vat_code = "A".to_string();
-            }
             match vat_code.as_str() {
-                "A" | "D" | "E" => {}
-                _ => bail!("vat_code duhet te jete A, D ose E (kur biznesi eshte ne TVSH)"),
+                "A" | "C" | "D" | "E" => {}
+                _ => bail!("vat_code duhet te jete A, C, D ose E (kur biznesi eshte ne TVSH)"),
             }
         } else {
             vat_code = "C".to_string();
@@ -5588,7 +6061,7 @@ impl Db {
         Ok(())
     }
 
-    // â”€â”€â”€ Offers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Offers ───────────────────────────────────────────────────────────────
 
     pub fn next_offer_number(&self, month: u32, year: i32) -> anyhow::Result<String> {
         let conn = self.conn.lock().unwrap();
@@ -5939,91 +6412,6 @@ impl Db {
             "kind":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,
             "visitId":r.get::<_,String>(6)?,"clinicianId":r.get::<_,String>(7)?,
             "recordedAt":r.get::<_,String>(8)?,"notes":r.get::<_,Option<String>>(9)?
-
-    pub fn clinician_can_access_patient(&self, clinician_id: &str, patient_id: &str) -> anyhow::Result<bool> {
-        let conn=self.conn()?;
-        let count:i64=conn.query_row(
-            "SELECT COUNT(*) FROM visits WHERE client_id=?1 AND doctor_id=?2 AND deleted=0",
-            params![patient_id,clinician_id], |r|r.get(0))?;
-        Ok(count>0)
-    }
-    pub fn clinician_owns_visit(&self, clinician_id: &str, patient_id: &str, visit_id: &str) -> anyhow::Result<bool> {
-        let conn=self.conn()?;
-        let count:i64=conn.query_row(
-            "SELECT COUNT(*) FROM visits WHERE id=?1 AND client_id=?2 AND doctor_id=?3 AND deleted=0",
-            params![visit_id,patient_id,clinician_id], |r|r.get(0))?;
-        Ok(count==1)
-    }
-}
-
-impl Db {
-    pub fn clinical_conditions_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
-        if patient_id.trim().is_empty() { bail!("patient_id required"); }
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT id, patient_id, code, code_system, code_version, display, clinical_status, verification_status, clinician_id, encounter_id, onset_date, resolved_date, notes FROM clinical_conditions WHERE patient_id = ?1 ORDER BY updated_at DESC, id DESC")?;
-        let rows = stmt.query_map(params![patient_id], |row| {
-            Ok(serde_json::json!({
-                "id": row.get::<_, String>(0)?, "patientId": row.get::<_, String>(1)?,
-                "code": row.get::<_, String>(2)?, "codeSystem": row.get::<_, String>(3)?,
-                "codeVersion": row.get::<_, String>(4)?, "display": row.get::<_, String>(5)?,
-                "clinicalStatus": row.get::<_, String>(6)?, "verificationStatus": row.get::<_, String>(7)?,
-                "clinicianId": row.get::<_, String>(8)?, "encounterId": row.get::<_, Option<String>>(9)?,
-                "onsetDate": row.get::<_, Option<String>>(10)?, "resolvedDate": row.get::<_, Option<String>>(11)?,
-                "notes": row.get::<_, String>(12)?
-            }))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
-
-    pub fn clinical_condition_create(&self, value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        let field = |name: &str| -> anyhow::Result<String> {
-            let text = value.get(name).and_then(|v| v.as_str()).unwrap_or("").trim();
-            if text.is_empty() { bail!("missing {}", name); }
-            Ok(text.to_owned())
-        };
-        let id = Uuid::new_v4().to_string();
-        let patient_id = field("patientId")?;
-        let code = field("code")?;
-        let system = field("codeSystem")?;
-        let version = field("codeVersion")?;
-        let display = field("display")?;
-        let clinician = field("clinicianId")?;
-        let status = field("clinicalStatus")?;
-        let verification = field("verificationStatus")?;
-        if !["active","inactive","resolved","history","entered_in_error"].contains(&status.as_str()) { bail!("invalid clinical status"); }
-        if !["unconfirmed","provisional","confirmed","refuted","entered_in_error"].contains(&verification.as_str()) { bail!("invalid verification status"); }
-        if (status == "entered_in_error") != (verification == "entered_in_error") { bail!("inconsistent entered-in-error status"); }
-        let encounter = value.get("encounterId").and_then(|v|v.as_str());
-        let onset = value.get("onsetDate").and_then(|v|v.as_str());
-        let resolved = value.get("resolvedDate").and_then(|v|v.as_str());
-        if status == "resolved" && resolved.is_none() { bail!("resolution date required"); }
-        if let (Some(a),Some(b))=(onset,resolved) { if b<a { bail!("resolution precedes onset"); } }
-        let notes = value.get("notes").and_then(|v|v.as_str()).unwrap_or("");
-        let now = now_iso();
-        let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
-        let existing: i64 = tx.query_row("SELECT COUNT(*) FROM clinical_conditions WHERE patient_id=?1 AND code=?2 AND code_system=?3 AND code_version=?4 AND clinical_status='active'", params![patient_id,code,system,version], |r|r.get(0))?;
-        if existing > 0 && status=="active" { bail!("active condition already exists; review and link existing record"); }
-        tx.execute("INSERT INTO clinical_conditions(id,patient_id,code,code_system,code_version,display,clinical_status,verification_status,clinician_id,encounter_id,onset_date,resolved_date,notes,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",params![id,patient_id,code,system,version,display,status,verification,clinician,encounter,onset,resolved,notes,now])?;
-        tx.execute("INSERT INTO clinical_condition_events(id,condition_id,author_id,recorded_at,event_type,new_value) VALUES (?1,?2,?3,?4,'created',?5)",params![Uuid::new_v4().to_string(),id,clinician,now,value.to_string()])?;
-        tx.commit()?;
-        let mut output=value;
-        output["id"]=serde_json::Value::String(id);
-        Ok(output)
-    }
-}
-
-impl Db {
-    pub fn clinical_notes_list(&self, patient_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
-        if patient_id.trim().is_empty() { bail!("patient_id required"); }
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT id, patient_id, encounter_id, author_id, version, status, subjective, objective, assessment, plan, previous_version_id FROM clinical_notes WHERE patient_id=?1 ORDER BY created_at DESC,id DESC")?;
-        let rows = stmt.query_map(params![patient_id], |r| Ok(serde_json::json!({
-            "id":r.get::<_,String>(0)?, "patientId":r.get::<_,String>(1)?,
-            "encounterId":r.get::<_,String>(2)?, "authorId":r.get::<_,String>(3)?,
-            "version":r.get::<_,i64>(4)?, "status":r.get::<_,String>(5)?,
-            "sections":{"subjective":r.get::<_,String>(6)?,"objective":r.get::<_,String>(7)?,"assessment":r.get::<_,String>(8)?,"plan":r.get::<_,String>(9)?},
-            "previousVersionId":r.get::<_,Option<String>>(10)?
         })))?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
@@ -6058,27 +6446,6 @@ impl Db {
             bail!("This finding cannot be a planned procedure");
         }
         if let Some(n)=notes { if n.len()>10_000 { bail!("Notes too long"); } }
-
-    pub fn clinical_note_create(&self, value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        let required = |key: &str| -> anyhow::Result<String> {
-            let text=value.get(key).and_then(|v|v.as_str()).unwrap_or("").trim();
-            if text.is_empty() { bail!("missing {}",key); }
-            Ok(text.to_owned())
-        };
-        let patient=required("patientId")?;
-        let encounter=required("encounterId")?;
-        let author=required("authorId")?;
-        let status=required("status")?;
-        if status!="draft" && status!="in_review" && status!="finalized" { bail!("invalid initial note status"); }
-        let sections=value.get("sections").ok_or_else(||anyhow!("sections required"))?;
-        let get_section=|key: &str| -> anyhow::Result<String> {
-            Ok(sections.get(key).and_then(|v|v.as_str()).ok_or_else(||anyhow!("missing {}",key))?.to_string())
-        };
-        let subjective=get_section("subjective")?;
-        let objective=get_section("objective")?;
-        let assessment=get_section("assessment")?;
-        let plan=get_section("plan")?;
-        if status=="finalized" && [&subjective,&objective,&assessment,&plan].iter().any(|s|s.trim().is_empty()) { bail!("finalized SOAP requires all sections"); }
         let id=Uuid::new_v4().to_string();
         let now=now_iso();
         let mut conn=self.conn()?;
@@ -6238,6 +6605,22 @@ mod dental_findings_tests {
         let conn=db.conn().unwrap();
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql")).unwrap();
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql")).unwrap();
+    }
+
+    #[test]
+    fn orthopedics_schema_migration_is_idempotent() {
+        let db = Db::new_in_memory().expect("in-memory DB migration");
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql")).unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'orthopedic_%'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 10);
     }
 }
 
@@ -6400,51 +6783,5 @@ impl Db {
             result.push(plan);
         }
         Ok(result)
-    }
-}
-
-        let belongs: i64=tx.query_row("SELECT COUNT(*) FROM visits WHERE id=?1 AND client_id=?2 AND deleted=0",params![encounter,patient],|r|r.get(0))?;
-        if belongs!=1 { bail!("encounter does not belong to patient"); }
-        tx.execute("INSERT INTO clinical_notes(id,patient_id,encounter_id,author_id,version,status,subjective,objective,assessment,plan,created_at,updated_at) VALUES (?1,?2,?3,?4,1,?5,?6,?7,?8,?9,?10,?10)",
-            params![id,patient,encounter,author,status,subjective,objective,assessment,plan,now])?;
-        tx.commit()?;
-        let mut result=value;
-        result["id"]=serde_json::Value::String(id);
-        result["version"]=serde_json::json!(1);
-        result["previousVersionId"]=serde_json::Value::Null;
-        Ok(result)
-    }
-}
-
-impl Db {
-    pub fn clinical_allergies_list(&self, patient_id:&str)->anyhow::Result<Vec<serde_json::Value>>{
-        if patient_id.trim().is_empty(){bail!("patient required");}
-        let conn=self.conn()?;
-        let mut stmt=conn.prepare("SELECT id,patient_id,substance,category,verification,reaction FROM clinical_allergies WHERE patient_id=?1 ORDER BY updated_at DESC")?;
-        let rows=stmt.query_map(params![patient_id],|r|Ok(serde_json::json!({
-            "id":r.get::<_,String>(0)?,"patientId":r.get::<_,String>(1)?,
-            "substance":r.get::<_,String>(2)?,"category":r.get::<_,String>(3)?,
-            "verification":r.get::<_,String>(4)?,"reaction":r.get::<_,Option<String>>(5)?
-        })))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
-    pub fn clinical_allergy_create(&self, value:serde_json::Value)->anyhow::Result<serde_json::Value>{
-        let required=|key:&str|->anyhow::Result<String>{
-            let text=value.get(key).and_then(|v|v.as_str()).unwrap_or("").trim();
-            if text.is_empty(){bail!("missing {}",key);}Ok(text.to_owned())
-        };
-        let patient=required("patientId")?;
-        let substance=required("substance")?;
-        let category=required("category")?;
-        let verification=required("verification")?;
-        if !["allergy","intolerance","unknown"].contains(&category.as_str()){bail!("invalid category");}
-        if !["unconfirmed","confirmed","refuted"].contains(&verification.as_str()){bail!("invalid verification");}
-        let reaction=value.get("reaction").and_then(|v|v.as_str());
-        let id=Uuid::new_v4().to_string();let now=now_iso();
-        let mut conn=self.conn()?;let tx=conn.transaction()?;
-        tx.execute("INSERT INTO clinical_allergies(id,patient_id,substance,category,verification,reaction,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
-            params![id,patient,substance,category,verification,reaction,now])?;
-        tx.commit()?;
-        let mut result=value;result["id"]=serde_json::json!(id);Ok(result)
     }
 }

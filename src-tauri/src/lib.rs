@@ -1,4 +1,4 @@
-﻿mod auth;
+mod auth;
 mod db;
 mod desktop_updates;
 mod error_logs;
@@ -6,6 +6,7 @@ mod invoice;
 mod lab_devices;
 mod license_engine;
 mod models;
+mod sef_bridge;
 mod sync_engine;
 mod ui_protocol;
 mod updates;
@@ -92,10 +93,10 @@ fn add_days_to_iso(ts: &str, days: i64) -> Option<String> {
     Some(next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-/// Krahason dy versione "x.y.z" numerikisht â€” kthen true vetÃ«m nÃ«se `remote`
-/// Ã«shtÃ« STRIKT mÃ« i ri se `local`. Kjo shmang rastin kur manifesti i update-it
-/// mbetet i ngrirÃ«/gabuar nÃ« njÃ« version mÃ« tÃ« vjetÃ«r (p.sh. "0.4.9") dhe kyÃ§i
-/// i vjetÃ«r `!=` e trajtonte gabimisht si "update i ri" edhe pse ishte mÃ« i vjetÃ«r.
+/// Krahason dy versione "x.y.z" numerikisht — kthen true vetëm nëse `remote`
+/// është STRIKT më i ri se `local`. Kjo shmang rastin kur manifesti i update-it
+/// mbetet i ngrirë/gabuar në një version më të vjetër (p.sh. "0.4.9") dhe kyçi
+/// i vjetër `!=` e trajtonte gabimisht si "update i ri" edhe pse ishte më i vjetër.
 fn version_is_newer(remote: &str, local: &str) -> bool {
     fn parse(v: &str) -> (u64, u64, u64) {
         let v = v.trim().trim_start_matches('v');
@@ -332,6 +333,10 @@ fn normalize_fiscal_printer_provider(v: &str) -> Option<String> {
         "enternet" => Some("enternet".to_string()),
         "global_eu" | "globaleu" | "global" => Some("global_eu".to_string()),
         "sef" => Some("sef".to_string()),
+        // SEF përmes PROGRAMERI POS (urë named pipe). E veçantë nga "sef" (Printer Windows).
+        "sef_programeri" | "sef_programeri_pos" | "programeri_sef" => {
+            Some(crate::sef_bridge::PROVIDER_VALUE.to_string())
+        }
         _ => None,
     }
 }
@@ -356,9 +361,9 @@ fn require_enternet_for_fiscal(provider: &str) -> Result<(), String> {
         return Ok(());
     }
     if provider == "global_eu" {
-        return Err("Printeri fiskal i zgjedhur Ã«shtÃ« Global EU. Ky model do tÃ« implementohet mÃ« vonÃ«; zgjidh ENTERNET te CilÃ«simet pÃ«r printim .inp.".to_string());
+        return Err("Printeri fiskal i zgjedhur është Global EU. Ky model do të implementohet më vonë; zgjidh ENTERNET te Cilësimet për printim .inp.".to_string());
     }
-    Err("Printeri fiskal nuk Ã«shtÃ« i konfiguruar saktÃ«. Te CilÃ«simet zgjidh ENTERNET, Global EU ose SEF.".to_string())
+    Err("Printeri fiskal nuk është i konfiguruar saktë. Te Cilësimet zgjidh ENTERNET, Global EU ose SEF.".to_string())
 }
 
 fn build_invoice_pdf_bytes_inner(
@@ -467,6 +472,30 @@ fn build_invoice_pdf_bytes_inner(
     crate::invoice::render_invoice_pdf(&data).map_err(err_string)
 }
 
+#[tauri::command]
+async fn printers_list() -> Result<Vec<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        tokio::task::spawn_blocking(|| {
+            use std::os::windows::process::CommandExt;
+            let output = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command",
+                    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $ErrorActionPreference='Stop'; ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name | Sort-Object -Unique)"])
+                .creation_flags(0x08000000)
+                .output().map_err(|e| format!("Lista e printerëve nuk u lexua: {e}"))?;
+            if !output.status.success() {
+                return Err("Windows nuk e ktheu listën e printerëve. Kontrollo shërbimin Print Spooler.".to_string());
+            }
+            serde_json::from_slice::<Vec<String>>(&output.stdout)
+                .map_err(|e| format!("Lista e printerëve nuk u lexua: {e}"))
+        }).await.map_err(err_string)?
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Zgjedhja native e printerit nuk është integruar ende në këtë platformë.".to_string())
+    }
+}
+
 fn print_pdf_to_windows_printer(pdf_bytes: &[u8], printer_name: &str) -> anyhow::Result<()> {
     let file_name = format!("mjeku-print-{}.pdf", uuid::Uuid::new_v4());
     let pdf_path = std::env::temp_dir().join(&file_name);
@@ -496,7 +525,7 @@ fn print_pdf_to_windows_printer(pdf_bytes: &[u8], printer_name: &str) -> anyhow:
 
     if !status.success() {
         anyhow::bail!(
-            "Printimi dÃ«shtoi (kod {:?}). Kontrolloni emrin e printerit te CilÃ«simet.",
+            "Printimi dështoi (kod {:?}). Kontrolloni emrin e printerit te Cilësimet.",
             status.code()
         );
     }
@@ -549,6 +578,7 @@ async fn get_app_info(
         desktop_update_force_deadline_at,
         desktop_update_last_manual_check_at,
         is_demo_mode: state.is_demo_mode,
+        capabilities: crate::sef_bridge::capabilities(),
     })
 }
 
@@ -701,7 +731,7 @@ async fn provision_apply_token(
     }
     if format!("{}:{}", host, port).to_socket_addrs().is_err() {
         return Err(format!(
-            "token check network error: DNS dÃ«shtoi pÃ«r host '{}'. Kontrollo internetin/DNS dhe Supabase URL.",
+            "token check network error: DNS dështoi për host '{}'. Kontrollo internetin/DNS dhe Supabase URL.",
             host
         ));
     }
@@ -758,7 +788,7 @@ async fn provision_apply_token(
     let row = rows.remove(0);
 
     if row.disabled.unwrap_or(false) {
-        return Err("tokeni eshte i Ã§aktivizuar".to_string());
+        return Err("tokeni eshte i çaktivizuar".to_string());
     }
     if row.one_time.unwrap_or(true) && row.used_at.as_deref().unwrap_or("").trim().len() > 0 {
         return Err("tokeni eshte perdorur me pare".to_string());
@@ -1266,6 +1296,55 @@ async fn settings_get_all(
 }
 
 #[tauri::command]
+async fn orthopedic_episodes_list(state: tauri::State<'_, AppState>, client_id: Option<String>) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_episodes_list(client_id)).await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn orthopedic_episode_upsert(state: tauri::State<'_, AppState>, episode: serde_json::Value) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_episode_upsert(&episode)).await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn orthopedic_surgery_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_surgery_upsert(&value)?; db.orthopedic_audit("surgery",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+#[tauri::command]
+async fn orthopedic_implant_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_implant_upsert(&value)?; db.orthopedic_audit("implant",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+#[tauri::command]
+async fn orthopedic_rehab_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_rehab_upsert(&value)?; db.orthopedic_audit("rehab",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+
+#[tauri::command]
+async fn orthopedic_markers_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_markers_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+#[tauri::command]
+async fn orthopedic_marker_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_marker_upsert(&value)?; db.orthopedic_audit("marker",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+
+#[tauri::command]
+async fn orthopedic_assessments_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_assessments_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+#[tauri::command]
+async fn orthopedic_assessment_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_assessment_upsert(&value)?; db.orthopedic_audit("assessment",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+
+#[tauri::command]
+async fn orthopedic_fractures_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_fractures_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+#[tauri::command]
+async fn orthopedic_fracture_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_fracture_upsert(&value)?; db.orthopedic_audit("fracture",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+
+#[tauri::command]
+async fn orthopedic_imaging_links_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_imaging_links_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+#[tauri::command]
+async fn orthopedic_imaging_link_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_imaging_link_upsert(&value)?; db.orthopedic_audit("imaging_link",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+
+#[tauri::command]
+async fn orthopedic_postop_visits_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_postop_visits_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+#[tauri::command]
+async fn orthopedic_postop_visit_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_postop_visit_upsert(&value)?; db.orthopedic_audit("postop_visit",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+
+#[tauri::command]
+async fn orthopedic_implants_search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_implants_search(&query)).await.map_err(err_string)?.map_err(err_string) }
+
+#[tauri::command]
 async fn settings_set(
     state: tauri::State<'_, AppState>,
     key: String,
@@ -1337,8 +1416,17 @@ async fn settings_set(
 
     if k == FISCAL_PRINTER_PROVIDER_KEY {
         v = normalize_fiscal_printer_provider(&v).ok_or_else(|| {
-            "vlera e printerit fiskal duhet tÃ« jetÃ« ENTERNET, Global EU ose SEF".to_string()
+            "vlera e printerit fiskal duhet të jetë ENTERNET, Global EU ose SEF".to_string()
         })?;
+        // SEF (PROGRAMERI POS): ruhet vetëm nga `sef_bridge_select_engine` (pas
+        // konfigurimit "gati"), dhe nuk lejohet kthimi prapa (e njëjta arkë s'bën PEF dhe SEF).
+        let current = get_fiscal_printer_provider(&state).await?;
+        if current == crate::sef_bridge::PROVIDER_VALUE && v != crate::sef_bridge::PROVIDER_VALUE {
+            return Err(crate::sef_bridge::MSG_SWITCH_BACK_REFUSED.to_string());
+        }
+        if v == crate::sef_bridge::PROVIDER_VALUE && current != crate::sef_bridge::PROVIDER_VALUE {
+            return Err(crate::sef_bridge::MSG_SELECT_VIA_CONFIGURE.to_string());
+        }
     }
 
     let db = state.db.clone();
@@ -1571,7 +1659,7 @@ async fn clients_upsert(
         if is_demo_mode && client.id.is_none() {
             let existing = db.clients_list(None)?;
             if existing.iter().any(|c| c.deleted == 0) {
-                bail!("Modaliteti Demo lejon vetÃ«m 1 pacient. Fshi pacientin ekzistues pÃ«r tÃ« shtuar njÃ« tjetÃ«r.");
+                bail!("Modaliteti Demo lejon vetëm 1 pacient. Fshi pacientin ekzistues për të shtuar një tjetër.");
             }
         }
         db.clients_upsert(client)
@@ -1985,79 +2073,6 @@ async fn dental_finding_create(state:tauri::State<'_,AppState>,finding:serde_jso
         .await.map_err(err_string)?.map_err(err_string)
 }
 
-async fn clinical_allergies_list(state:tauri::State<'_,AppState>,patient_id:String)->Result<Vec<serde_json::Value>,String>{
-    let (doctor_id,is_admin)=clinical_actor(&state).await?;
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||{
-        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)?{bail!("Patient access denied");}
-        db.clinical_allergies_list(&patient_id)
-    }).await.map_err(err_string)?.map_err(err_string)
-}
-#[tauri::command]
-async fn clinical_allergy_create(state:tauri::State<'_,AppState>,allergy:serde_json::Value)->Result<serde_json::Value,String>{
-    let (doctor_id,is_admin)=clinical_actor(&state).await?;
-    let patient_id=allergy.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||{
-        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)?{bail!("Patient access denied");}
-        db.clinical_allergy_create(allergy)
-    }).await.map_err(err_string)?.map_err(err_string)
-}
-
-// Clinical commands are restricted to authenticated clinicians.
-// Non-admin doctors may access only patients with an assigned visit.
-async fn clinical_actor(state: &tauri::State<'_, AppState>) -> Result<(String,bool),String> {
-    match require_login(state).await? {
-        SessionKind::Doctor { doctor_id, is_admin } => Ok((doctor_id,is_admin)),
-        _ => Err("Clinical access requires a doctor session".into())
-    }
-}
-#[tauri::command]
-async fn clinical_notes_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>,String> {
-    let (doctor_id,is_admin)=clinical_actor(&state).await?;
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || {
-        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
-        db.clinical_notes_list(&patient_id)
-    }).await.map_err(err_string)?.map_err(err_string)
-}
-#[tauri::command]
-async fn clinical_note_create(state: tauri::State<'_, AppState>, note: serde_json::Value) -> Result<serde_json::Value,String> {
-    let (doctor_id,is_admin)=clinical_actor(&state).await?;
-    let patient_id=note.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
-    let visit_id=note.get("encounterId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
-    if note.get("authorId").and_then(|v|v.as_str())!=Some(doctor_id.as_str()) { return Err("Author identity mismatch".into()); }
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || {
-        if !is_admin && !db.clinician_owns_visit(&doctor_id,&patient_id,&visit_id)? { bail!("Encounter access denied"); }
-        db.clinical_note_create(note)
-    }).await.map_err(err_string)?.map_err(err_string)
-}
-#[tauri::command]
-async fn clinical_conditions_list(state: tauri::State<'_, AppState>, patient_id: String) -> Result<Vec<serde_json::Value>,String> {
-    let (doctor_id,is_admin)=clinical_actor(&state).await?;
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || {
-        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
-        db.clinical_conditions_list(&patient_id)
-    }).await.map_err(err_string)?.map_err(err_string)
-}
-#[tauri::command]
-async fn clinical_condition_create(state: tauri::State<'_, AppState>, condition: serde_json::Value) -> Result<serde_json::Value,String> {
-    let (doctor_id,is_admin)=clinical_actor(&state).await?;
-    if condition.get("clinicianId").and_then(|v|v.as_str())!=Some(doctor_id.as_str()) { return Err("Clinician identity mismatch".into()); }
-    let patient_id=condition.get("patientId").and_then(|v|v.as_str()).unwrap_or("").to_owned();
-    let encounter=condition.get("encounterId").and_then(|v|v.as_str()).map(str::to_owned);
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || {
-        if !is_admin && !db.clinician_can_access_patient(&doctor_id,&patient_id)? { bail!("Patient access denied"); }
-        if let Some(ref visit_id)=encounter {
-            if !is_admin && !db.clinician_owns_visit(&doctor_id,&patient_id,visit_id)? { bail!("Encounter access denied"); }
-        }
-        db.clinical_condition_create(condition)
-    }).await.map_err(err_string)?.map_err(err_string)
-}
-
 #[tauri::command]
 async fn visits_list(
     state: tauri::State<'_, AppState>,
@@ -2417,6 +2432,15 @@ async fn invoice_export_fiscal_inp(
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
 
+    if provider == crate::sef_bridge::PROVIDER_VALUE {
+        // SEF përmes PROGRAMERI POS: asnjë skedar .inp, asnjë printim PDF këtu.
+        let db = state.db.clone();
+        let allow_any = allow_any_if_no_fiscal.unwrap_or(false);
+        return tokio::task::spawn_blocking(move || sef_fiscalize_blocking(&db, &sale_id, allow_any))
+            .await
+            .map_err(err_string)?;
+    }
+
     if provider == "sef" {
         let sale_id = sale_id.trim().to_string();
         if sale_id.is_empty() {
@@ -2435,11 +2459,11 @@ async fn invoice_export_fiscal_inp(
                 .unwrap_or_default();
             let printer_name = printer_name.trim().to_string();
             if printer_name.is_empty() {
-                return Err("Emri i printerit SEF nuk Ã«shtÃ« konfiguruar. Shko te CilÃ«simet > Printer SEF dhe vendos emrin.".to_string());
+                return Err("Emri i printerit SEF nuk është konfiguruar. Shko te Cilësimet > Printer SEF dhe vendos emrin.".to_string());
             }
             let pdf_bytes = build_invoice_pdf_bytes_inner(&db, &data_dir, &sale_id, false)?;
             print_pdf_to_windows_printer(&pdf_bytes, &printer_name).map_err(err_string)?;
-            Ok("Fatura u dÃ«rgua nÃ« printer.".to_string())
+            Ok("Fatura u dërgua në printer.".to_string())
         })
         .await
         .map_err(err_string)?;
@@ -2475,6 +2499,9 @@ async fn invoice_export_fiscal_inp(
 async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
+    if provider == crate::sef_bridge::PROVIDER_VALUE {
+        return sef_report_summary("report.x", None).await;
+    }
     require_enternet_for_fiscal(&provider)?;
     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         let mut files: Vec<String> = Vec::new();
@@ -2534,6 +2561,9 @@ async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String
 async fn fiscal_report_z_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
+    if provider == crate::sef_bridge::PROVIDER_VALUE {
+        return sef_report_summary("report.z", None).await;
+    }
     require_enternet_for_fiscal(&provider)?;
     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         let mut files: Vec<String> = Vec::new();
@@ -2626,7 +2656,7 @@ async fn history_reset_all(state: tauri::State<'_, AppState>) -> Result<(), Stri
 
 // Ne mobile, document_dir() shkon te nje dosje private e app-it (Android/data/<pkg>/files/Documents)
 // qe Android 11+ e fsheh nga app-i standard "Files" (scoped storage). Prandaj ketu hapim save-dialog-un
-// nativ (SAF) qe useri te zgjedhe vete vendin â€” skedari garantohet i dukshem pas kesaj.
+// nativ (SAF) qe useri te zgjedhe vete vendin — skedari garantohet i dukshem pas kesaj.
 #[cfg(mobile)]
 fn save_pdf_via_dialog(app: &tauri::AppHandle, default_name: &str, pdf_bytes: &[u8]) -> Result<String, String> {
     use std::io::Write;
@@ -2884,13 +2914,17 @@ fn fiscal_job_process_inner(db: &Db, job: &crate::models::FiscalJob) -> Result<(
         .unwrap_or_default();
     let provider = normalize_fiscal_printer_provider(&provider_raw)
         .unwrap_or_else(|| provider_raw.trim().to_ascii_lowercase());
+    if provider == crate::sef_bridge::PROVIDER_VALUE {
+        // Radha fiskale (p.sh. nga telefoni) fiskalizohet te ky PC përmes PROGRAMERI POS.
+        return sef_fiscalize_blocking(db, &job.sale_id, true).map(|_| ());
+    }
     if provider != "enternet" && provider != "global_eu" {
-        return Err("Provideri fiskal i kÃ«tij kompjuteri nuk Ã«shtÃ« Enternet/Global EU".to_string());
+        return Err("Provideri fiskal i këtij kompjuteri nuk është Enternet/Global EU".to_string());
     }
     #[cfg(target_os = "windows")]
     let out_dir = std::path::PathBuf::from(r"C:\Temp");
     #[cfg(not(target_os = "windows"))]
-    return Err("Fiskalizimi i radhÃ«s bÃ«het vetÃ«m nga kompjuteri i klinikÃ«s".to_string());
+    return Err("Fiskalizimi i radhës bëhet vetëm nga kompjuteri i klinikës".to_string());
     #[cfg(target_os = "windows")]
     {
         db.fiscal_receipt_generate_inp(&job.sale_id, &out_dir, true)
@@ -2909,7 +2943,7 @@ fn fiscal_job_mark(db: &Db, job: &crate::models::FiscalJob, status: &str, error:
     db.fiscal_job_upsert(&row)
 }
 
-const FISCAL_JOB_AUTO_MAX_AGE_SECS: i64 = 2 * 3600; // 2 orÃ« â€” mÃ« tÃ« vjetrat kÃ«rkojnÃ« aprovim manual
+const FISCAL_JOB_AUTO_MAX_AGE_SECS: i64 = 2 * 3600; // 2 orë — më të vjetrat kërkojnë aprovim manual
 
 fn fiscal_job_age_secs(created_at: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(created_at)
@@ -2993,7 +3027,7 @@ async fn fiscal_job_process(state: tauri::State<'_, AppState>, id: String) -> Re
             .map_err(err_string)?
             .ok_or_else(|| "Job-i nuk u gjet".to_string())?;
         if job.status != "pending" && job.status != "failed" {
-            return Err(format!("Job-i Ã«shtÃ« '{}'", job.status));
+            return Err(format!("Job-i është '{}'", job.status));
         }
         match fiscal_job_process_inner(&db, &job) {
             Ok(()) => fiscal_job_mark(&db, &job, "done", None).map_err(err_string),
@@ -3005,6 +3039,422 @@ async fn fiscal_job_process(state: tauri::State<'_, AppState>, id: String) -> Re
     })
     .await
     .map_err(err_string)?
+}
+
+// ---------------------------------------------------------------------------
+// SEF (PROGRAMERI POS) — urë me shërbimin fiskal të PROGRAMERI POS.
+// Përdoret vetëm kur fiscal_printer_provider = "sef_programeri".
+// ---------------------------------------------------------------------------
+
+/// Një fiskalizim SEF në një kohë nga ky proces (klikime të dyfishta, radha fiskale).
+fn sef_fiscal_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Thirrje e urës nga kod sinkron (brenda spawn_blocking ose fijes së radhës fiskale).
+fn sef_call_blocking(
+    op: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, crate::sef_bridge::BridgeError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| {
+            crate::sef_bridge::BridgeError::new(
+                "INTERNAL",
+                "Mjeku nuk arriti të nisë lidhjen me PROGRAMERI POS.",
+            )
+        })?;
+    rt.block_on(crate::sef_bridge::call(op, params, timeout))
+}
+
+fn cents_to_text(c: i64) -> String {
+    let sign = if c < 0 { "-" } else { "" };
+    let a = c.unsigned_abs();
+    format!("{sign}{}.{:02}", a / 100, a % 100)
+}
+
+/// Fiskalizon shitjen përmes PROGRAMERI POS. Në sukses shënon shitjen dhe rreshtat
+/// si të fiskalizuar dhe ruan kuponin; në gabim nuk shënon asgjë.
+fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<String, String> {
+    let sale_id = sale_id.trim().to_string();
+    if sale_id.is_empty() {
+        return Err("sale_id eshte i detyrueshem".to_string());
+    }
+    // Pa variablat e nisjes nga PROGRAMERI POS nuk fiskalizohet.
+    crate::sef_bridge::Session::from_env().map_err(err_string)?;
+    let _guard = sef_fiscal_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let data = db
+        .sef_collect_sale(&sale_id, allow_any)
+        .map_err(err_string)?;
+    let rates = crate::sef_bridge::VatRates::from_settings(|k| db.setting_get(k).ok().flatten());
+    let lines: Vec<crate::sef_bridge::SaleLine> = data
+        .items
+        .iter()
+        .map(|it| crate::sef_bridge::SaleLine {
+            id: it.id.clone(),
+            title: it.title.clone(),
+            qty: it.qty,
+            unit_price: it.unit_price,
+            vat_code: it.vat_code.clone(),
+        })
+        .collect();
+    let pays: Vec<crate::sef_bridge::SalePayment> = data
+        .payments
+        .iter()
+        .map(|(m, a)| crate::sef_bridge::SalePayment {
+            method: m.clone(),
+            amount: *a,
+        })
+        .collect();
+    let req = crate::sef_bridge::build_fiscalize_request(&lines, &pays, &rates)
+        .map_err(err_string)?;
+    let issued_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let params = crate::sef_bridge::fiscalize_params(&data.sale.id, &issued_at, &req);
+    let res = sef_call_blocking("fiscalize", params, crate::sef_bridge::DEFAULT_TIMEOUT)
+        .map_err(err_string)?;
+    let coupon = crate::sef_bridge::parse_coupon_result(res).map_err(err_string)?;
+    let info = crate::db::SefCouponInfo {
+        coupon_id: coupon.coupon_id.clone(),
+        daily_number: coupon.daily_number,
+        status: coupon.status.clone(),
+        verification_url: coupon.verification_url.clone(),
+    };
+    let label = coupon
+        .daily_number
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| coupon.coupon_id.clone());
+    let total = req.total_cents as f64 / 100.0;
+    db.sef_mark_fiscalized(&data, total, &info).map_err(|e| {
+        format!(
+            "Kuponi SEF nr. {label} u lëshua, por shënimi te Mjeku dështoi ({e}). Provoje përsëri: e njëjta faturë nuk krijon kupon të dytë."
+        )
+    })?;
+    let mut msg = format!(
+        "Kuponi SEF nr. {label} u lëshua ({} €).",
+        cents_to_text(req.total_cents)
+    );
+    if coupon.status.eq_ignore_ascii_case("PENDING_OFFLINE") {
+        msg.push_str(" SEF është offline: kuponi u ruajt dhe dërgohet automatikisht në ATK.");
+    }
+    if coupon.duplicate == Some(true) {
+        msg.push_str(" (Kuponi ekzistonte tashmë për këtë faturë.)");
+    }
+    Ok(msg)
+}
+
+async fn require_sef_provider(state: &tauri::State<'_, AppState>) -> Result<(), String> {
+    let provider = get_fiscal_printer_provider(state).await?;
+    if provider != crate::sef_bridge::PROVIDER_VALUE {
+        return Err("Motori fiskal nuk është SEF (PROGRAMERI POS).".to_string());
+    }
+    Ok(())
+}
+
+fn sef_today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+async fn sef_report_summary(op: &str, date: Option<String>) -> Result<String, String> {
+    let date = date
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(sef_today);
+    let r = crate::sef_bridge::call(
+        op,
+        serde_json::json!({ "date": date }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)?;
+    let t = &r["totals"];
+    let sales = t["salesCents"].as_i64().unwrap_or(0);
+    let returns = t["returnsCents"].as_i64().unwrap_or(0);
+    let count = t["count"].as_i64().unwrap_or(0);
+    let name = if op == "report.z" { "Z" } else { "X" };
+    Ok(format!(
+        "{name} Raport SEF ({date}): shitje {} €, kthime {} €, kuponë {count}.",
+        cents_to_text(sales),
+        cents_to_text(returns)
+    ))
+}
+
+#[derive(serde::Serialize)]
+struct SefBridgeInfo {
+    /// Windows/Android: zgjedhja "SEF (PROGRAMERI POS)" shfaqet.
+    supported: bool,
+    /// Mjeku u nis nga PROGRAMERI POS (variablat e seancës ekzistojnë).
+    launched: bool,
+    context: Option<String>,
+    provider_value: &'static str,
+    provider: String,
+}
+
+#[tauri::command]
+async fn sef_bridge_info(state: tauri::State<'_, AppState>) -> Result<SefBridgeInfo, String> {
+    let _ = require_login(&state).await?;
+    let provider = get_fiscal_printer_provider(&state).await?;
+    Ok(SefBridgeInfo {
+        supported: crate::sef_bridge::platform_supported(),
+        launched: crate::sef_bridge::launched_from_programeri(),
+        context: crate::sef_bridge::context_id(),
+        provider_value: crate::sef_bridge::PROVIDER_VALUE,
+        provider,
+    })
+}
+
+#[tauri::command]
+async fn sef_bridge_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let _ = require_login(&state).await?;
+    crate::sef_bridge::call(
+        "status",
+        serde_json::json!({}),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
+/// Zgjedh SEF (PROGRAMERI POS) si motor fiskal: hap konfigurimin SEF të PROGRAMERI POS
+/// dhe e ruan motorin vetëm kur kthehet `ready:true`. Kur SEF është tashmë motori,
+/// vetëm rihap konfigurimin dhe kthen gjendjen `ready`.
+#[tauri::command]
+async fn sef_bridge_select_engine(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let session = require_login(&state).await?;
+    if matches!(
+        session,
+        SessionKind::User {
+            role: crate::auth::UserRole::Cashier
+        } | SessionKind::Doctor {
+            is_admin: false,
+            ..
+        }
+    ) {
+        return Err("nuk ke akses per kete seksion".to_string());
+    }
+    if !crate::sef_bridge::platform_supported() {
+        return Err(crate::sef_bridge::MSG_UNSUPPORTED_PLATFORM.to_string());
+    }
+    let current = get_fiscal_printer_provider(&state).await?;
+    // PROGRAMERI POS dhe moduli Mjeku duhet të jenë aktivë (përgjigjet `status`).
+    crate::sef_bridge::call(
+        "status",
+        serde_json::json!({}),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)?;
+    let r = crate::sef_bridge::call(
+        "configure",
+        serde_json::json!({}),
+        crate::sef_bridge::CONFIGURE_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)?;
+    let ready = r.get("ready").and_then(|x| x.as_bool()) == Some(true);
+    if current == crate::sef_bridge::PROVIDER_VALUE {
+        return Ok(ready);
+    }
+    if !ready {
+        return Err(crate::sef_bridge::MSG_CONFIGURE_NOT_READY.to_string());
+    }
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.setting_set(FISCAL_PRINTER_PROVIDER_KEY, crate::sef_bridge::PROVIDER_VALUE)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn sef_coupons_list(
+    state: tauri::State<'_, AppState>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let _ = require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let mut params = serde_json::Map::new();
+    if let Some(f) = from.map(|x| x.trim().to_string()).filter(|x| !x.is_empty()) {
+        params.insert("from".to_string(), serde_json::Value::String(f));
+    }
+    if let Some(t) = to.map(|x| x.trim().to_string()).filter(|x| !x.is_empty()) {
+        params.insert("to".to_string(), serde_json::Value::String(t));
+    }
+    crate::sef_bridge::call(
+        "coupons.list",
+        serde_json::Value::Object(params),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_coupon_copy(
+    state: tauri::State<'_, AppState>,
+    coupon_id: String,
+) -> Result<serde_json::Value, String> {
+    let _ = require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let coupon_id = coupon_id.trim().to_string();
+    if coupon_id.is_empty() {
+        return Err("Zgjidh kuponin.".to_string());
+    }
+    crate::sef_bridge::call(
+        "coupon.copy",
+        serde_json::json!({ "couponId": coupon_id }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SefReturnItemInput {
+    id: String,
+    qty: f64,
+}
+
+#[tauri::command]
+async fn sef_coupon_return(
+    state: tauri::State<'_, AppState>,
+    coupon_id: String,
+    items: Vec<SefReturnItemInput>,
+    reason: String,
+) -> Result<serde_json::Value, String> {
+    let _ = require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let coupon_id = coupon_id.trim().to_string();
+    let reason = reason.trim().to_string();
+    if coupon_id.is_empty() {
+        return Err("Zgjidh kuponin.".to_string());
+    }
+    if reason.is_empty() {
+        return Err("Shkruaj arsyen e kthimit.".to_string());
+    }
+    let mut out = Vec::new();
+    for it in items {
+        if !it.qty.is_finite() || it.qty <= 0.0 || it.id.trim().is_empty() {
+            continue;
+        }
+        let milli = crate::sef_bridge::qty_to_milli(it.qty);
+        if milli <= 0 {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "id": it.id.trim(),
+            "qty": crate::sef_bridge::qty_string(milli),
+        }));
+    }
+    if out.is_empty() {
+        return Err("Zgjidh të paktën një artikull dhe sasinë për kthim.".to_string());
+    }
+    crate::sef_bridge::call(
+        "coupon.return",
+        serde_json::json!({ "couponId": coupon_id, "items": out, "reason": reason }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_coupon_cancel(
+    state: tauri::State<'_, AppState>,
+    coupon_id: String,
+    reason: String,
+) -> Result<serde_json::Value, String> {
+    let _ = require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let coupon_id = coupon_id.trim().to_string();
+    let reason = reason.trim().to_string();
+    if coupon_id.is_empty() {
+        return Err("Zgjidh kuponin.".to_string());
+    }
+    if reason.is_empty() {
+        return Err("Shkruaj arsyen e anulimit.".to_string());
+    }
+    crate::sef_bridge::call(
+        "coupon.cancel",
+        serde_json::json!({ "couponId": coupon_id, "reason": reason }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
+/// Raporti X/Z i plotë (tekst + totale) për faqen "Kuponët".
+#[tauri::command]
+async fn sef_report(
+    state: tauri::State<'_, AppState>,
+    kind: String,
+    date: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let _ = require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let op = match kind.trim().to_ascii_lowercase().as_str() {
+        "x" => "report.x",
+        "z" => "report.z",
+        _ => return Err("Raporti duhet të jetë X ose Z.".to_string()),
+    };
+    let date = date
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(sef_today);
+    crate::sef_bridge::call(
+        op,
+        serde_json::json!({ "date": date }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
+/// Rreshtat e fiskalizuar të një shitjeje (për zgjedhjen e artikujve te "Kthe").
+#[tauri::command]
+async fn sef_sale_items(
+    state: tauri::State<'_, AppState>,
+    sale_id: String,
+) -> Result<Vec<VisitItem>, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.visit_items_list(Some(VisitItemsListFilters {
+            visit_id: Some(sale_id.trim().to_string()),
+            client_id: None,
+            include_deleted: Some(false),
+        }))
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|x| x.deleted == 0 && x.fiscalized == 1)
+                .collect::<Vec<_>>()
+        })
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
+
+/// Kuponi SEF i ruajtur lokalisht te shitja (nëse ka).
+#[tauri::command]
+async fn sef_sale_coupon(
+    state: tauri::State<'_, AppState>,
+    sale_id: String,
+) -> Result<Option<crate::db::SefCouponInfo>, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_sale_coupon(&sale_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
@@ -3484,7 +3934,7 @@ async fn sale_items_replace(state: tauri::State<'_, AppState>, sale_id: String, 
         .await.map_err(err_string)?.map_err(err_string)
 }
 
-// â”€â”€â”€ Offer commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Offer commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn offers_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate::models::Offer>, String> {
@@ -3951,9 +4401,9 @@ pub fn run() {
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_API_KEY, DEFAULT_SUPABASE_API_KEY)?;
             ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_ANON_KEY, DEFAULT_SUPABASE_API_KEY)?;
             ensure_setting_if_empty(db.as_ref(), "update_base_url", DEFAULT_UPDATE_BASE_URL)?;
-            // Migrim: klientÃ«t ekzistues e kishin "update_base_url" tÃ« vendosur eksplicit
-            // (jo bosh) te Vercel-i i vjetÃ«r - ensure_setting_if_empty s'e prek atÃ«. E
-            // kalojmÃ« te Render nÃ«se ende ka vlerÃ«n default tÃ« vjetÃ«r (jo njÃ« URL tÃ«
+            // Migrim: klientët ekzistues e kishin "update_base_url" të vendosur eksplicit
+            // (jo bosh) te Vercel-i i vjetër - ensure_setting_if_empty s'e prek atë. E
+            // kalojmë te Render nëse ende ka vlerën default të vjetër (jo një URL të
             // personalizuar nga useri).
             if let Ok(Some(cur)) = db.setting_get("update_base_url") {
                 if cur.trim().trim_end_matches('/') == OLD_DEFAULT_UPDATE_BASE_URL {
@@ -3966,7 +4416,7 @@ pub fn run() {
             let error_log_path = data_dir.join("logs").join("errors.log");
             db.setting_set("error_log_path", &error_log_path.display().to_string())?;
             let has_visit_service = db.services_list(None)?.into_iter().any(|s| {
-                let t = s.title.trim().to_ascii_lowercase().replace('Ã«', "e");
+                let t = s.title.trim().to_ascii_lowercase().replace('ë', "e");
                 t == "vizite" || t == "vizita"
             });
             if !has_visit_service {
@@ -3977,10 +4427,10 @@ pub fn run() {
                     == "1";
                 db.services_upsert(ServiceUpsertInput {
                     id: None,
-                    title: "VizitÃ«".to_string(),
+                    title: "Vizitë".to_string(),
                     default_price: 0.0,
                     vat_code: Some(if vat_registered { "A" } else { "C" }.to_string()),
-                    notes: Some("ShÃ«rbim bazÃ« i vizitÃ«s".to_string()),
+                    notes: Some("Shërbim bazë i vizitës".to_string()),
                 })?;
             }
 
@@ -4004,8 +4454,8 @@ pub fn run() {
                 sync.clone().spawn_background();
             }
 
-            // Procesori i radhÃ«s fiskale: Ã§do 15s proceson job-et 'pending' mÃ« tÃ« reja se 2 orÃ«.
-            // MÃ« tÃ« vjetrat presin aprovim manual te Sporteli (mbrojtje nga printimet aksidentale).
+            // Procesori i radhës fiskale: çdo 15s proceson job-et 'pending' më të reja se 2 orë.
+            // Më të vjetrat presin aprovim manual te Sporteli (mbrojtje nga printimet aksidentale).
             #[cfg(all(desktop, target_os = "windows"))]
             {
                 let db_fj = db.clone();
@@ -4021,7 +4471,7 @@ pub fn run() {
                             };
                             for job in jobs {
                                 if fiscal_job_age_secs(&job.created_at) > FISCAL_JOB_AUTO_MAX_AGE_SECS {
-                                    continue; // kÃ«rkon aprovim manual
+                                    continue; // kërkon aprovim manual
                                 }
                                 match fiscal_job_process_inner(&db2, &job) {
                                     Ok(()) => { let _ = fiscal_job_mark(&db2, &job, "done", None); }
@@ -4106,6 +4556,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_info,
+            printers_list,
             auth_get_state,
             auth_setup,
             provision_apply_token,
@@ -4120,6 +4571,22 @@ pub fn run() {
             doctors_login_options,
             doctor_account_update,
             settings_get_all,
+            orthopedic_episodes_list,
+            orthopedic_episode_upsert,
+            orthopedic_surgery_upsert,
+            orthopedic_implant_upsert,
+            orthopedic_rehab_upsert,
+            orthopedic_markers_list,
+            orthopedic_marker_upsert,
+            orthopedic_assessments_list,
+            orthopedic_assessment_upsert,
+            orthopedic_fractures_list,
+            orthopedic_fracture_upsert,
+            orthopedic_imaging_links_list,
+            orthopedic_imaging_link_upsert,
+            orthopedic_postop_visits_list,
+            orthopedic_postop_visit_upsert,
+            orthopedic_implants_search,
             settings_set,
             clinic_asset_set_png,
             clinic_asset_clear_png,
@@ -4151,13 +4618,6 @@ pub fn run() {
             dental_finding_corrections_list,
             dental_findings_list,
             dental_finding_create,
-
-            clinical_allergies_list,
-            clinical_allergy_create,
-            clinical_notes_list,
-            clinical_note_create,
-            clinical_conditions_list,
-            clinical_condition_create,
             visits_list,
             visits_upsert,
             visits_delete,
@@ -4199,6 +4659,16 @@ pub fn run() {
             fiscal_job_create,
             fiscal_job_cancel,
             fiscal_job_process,
+            sef_bridge_info,
+            sef_bridge_status,
+            sef_bridge_select_engine,
+            sef_coupons_list,
+            sef_coupon_copy,
+            sef_coupon_return,
+            sef_coupon_cancel,
+            sef_report,
+            sef_sale_items,
+            sef_sale_coupon,
             prescriptions_delete,
             error_logs_list,
             error_logs_clear,

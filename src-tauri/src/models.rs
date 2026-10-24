@@ -22,6 +22,10 @@ pub struct AppInfo {
     pub desktop_update_last_manual_check_at: Option<String>,
     #[serde(default)]
     pub is_demo_mode: bool,
+    /// Aftësi shtesë të këtij binari (p.sh. "sef_programeri_bridge_v1"). UI-ja e re
+    /// i shfaq veçoritë e reja vetëm kur aftësia ekziston; UI-ja e vjetër e injoron fushën.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
