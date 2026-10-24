@@ -3186,6 +3186,8 @@ async fn sef_report_summary(op: &str, date: Option<String>) -> Result<String, St
 
 #[derive(serde::Serialize)]
 struct SefBridgeInfo {
+    /// Diagnostic origin of this Mjeku process, never used for authorization.
+    launch_mode: &'static str,
     /// Windows/Android: zgjedhja "SEF (PROGRAMERI POS)" shfaqet.
     supported: bool,
     /// Mjeku u nis nga PROGRAMERI POS (variablat e seancës ekzistojnë).
@@ -3199,7 +3201,15 @@ struct SefBridgeInfo {
 async fn sef_bridge_info(state: tauri::State<'_, AppState>) -> Result<SefBridgeInfo, String> {
     let _ = require_login(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
+    let launch_mode = match std::env::var("PROGRAMERI_MJEKU_LAUNCH_MODE").as_deref() {
+        Ok("sef-bridge") => "sef-bridge",
+        Ok("local-token-no-sef") => "local-token-no-sef",
+        Ok("pef-launch-only") => "pef-launch-only",
+        Ok("legacy-no-bridge") => "legacy-no-bridge",
+        _ => "standalone-or-unknown",
+    };
     Ok(SefBridgeInfo {
+        launch_mode,
         supported: crate::sef_bridge::platform_supported(),
         launched: crate::sef_bridge::launched_from_programeri(),
         context: crate::sef_bridge::context_id(),
