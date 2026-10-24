@@ -59,6 +59,7 @@ fn ui_bundle_looks_compatible(dir: &Path) -> bool {
     let mut has_doctors_login_options = false;
     let mut has_doctor_account_update = false;
     let mut has_sales_daily_report = false;
+    let mut has_programeri_sef_bridge = false;
 
     for ent in rd.flatten() {
         let p = ent.path();
@@ -102,11 +103,17 @@ fn ui_bundle_looks_compatible(dir: &Path) -> bool {
                 has_sales_daily_report = true;
             }
 
+            if !has_programeri_sef_bridge
+                && bytes.windows(b"sef_bridge_select_engine".len()).any(|w| w == b"sef_bridge_select_engine")
+            {
+                has_programeri_sef_bridge = true;
+            }
             if has_clinic_name
                 && has_doctor_login
                 && has_doctors_login_options
                 && has_doctor_account_update
                 && has_sales_daily_report
+                && has_programeri_sef_bridge
             {
                 return true;
             }
@@ -198,6 +205,9 @@ impl UpdatesEngine {
         }
 
         if version_installed(app, &latest)? {
+            if !ui_bundle_looks_compatible(&versions_dir(app)?.join(&latest)) {
+                bail!("UI update ekzistues nuk e mbeshtet SEF (PROGRAMERI POS); ruhet UI e integruar ne binar");
+            }
             // Already downloaded; mark pending if not current.
             let current = current_ui_version(app).unwrap_or_else(|_| "unknown".to_string());
             if current != latest {
@@ -245,6 +255,11 @@ impl UpdatesEngine {
         if !idx.exists() {
             bail!("bundle missing index.html after extraction");
         }
+        if !ui_bundle_looks_compatible(&extracting_dir) {
+            let _ = fs::remove_dir_all(&extracting_dir);
+            let _ = fs::remove_file(&tmp_zip);
+            bail!("UI update nuk permban komandat e urës SEF; ruhet UI e integruar ne aplikacion");
+        }
 
         let final_dir = versions.join(&latest);
         if final_dir.exists() {
@@ -266,10 +281,11 @@ impl UpdatesEngine {
         ensure_ui_dirs(app)?;
         let pending = pending_ui_version(app)?;
         if let Some(v) = pending {
-            if version_installed(app, &v)? {
+            if version_installed(app, &v)? && ui_bundle_looks_compatible(&versions_dir(app)?.join(&v)) {
                 set_pointer_atomic(&current_ptr_path(app)?, &v)?;
-                clear_pending(app)?;
             }
+            // Old or incompatible pending UI must never replace the SEF-capable seed.
+            clear_pending(app)?;
         }
         Ok(())
     }
@@ -333,11 +349,12 @@ impl UpdatesEngine {
     pub fn apply_downloaded_now(app: &tauri::AppHandle) -> anyhow::Result<bool> {
         let pending = pending_ui_version(app)?;
         if let Some(v) = pending {
-            if version_installed(app, &v)? {
+            if version_installed(app, &v)? && ui_bundle_looks_compatible(&versions_dir(app)?.join(&v)) {
                 set_pointer_atomic(&current_ptr_path(app)?, &v)?;
                 clear_pending(app)?;
                 return Ok(true);
             }
+            clear_pending(app)?;
         }
         Ok(false)
     }
