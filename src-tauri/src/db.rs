@@ -543,6 +543,185 @@ impl Db {
         Ok(())
     }
 
+    /// Shared Physiotherapy episode. A clinician can refer an active orthopedic
+    /// rehabilitation plan only to its own patient. Repeating the same referral
+    /// returns the existing immutable row (one source of truth per plan).
+    pub fn physiotherapy_referral_create(
+        &self, orthopedic_episode_id: &str, rehab_plan_id: &str, clinician: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        if clinician.trim().is_empty() { bail!("Mjeku i identifikuar kërkohet për referim."); }
+        if orthopedic_episode_id.trim().is_empty() || rehab_plan_id.trim().is_empty() {
+            bail!("Zgjidh episodin ortopedik dhe protokollin e rehabilitimit.");
+        }
+        let conn = self.conn.lock().unwrap();
+        let patient: String = conn.query_row(
+            "SELECT e.client_id FROM orthopedic_episodes e
+             JOIN orthopedic_rehab_plans p ON p.episode_id=e.id
+             WHERE e.id=?1 AND p.id=?2 AND e.status='active'",
+            rusqlite::params![orthopedic_episode_id,rehab_plan_id],
+            |r| r.get(0),
+        ).optional()?.ok_or_else(|| anyhow!(
+            "Protokolli nuk i përket një episodi ortopedik aktiv."
+        ))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO physiotherapy_episodes
+             (id,client_id,orthopedic_episode_id,rehab_plan_id,status,created_by,created_at)
+             VALUES(?1,?2,?3,?4,'active',?5,?6)",
+            rusqlite::params![Uuid::new_v4().to_string(),patient,
+                orthopedic_episode_id,rehab_plan_id,clinician,now_iso()],
+        )?;
+        let data: serde_json::Value = conn.query_row(
+            "SELECT id,client_id,orthopedic_episode_id,rehab_plan_id,status,created_by,created_at
+             FROM physiotherapy_episodes WHERE rehab_plan_id=?1",
+            [rehab_plan_id],
+            |r| Ok(serde_json::json!({
+                "id":r.get::<_,String>(0)?,
+                "client_id":r.get::<_,String>(1)?,
+                "orthopedic_episode_id":r.get::<_,String>(2)?,
+                "rehab_plan_id":r.get::<_,String>(3)?,
+                "status":r.get::<_,String>(4)?,
+                "created_by":r.get::<_,String>(5)?,
+                "created_at":r.get::<_,String>(6)?
+            }))
+        )?;
+        Ok(data)
+    }
+
+    /// Both department screens read the same joined data; restrictions always
+    /// come from orthopedic_rehab_plans, never an obsolete physio copy.
+    pub fn physiotherapy_episodes_list(
+        &self, orthopedic_episode_id: Option<String>,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT f.id,f.client_id,c.name,f.orthopedic_episode_id,e.diagnosis,
+                    e.region,e.laterality,e.status,f.rehab_plan_id,p.protocol,
+                    p.phase,COALESCE(p.load_restrictions,''),COALESCE(p.rom_restrictions,''),
+                    f.created_by,f.created_at,f.status,
+                    (SELECT COUNT(*) FROM physiotherapy_sessions s
+                     WHERE s.physiotherapy_episode_id=f.id)
+             FROM physiotherapy_episodes f
+             JOIN clients c ON c.id=f.client_id AND c.deleted=0
+             JOIN orthopedic_episodes e ON e.id=f.orthopedic_episode_id
+             JOIN orthopedic_rehab_plans p ON p.id=f.rehab_plan_id
+             WHERE (?1 IS NULL OR f.orthopedic_episode_id=?1)
+             ORDER BY f.created_at DESC,f.id DESC"
+        )?;
+        let rows=stmt.query_map([orthopedic_episode_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,
+            "client_id":r.get::<_,String>(1)?,
+            "patient_name":r.get::<_,String>(2)?,
+            "orthopedic_episode_id":r.get::<_,String>(3)?,
+            "diagnosis":r.get::<_,String>(4)?,
+            "region":r.get::<_,String>(5)?,
+            "laterality":r.get::<_,String>(6)?,
+            "orthopedic_status":r.get::<_,String>(7)?,
+            "rehab_plan_id":r.get::<_,String>(8)?,
+            "protocol":r.get::<_,String>(9)?,
+            "phase":r.get::<_,String>(10)?,
+            "load_restrictions":r.get::<_,String>(11)?,
+            "rom_restrictions":r.get::<_,String>(12)?,
+            "created_by":r.get::<_,String>(13)?,
+            "created_at":r.get::<_,String>(14)?,
+            "status":r.get::<_,String>(15)?,
+            "session_count":r.get::<_,i64>(16)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_sessions_list(
+        &self, physiotherapy_episode_id: &str,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn.lock().unwrap();
+        let mut stmt=conn.prepare(
+            "SELECT id,physiotherapy_episode_id,session_date,therapist_id,
+                    intervention,response,pain_before,pain_after,
+                    rom_joint,rom_movement,rom_degrees,mmt_grade,next_plan,created_at
+             FROM physiotherapy_sessions
+             WHERE physiotherapy_episode_id=?1 ORDER BY session_date DESC,created_at DESC"
+        )?;
+        let rows=stmt.query_map([physiotherapy_episode_id],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,
+            "physiotherapy_episode_id":r.get::<_,String>(1)?,
+            "session_date":r.get::<_,String>(2)?,
+            "therapist_id":r.get::<_,String>(3)?,
+            "intervention":r.get::<_,String>(4)?,
+            "response":r.get::<_,String>(5)?,
+            "pain_before":r.get::<_,Option<i64>>(6)?,
+            "pain_after":r.get::<_,Option<i64>>(7)?,
+            "rom_joint":r.get::<_,String>(8)?,
+            "rom_movement":r.get::<_,String>(9)?,
+            "rom_degrees":r.get::<_,Option<f64>>(10)?,
+            "mmt_grade":r.get::<_,Option<i64>>(11)?,
+            "next_plan":r.get::<_,String>(12)?,
+            "created_at":r.get::<_,String>(13)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_session_add(
+        &self, value: &serde_json::Value, clinician: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        if clinician.trim().is_empty() { bail!("Kërkohet përdorues klinik i identifikuar."); }
+        let episode=value["physiotherapy_episode_id"].as_str().unwrap_or_default();
+        let date=value["session_date"].as_str().unwrap_or_default();
+        let treatment=value["intervention"].as_str().unwrap_or_default().trim();
+        if episode.trim().is_empty() || treatment.chars().count()<3 || treatment.chars().count()>4000 {
+            bail!("Seanca kërkon episodin dhe përshkrimin e trajtimit (3–4000 karaktere).");
+        }
+        chrono::NaiveDate::parse_from_str(date,"%Y-%m-%d")
+            .map_err(|_| anyhow!("Data e seancës duhet të jetë YYYY-MM-DD."))?;
+        fn score(v: &serde_json::Value, key: &str, max: i64) -> anyhow::Result<Option<i64>> {
+            if v.get(key).is_none() || v[key].is_null() { return Ok(None); }
+            let s=v[key].as_i64().ok_or_else(|| anyhow!("Matje e pavlefshme: {}",key))?;
+            if !(0..=max).contains(&s) { bail!("Matja {} jashtë intervalit 0..{}.",key,max); }
+            Ok(Some(s))
+        }
+        let pain_before=score(value,"pain_before",10)?;
+        let pain_after=score(value,"pain_after",10)?;
+        let mmt=score(value,"mmt_grade",5)?;
+        let rom=value.get("rom_degrees").filter(|v|!v.is_null()).map(|v|v.as_f64()
+            .ok_or_else(||anyhow!("ROM duhet të jetë numerik."))).transpose()?;
+        if let Some(v)=rom {
+            if !v.is_finite() || !(0.0..=360.0).contains(&v) {
+                bail!("ROM duhet të jetë në intervalin 0..360°.");
+            }
+            if value["rom_joint"].as_str().unwrap_or_default().trim().is_empty()
+                || value["rom_movement"].as_str().unwrap_or_default().trim().is_empty() {
+                bail!("Matja ROM kërkon nyjën dhe lëvizjen.");
+            }
+        }
+        let conn=self.conn.lock().unwrap();
+        let active:i64=conn.query_row(
+            "SELECT COUNT(*) FROM physiotherapy_episodes f
+             JOIN orthopedic_episodes e ON e.id=f.orthopedic_episode_id
+             WHERE f.id=?1 AND f.status='active' AND e.status='active'",
+            [episode], |r|r.get(0))?;
+        if active!=1 { bail!("Seanca refuzohet: referimi ose episodi ortopedik nuk është aktiv."); }
+        let id=Uuid::new_v4().to_string();
+        let now=now_iso();
+        let response=value["response"].as_str().unwrap_or_default();
+        let next=value["next_plan"].as_str().unwrap_or_default();
+        if response.len()>4000 || next.len()>4000 { bail!("Përmbajtja e seancës është shumë e gjatë."); }
+        conn.execute(
+            "INSERT INTO physiotherapy_sessions(
+             id,physiotherapy_episode_id,session_date,therapist_id,intervention,response,
+             pain_before,pain_after,rom_joint,rom_movement,rom_degrees,mmt_grade,next_plan,created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            rusqlite::params![id,episode,date,clinician,treatment,response,pain_before,pain_after,
+                value["rom_joint"].as_str().unwrap_or_default(),
+                value["rom_movement"].as_str().unwrap_or_default(),
+                rom,mmt,next,now]
+        )?;
+        Ok(serde_json::json!({
+            "id":id,"physiotherapy_episode_id":episode,"session_date":date,
+            "therapist_id":clinician,"intervention":treatment,"response":response,
+            "pain_before":pain_before,"pain_after":pain_after,"rom_joint":value["rom_joint"],
+            "rom_movement":value["rom_movement"],"rom_degrees":rom,
+            "mmt_grade":mmt,"next_plan":next,"created_at":now
+        }))
+    }
+
     pub fn orthopedic_episodes_list(&self, client_id: Option<String>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, client_id, diagnosis, region, laterality, status, notes, created_at, updated_at FROM orthopedic_episodes WHERE (?1 IS NULL OR client_id = ?1) ORDER BY updated_at DESC")?;
@@ -1009,6 +1188,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v4.sql"))?;
+        conn.execute_batch(include_str!("../migrations/physiotherapy_v1.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -1032,6 +1212,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v4.sql"))?;
+        conn.execute_batch(include_str!("../migrations/physiotherapy_v1.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
