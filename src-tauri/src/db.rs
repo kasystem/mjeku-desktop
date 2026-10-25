@@ -7366,6 +7366,41 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Fetch a single immutable saved version and its authoritative SQL-linked
+    /// patient identity. The PDF renderer must not trust client-supplied details.
+    pub fn orthopedic_report_pdf_data(&self, report_id: &str) -> anyhow::Result<serde_json::Value> {
+        if report_id.trim().is_empty() { bail!("Zgjidh versionin e raportit."); }
+        let conn = self.conn.lock().unwrap();
+        let report = conn.query_row(
+            "SELECT r.id,r.episode_id,r.type,r.version,r.status,r.body_json,
+                    r.author_id,r.reason,r.created_at,e.diagnosis,e.region,e.laterality,
+                    e.status,c.name,COALESCE(c.patient_code,'')
+             FROM orthopedic_report_versions r
+             JOIN orthopedic_episodes e ON e.id=r.episode_id
+             JOIN clients c ON c.id=e.client_id
+             WHERE r.id=?1",
+            [report_id],
+            |r| Ok(serde_json::json!({
+                "id":r.get::<_,String>(0)?,
+                "episode_id":r.get::<_,String>(1)?,
+                "type":r.get::<_,String>(2)?,
+                "version":r.get::<_,i64>(3)?,
+                "status":r.get::<_,String>(4)?,
+                "body_json":r.get::<_,String>(5)?,
+                "author_id":r.get::<_,String>(6)?,
+                "reason":r.get::<_,String>(7)?,
+                "created_at":r.get::<_,String>(8)?,
+                "diagnosis":r.get::<_,String>(9)?,
+                "region":r.get::<_,String>(10)?,
+                "laterality":r.get::<_,String>(11)?,
+                "episode_status":r.get::<_,String>(12)?,
+                "patient_name":r.get::<_,String>(13)?,
+                "patient_code":r.get::<_,String>(14)?
+            })),
+        ).optional()?;
+        report.ok_or_else(|| anyhow!("Versioni i raportit ortopedik nuk u gjet."))
+    }
+
     pub fn orthopedic_report_version_create(&self,value: &serde_json::Value, clinician: &str) -> anyhow::Result<serde_json::Value> {
         if clinician.trim().is_empty() { bail!("Mjeku i identifikuar kërkohet."); }
         let episode = value["episode_id"].as_str().unwrap_or_default();
