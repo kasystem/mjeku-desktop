@@ -59,3 +59,34 @@ npm run tauri:dev
 - Upgrade an existing SQLite clinic database containing legacy episodes.
 - Windows/macOS packaging and platform E2E.
 - Clinical sign-off, PACS, implant inventory and physiotherapy integration.
+
+## Local Windows test evidence and repair (2026-10-25)
+
+User-provided Windows PowerShell log after pulling the episode lifecycle commits:
+- `mjeku-ui: npm run typecheck` failed with 2 TS2550 errors because the
+  ES2020 target does not declare `String.prototype.replaceAll`.
+- `mjeku-desktop: npm run cargo:test` compiled and ran **50 tests**;
+  **46 passed, 4 failed**. Both newly added orthopedic lifecycle tests passed.
+- The 4 failures were unrelated to clinical lifecycle logic:
+  1. `generate_sample_invoice_pdf`: hardcoded developer desktop path missing.
+  2. `generate_sample_visit_pdf`: same hardcoded developer path.
+  3. `periodontal_exam_round_trip_preserves_nullable_sites`: test indexed
+     results without accounting for SQLite's `ORDER BY tooth_fdi,site`.
+  4. `orthopedics_schema_migration_is_idempotent`: expected 15 tables even
+     though v4 introduced the 16th orthopedic table.
+
+Code fixes have been committed directly to the existing development branches:
+- UI: both display labels use ES2020-compatible `key.replace(/_/g, " ")`.
+- PDF tests: validate in-memory PDF header, EOF marker and nontrivial length;
+  do not write sample patient data to a developer-specific path.
+- Periodontal test: identify MB/B measurements by tooth and site, assert
+  nullable bleeding/plaque/suppuration and depth values for both sites.
+- Orthopedic idempotence test: reruns v4 twice and checks 16 tables plus the
+  lifecycle table and critical triggers.
+
+**Post-fix verification status: NOT RUN**. The 46/50 numbers describe the
+*pre-fix* run only. Rerun `npm run typecheck`, `npm run build`, and
+`npm run cargo:test` locally before asserting 50/50 or releasing.
+The local generated `src-tauri/resources/ui-seed.zip` and
+`ui-seed-version.txt` may be dirty; do not reset these user-local files
+merely to run or pull the tests.
