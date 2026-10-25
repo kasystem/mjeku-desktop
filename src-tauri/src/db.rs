@@ -445,6 +445,32 @@ impl Db {
         let c=self.conn.lock().unwrap(); c.execute("INSERT INTO orthopedic_rehab_plans(id,episode_id,protocol,phase,load_restrictions,rom_restrictions,approving_surgeon,start_date,status,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET protocol=excluded.protocol,phase=excluded.phase,load_restrictions=excluded.load_restrictions,rom_restrictions=excluded.rom_restrictions,approving_surgeon=excluded.approving_surgeon,start_date=excluded.start_date,status=excluded.status,payload_json=excluded.payload_json", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["protocol"].as_str().unwrap_or_default(),v["phase"].as_str().unwrap_or("phase_1"),v["load_restrictions"].as_str().unwrap_or_default(),v["rom_restrictions"].as_str().unwrap_or_default(),v["approving_surgeon"].as_str().unwrap_or_default(),v["start_date"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("active"),v.to_string(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
     }
 
+    // Keep the full structured payload for existing WIP records. The linked
+    // episode is verified by SQL JOIN; records never leak across patients.
+    pub fn orthopedic_surgeries_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT payload_json FROM orthopedic_surgeries WHERE episode_id=?1 ORDER BY created_at DESC")?;
+        let items = stmt.query_map(rusqlite::params![episode_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        items.into_iter().map(|v| Ok(serde_json::from_str(&v)?)).collect()
+    }
+
+    pub fn orthopedic_implants_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT i.payload_json FROM orthopedic_implants i JOIN orthopedic_surgeries s ON s.id=i.surgery_id WHERE s.episode_id=?1 ORDER BY i.created_at DESC")?;
+        let items = stmt.query_map(rusqlite::params![episode_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        items.into_iter().map(|v| Ok(serde_json::from_str(&v)?)).collect()
+    }
+
+    pub fn orthopedic_rehab_plans_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT payload_json FROM orthopedic_rehab_plans WHERE episode_id=?1 ORDER BY created_at DESC")?;
+        let items = stmt.query_map(rusqlite::params![episode_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        items.into_iter().map(|v| Ok(serde_json::from_str(&v)?)).collect()
+    }
+
     pub fn orthopedic_markers_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, episode_id, view, region, side, injury_type, note, x, y, created_at FROM orthopedic_markers WHERE episode_id=?1 ORDER BY created_at DESC")?;
