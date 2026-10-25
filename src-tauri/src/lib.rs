@@ -1665,6 +1665,111 @@ async fn physiotherapy_document_export_pdf(
 }
 
 #[tauri::command]
+async fn physiotherapy_documents_list(
+    state: tauri::State<'_, AppState>, orthopedic_episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_documents_list(&orthopedic_episode_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+/// Store a patient-linked clinical PDF through the native picker; never
+/// send an OS path through the webview, and validate the file on the backend.
+#[tauri::command]
+async fn physiotherapy_document_attach(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    orthopedic_episode_id: String, category: String, source_note: String,
+) -> Result<serde_json::Value, String> {
+    let actor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
+        _=>return Err("Kërkohet identiteti i profesionistit.".to_string()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(mobile)]
+        {let _=(app,db,orthopedic_episode_id,category,source_note,actor);
+         Err("Importi i dokumentit kryhet në aplikacionin desktop.".into())}
+        #[cfg(desktop)]
+        {
+            use tauri_plugin_dialog::DialogExt;
+            use sha2::{Digest,Sha256};
+            let file=app.dialog().file().set_title("Zgjidh raportin e rehabilitimit PDF")
+                .add_filter("PDF",&["pdf"]).blocking_pick_file()
+                .ok_or_else(||"Përzgjedhja e skedarit u anulua.".to_string())?;
+            let selected=file.as_path().ok_or_else(
+                ||"Zgjidh një skedar PDF të disponueshëm.".to_string())?;
+            let metadata=std::fs::metadata(selected).map_err(err_string)?;
+            if metadata.len()<100 || metadata.len()>20*1024*1024 {
+                return Err("Dokumenti duhet të jetë PDF nën 20 MB.".into());
+            }
+            let bytes=std::fs::read(selected).map_err(err_string)?;
+            if !bytes.starts_with(b"%PDF-") || !bytes.windows(5).any(|w|w==b"%%EOF") {
+                return Err("Skedari i zgjedhur nuk është PDF i plotë.".into());
+            }
+            let digest=hex::encode(Sha256::digest(&bytes));
+            let basename=selected.file_name().and_then(|x|x.to_str())
+                .unwrap_or("Raport-Fizioterapie.pdf").to_string();
+            let relative=format!("rehab-pdf/{}.pdf",uuid::Uuid::new_v4());
+            let base=app.path().app_data_dir().map_err(err_string)?;
+            let directory=base.join("rehab-pdf");
+            std::fs::create_dir_all(&directory).map_err(err_string)?;
+            let target=base.join(&relative);
+            std::fs::write(&target,&bytes).map_err(err_string)?;
+            match db.physiotherapy_document_register(
+                &orthopedic_episode_id,&category,&basename,&relative,
+                &digest,bytes.len() as i64,&source_note,&actor
+            ){
+                Ok(data)=>Ok(data),
+                Err(e)=>{
+                    let _=std::fs::remove_file(&target);
+                    Err(err_string(e))
+                }
+            }
+        }
+    }).await.map_err(err_string)?
+}
+
+/// Resolves only locally managed PDF IDs; validates checksum before opening.
+#[tauri::command]
+async fn physiotherapy_document_open(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>, document_id: String,
+) -> Result<String, String> {
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(mobile)]
+        {let _=(app,db,document_id);
+         Err("Hapja e PDF kryhet nga aplikacioni desktop.".into())}
+        #[cfg(desktop)]
+        {
+            use sha2::{Digest,Sha256};
+            let (relative,expected)=db.physiotherapy_document_file(&document_id)
+                .map_err(err_string)?;
+            let name=relative.strip_prefix("rehab-pdf/")
+                .ok_or_else(||"Vendndodhje e pavlefshme e dokumentit.".to_string())?;
+            if name.contains('/')||name.contains('\\')||name.contains("..")
+                ||!name.ends_with(".pdf") {
+                return Err("Skedari nuk është në dosjen klinike.".into());
+            }
+            let path=app.path().app_data_dir().map_err(err_string)?.join(&relative);
+            let bytes=std::fs::read(&path).map_err(err_string)?;
+            let actual=hex::encode(Sha256::digest(&bytes));
+            if actual!=expected || !bytes.starts_with(b"%PDF-") {
+                return Err("Integriteti i dokumentit klinik nuk përputhet.".into());
+            }
+            #[cfg(target_os="windows")]
+            {std::process::Command::new("explorer.exe").arg(&path).spawn().map_err(err_string)?;}
+            #[cfg(not(target_os="windows"))]
+            {open::that(&path).map_err(err_string)?;}
+            Ok("Dokumenti u hap në lexuesin PDF.".to_string())
+        }
+    }).await.map_err(err_string)?
+}
+
+#[tauri::command]
 async fn orthopedic_rehab_plans_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
@@ -5062,6 +5167,9 @@ pub fn run() {
             physiotherapy_reports_list,
             physiotherapy_report_create,
             physiotherapy_document_export_pdf,
+            physiotherapy_documents_list,
+            physiotherapy_document_attach,
+            physiotherapy_document_open,
             orthopedic_rehab_phase_reviews_list,
             orthopedic_rehab_phase_review_add,
             orthopedic_reports_list,
