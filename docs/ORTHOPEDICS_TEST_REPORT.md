@@ -114,3 +114,21 @@ From the user's second PowerShell log after pulling `mjeku-ui` commit
 Verified status is based on the user-provided log from their local Windows PC,
 not a server-side test run. UI production build is not the same as installing
 or launching the Tauri .exe. Do not claim patient-ready clinical certification.
+
+## New, separate change: native PDF rendering and POS sidebar branding (2026-10-25)
+
+After the 50/50 Windows baseline, additional code was committed:
+- Original PROGRAMERI POS logo in sidebar and embedded PDF header.
+- `orthopedic_report_pdf_data` verifies report/patient/episode via SQL joins.
+- `orthopedic_report_export_pdf` builds an A4 multi-page PDF from a saved
+  version, opens a native Windows save dialog, then launches the saved PDF
+  in the system's PDF reader.
+- `OrthopedicsPage.tsx` no longer uses `window.print()`; it presents a
+  saved-version selector and calls the Tauri export command.
+- New tests: one standalone PDF generation test and one DB+PDF data-binding
+  test. These are **not part of the earlier 50/50 verified result**.
+
+**New PDF feature status: NOT YET RUN ON WINDOWS.** Rerun full TypeScript
+typecheck, Vite build and Cargo tests to confirm the changed application
+compiles, then manually verify layout, Albanian glyphs, correct patient ID,
+PDF selection, permission checks and printing from the PDF reader.
