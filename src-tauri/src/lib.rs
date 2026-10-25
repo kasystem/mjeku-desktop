@@ -1503,6 +1503,123 @@ async fn physiotherapy_session_add(
 }
 
 #[tauri::command]
+async fn physiotherapy_measurements_list(state: tauri::State<'_, AppState>, physiotherapy_episode_id: String)
+    -> Result<Vec<serde_json::Value>, String> {
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_measurements_list(&physiotherapy_episode_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_measurement_add(state: tauri::State<'_, AppState>, value: serde_json::Value)
+    -> Result<serde_json::Value, String> {
+    let doctor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
+        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_measurement_add(&value,&doctor))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_care_plans_list(state: tauri::State<'_, AppState>, physiotherapy_episode_id: String)
+    -> Result<Vec<serde_json::Value>, String> {
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_care_plans_list(&physiotherapy_episode_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_care_plan_create(state: tauri::State<'_, AppState>, value: serde_json::Value)
+    -> Result<serde_json::Value, String> {
+    let doctor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
+        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_care_plan_create(&value,&doctor))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_exercises_list(state: tauri::State<'_, AppState>)
+    -> Result<Vec<serde_json::Value>, String> {
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_exercises_list())
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_exercise_create(state: tauri::State<'_, AppState>, value: serde_json::Value)
+    -> Result<serde_json::Value, String> {
+    let doctor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
+        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_exercise_create(&value,&doctor))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_hep_list(state: tauri::State<'_, AppState>, physiotherapy_episode_id: String)
+    -> Result<Vec<serde_json::Value>, String> {
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_hep_list(&physiotherapy_episode_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_hep_assign(state: tauri::State<'_, AppState>, value: serde_json::Value)
+    -> Result<serde_json::Value, String> {
+    let doctor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
+        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_hep_assign(&value,&doctor))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_hep_log_add(state: tauri::State<'_, AppState>, value: serde_json::Value)
+    -> Result<serde_json::Value, String> {
+    let doctor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
+        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_hep_log_add(&value,&doctor))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_reports_list(state: tauri::State<'_, AppState>, physiotherapy_episode_id: String)
+    -> Result<Vec<serde_json::Value>, String> {
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_reports_list(&physiotherapy_episode_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_report_create(state: tauri::State<'_, AppState>, value: serde_json::Value)
+    -> Result<serde_json::Value, String> {
+    let doctor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
+        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_report_create(&value,&doctor))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
 async fn orthopedic_rehab_plans_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
@@ -4888,6 +5005,17 @@ pub fn run() {
             physiotherapy_episodes_list,
             physiotherapy_sessions_list,
             physiotherapy_session_add,
+            physiotherapy_measurements_list,
+            physiotherapy_measurement_add,
+            physiotherapy_care_plans_list,
+            physiotherapy_care_plan_create,
+            physiotherapy_exercises_list,
+            physiotherapy_exercise_create,
+            physiotherapy_hep_list,
+            physiotherapy_hep_assign,
+            physiotherapy_hep_log_add,
+            physiotherapy_reports_list,
+            physiotherapy_report_create,
             orthopedic_rehab_phase_reviews_list,
             orthopedic_rehab_phase_review_add,
             orthopedic_reports_list,
