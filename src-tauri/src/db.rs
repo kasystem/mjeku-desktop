@@ -473,26 +473,92 @@ impl Db {
         } let now=v["created_at"].as_str().unwrap_or_default();
         c.execute("INSERT INTO orthopedic_surgeries(id,episode_id,procedure,status,side,site,team,consent_status,planned_date,preop_checklist,postop_plan,payload_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13) ON CONFLICT(id) DO UPDATE SET procedure=excluded.procedure,status=excluded.status,side=excluded.side,site=excluded.site,team=excluded.team,consent_status=excluded.consent_status,planned_date=excluded.planned_date,preop_checklist=excluded.preop_checklist,postop_plan=excluded.postop_plan,payload_json=excluded.payload_json,updated_at=excluded.updated_at", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["procedure"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("draft"),v["side"].as_str().unwrap_or_default(),v["site"].as_str().unwrap_or_default(),v["team"].as_str().unwrap_or_default(),v["consent_status"].as_str().unwrap_or("pending"),v["planned_date"].as_str().unwrap_or_default(),v["preop_checklist"].as_str().unwrap_or_default(),v["postop_plan"].as_str().unwrap_or_default(),v.to_string(),now])?; Ok(())
     }
-    pub fn orthopedic_implant_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
-        let c=self.conn.lock().unwrap();
-        Self::orthopedic_require_surgery(&c, v["surgery_id"].as_str().unwrap_or_default())?;
+    pub fn orthopedic_implant_upsert(&self, v: &serde_json::Value, actor: &str) -> anyhow::Result<()> {
+        if actor.trim().is_empty() { bail!("Identiteti i përdoruesit kërkohet."); }
+        let mut c = self.conn.lock().unwrap();
+        let surgery_id = v["surgery_id"].as_str().unwrap_or_default();
+        Self::orthopedic_require_surgery(&c, surgery_id)?;
         let id = v["id"].as_str().unwrap_or_default();
-        let serial = v["serial"].as_str().unwrap_or_default().trim();
+        if id.trim().is_empty() { bail!("Mungon identifikuesi i implantit."); }
         let status = v["status"].as_str().unwrap_or("reserved");
+        let removal = v["removal_status"].as_str().unwrap_or("not_implanted");
+        if !matches!(status, "reserved" | "implanted")
+            || !matches!(removal, "not_implanted" | "in_body" | "removed") {
+            bail!("Statusi i implantit nuk është i vlefshëm.");
+        }
+        let serial = v["serial"].as_str().unwrap_or_default().trim();
+        let lot = v["lot"].as_str().unwrap_or_default().trim();
         if status == "implanted" {
+            if serial.is_empty() && lot.is_empty() { bail!("Implanti i konfirmuar kërkon lot ose serial."); }
             if v["sterility_status"].as_str() != Some("sterile") {
                 bail!("Implanti nuk është konfirmuar steril.");
             }
             let expires = v["expiration_date"].as_str().unwrap_or_default();
             if !expires.is_empty() && expires < chrono::Utc::now().format("%Y-%m-%d").to_string().as_str() {
-                bail!("Implanti ka skaduar dhe nuk mund të konfirmohet.");
+                bail!("Implanti është i skaduar.");
             }
-            if !serial.is_empty() && c.query_row(
+        } else if removal != "not_implanted" {
+            bail!("Implanti i rezervuar nuk mund të shënohet në trup.");
+        }
+        let tx = c.transaction()?;
+        let previous: Option<(String,String)> = tx.query_row(
+            "SELECT status,removal_status FROM orthopedic_implants WHERE id=?1",
+            rusqlite::params![id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((ref old_status,ref old_removal)) = previous {
+            if old_status == "implanted" && status != "implanted" {
+                bail!("Implanti i vendosur nuk rikthehet në rezervim.");
+            }
+            if old_removal == "removed" && removal != "removed" {
+                bail!("Implanti i hequr nuk mund të rivendoset pa regjistrim të ri.");
+            }
+        }
+        let mut actual_operation: Option<String> = None;
+        if status == "implanted" {
+            actual_operation = tx.query_row(
+                "SELECT id FROM orthopedic_operations WHERE plan_id=?1 ORDER BY finalized_at DESC LIMIT 1",
+                rusqlite::params![surgery_id], |r|r.get::<_,String>(0)).optional()?;
+            if actual_operation.is_none() {
+                bail!("Implantimi real kërkon raport operativ të finalizuar, jo vetëm planin.");
+            }
+            if !serial.is_empty() && tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM orthopedic_implants WHERE serial=?1 AND id<>?2 AND status='implanted' AND removal_status='in_body')",
-                rusqlite::params![serial,id], |r| r.get::<_, bool>(0))? {
-                bail!("Ky numër serial tashmë është implantuar te një pacient tjetër.");
+                rusqlite::params![serial,id], |r|r.get::<_,bool>(0))? {
+                bail!("Ky numër serial është implantuar te një pacient tjetër.");
             }
-        } c.execute("INSERT INTO orthopedic_implants(id,surgery_id,udi,lot,serial,status,manufacturer,model,catalog_ref,udi_di,udi_pi,expiration_date,sterility_status,anatomical_site,implantation_date,removal_status,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(id) DO UPDATE SET serial=excluded.serial,status=excluded.status,manufacturer=excluded.manufacturer,model=excluded.model,catalog_ref=excluded.catalog_ref,udi_di=excluded.udi_di,udi_pi=excluded.udi_pi,expiration_date=excluded.expiration_date,sterility_status=excluded.sterility_status,anatomical_site=excluded.anatomical_site,implantation_date=excluded.implantation_date,removal_status=excluded.removal_status,payload_json=excluded.payload_json", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["surgery_id"].as_str().unwrap_or_default(),v["udi"].as_str().unwrap_or_default(),v["lot"].as_str().unwrap_or_default(),v["serial"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("reserved"),v["manufacturer"].as_str().unwrap_or_default(),v["model"].as_str().unwrap_or_default(),v["catalog_ref"].as_str().unwrap_or_default(),v["udi_di"].as_str().unwrap_or_default(),v["udi_pi"].as_str().unwrap_or_default(),v["expiration_date"].as_str().unwrap_or_default(),v["sterility_status"].as_str().unwrap_or_default(),v["anatomical_site"].as_str().unwrap_or_default(),v["implantation_date"].as_str().unwrap_or_default(),v["removal_status"].as_str().unwrap_or("in_body"),v.to_string(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+        }
+        tx.execute("INSERT INTO orthopedic_implants(
+            id,surgery_id,udi,lot,serial,status,manufacturer,model,catalog_ref,udi_di,udi_pi,expiration_date,sterility_status,
+            anatomical_site,implantation_date,removal_status,payload_json,created_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+            ON CONFLICT(id) DO UPDATE SET
+            status=excluded.status,removal_status=excluded.removal_status,
+            implantation_date=excluded.implantation_date,payload_json=excluded.payload_json",
+            rusqlite::params![
+                id,surgery_id,v["udi"].as_str().unwrap_or_default(),lot,serial,status,
+                v["manufacturer"].as_str().unwrap_or_default(),
+                v["model"].as_str().unwrap_or_default(),v["catalog_ref"].as_str().unwrap_or_default(),
+                v["udi_di"].as_str().unwrap_or_default(),v["udi_pi"].as_str().unwrap_or_default(),
+                v["expiration_date"].as_str().unwrap_or_default(),
+                v["sterility_status"].as_str().unwrap_or_default(),
+                v["anatomical_site"].as_str().unwrap_or_default(),
+                v["implantation_date"].as_str().unwrap_or_default(),removal,
+                v.to_string(),v["created_at"].as_str().unwrap_or_default()
+            ])?;
+        let event = if previous.is_none() { Some("reserved") }
+            else if previous.as_ref().map(|(s,_)|s.as_str()) != Some(status) {
+                Some("implanted")
+            } else if previous.as_ref().map(|(_,r)|r.as_str()) != Some(removal)
+                && removal=="removed" { Some("removed") }
+            else { None };
+        if let Some(action)=event {
+            tx.execute("INSERT INTO orthopedic_implant_events(
+                id,implant_id,operation_id,action,clinician_id,note,occurred_at)
+                VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![Uuid::new_v4().to_string(),id,actual_operation,
+                    action,actor,v["change_reason"].as_str().unwrap_or_default(),now_iso()])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
     pub fn orthopedic_rehab_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
         let c=self.conn.lock().unwrap();
