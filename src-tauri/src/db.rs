@@ -6829,12 +6829,46 @@ mod dental_findings_tests {
         conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql")).unwrap();
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql")).unwrap();
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql")).unwrap();
         let count: i64 = conn.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'orthopedic_%'",
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 15);
+    }
+
+    #[test]
+    fn orthopedics_rejects_orphan_episode_and_marker() {
+        let db = Db::new_in_memory().expect("orthopedics migration");
+        let episode = serde_json::json!({
+            "id":"orphan-episode","client_id":"not-a-client","diagnosis":"Frakturë",
+            "region":"Femur","laterality":"left","created_at":now_iso(),"updated_at":now_iso()
+        });
+        assert!(db.orthopedic_episode_upsert(&episode).is_err());
+        let marker = serde_json::json!({
+            "id":"orphan-marker","episode_id":"not-an-episode","region":"Femur",
+            "view":"anterior","side":"left","injury_type":"fracture",
+            "x":0.25,"y":0.5,"created_at":now_iso()
+        });
+        assert!(db.orthopedic_marker_upsert(&marker).is_err());
+    }
+
+    #[test]
+    fn orthopedics_rejects_unverified_operation_and_orphan_fracture_followup() {
+        let db = Db::new_in_memory().expect("orthopedics migration");
+        let operation = serde_json::json!({
+            "id":"test-operation","episode_id":"missing-episode","plan_id":"missing",
+            "patient_verified":true,"site_verified":true,"laterality_verified":true,
+            "consent_verified":true
+        });
+        assert!(db.orthopedic_operation_finalize(&operation,"doctor-1").is_err());
+        let followup = serde_json::json!({
+            "id":"test-followup","episode_id":"missing-episode",
+            "fracture_id":"missing-fracture", "assessment_date":"2026-10-25"
+        });
+        assert!(db.orthopedic_fracture_followup_add(&followup,"doctor-1").is_err());
     }
 }
 
