@@ -153,10 +153,12 @@ pub fn render_orthopedic_pdf(report: &Value, clinic_name: &str) -> Result<Vec<u8
             let w_px = img.image.width.0 as f32;
             let h_px = img.image.height.0 as f32;
             if w_px > 0.0 && h_px > 0.0 {
-                let side_mm = 20.0;
+                // The original POS artwork has wide transparent margins;
+                // scale the full PNG larger so the actual emblem is legible.
+                let side_mm = 35.0;
                 img.add_to_layer(page.layer.clone(), ImageTransform {
-                    translate_x: Some(Mm(LEFT)),
-                    translate_y: Some(Mm(266.0)),
+                    translate_x: Some(Mm(10.0)),
+                    translate_y: Some(Mm(254.0)),
                     rotate: None,
                     scale_x: Some(side_mm * dpi / (w_px * 25.4)),
                     scale_y: Some(side_mm * dpi / (h_px * 25.4)),
