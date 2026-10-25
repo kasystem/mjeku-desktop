@@ -621,10 +621,13 @@ impl Db {
             .with_context(|| format!("open sqlite: {}", db_path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(MIGRATION_SQL)?;
-        Self::run_migrations(&conn)?;
-        conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
+        // Create orthopedic base tables BEFORE adding their newer columns.
+        // The previous order attempted ALTER TABLE on non-existing tables
+        // when installing a clean clinic database.
         conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
+        Self::run_migrations(&conn)?;
+        conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
         Ok(Self {
             db_path,
@@ -639,10 +642,13 @@ impl Db {
     pub fn new_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory().context("open in-memory sqlite")?;
         conn.execute_batch(MIGRATION_SQL)?;
-        Self::run_migrations(&conn)?;
-        conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
+        // Create orthopedic base tables BEFORE adding their newer columns.
+        // The previous order attempted ALTER TABLE on non-existing tables
+        // when installing a clean clinic database.
         conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
+        Self::run_migrations(&conn)?;
+        conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
         Ok(Self {
             db_path: PathBuf::new(),
