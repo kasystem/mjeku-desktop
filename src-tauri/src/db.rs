@@ -2007,6 +2007,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/physiotherapy_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v3.sql"))?;
+        conn.execute_batch(include_str!("../migrations/physiotherapy_v4.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -2033,6 +2034,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/physiotherapy_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v3.sql"))?;
+        conn.execute_batch(include_str!("../migrations/physiotherapy_v4.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
