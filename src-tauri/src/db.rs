@@ -1178,6 +1178,150 @@ impl Db {
             "response":response,"recorded_by":actor,"created_at":now}))
     }
 
+    pub fn physiotherapy_reports_list(&self,ep:&str)->anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn.lock().unwrap();
+        let mut stmt=conn.prepare(
+            "SELECT id,physiotherapy_episode_id,type,version,status,narrative,
+             clinical_summary_json,author_id,reason,created_at
+             FROM physiotherapy_reports WHERE physiotherapy_episode_id=?1
+             ORDER BY created_at DESC,version DESC")?;
+        let rows=stmt.query_map([ep],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"physiotherapy_episode_id":r.get::<_,String>(1)?,
+            "type":r.get::<_,String>(2)?,"version":r.get::<_,i64>(3)?,
+            "status":r.get::<_,String>(4)?,"narrative":r.get::<_,String>(5)?,
+            "clinical_summary_json":r.get::<_,String>(6)?,
+            "author_id":r.get::<_,String>(7)?,"reason":r.get::<_,String>(8)?,
+            "created_at":r.get::<_,String>(9)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_report_create(
+        &self,v:&serde_json::Value,actor:&str
+    )->anyhow::Result<serde_json::Value>{
+        if actor.trim().is_empty(){bail!("Nënshkruesi klinik është i detyrueshëm.");}
+        let ep=v["physiotherapy_episode_id"].as_str().unwrap_or_default();
+        let kind=v["type"].as_str().unwrap_or_default();
+        let status=v["status"].as_str().unwrap_or("draft");
+        let narrative=v["narrative"].as_str().unwrap_or_default().trim();
+        let reason=v["reason"].as_str().unwrap_or_default().trim();
+        if !matches!(kind,"initial"|"progress"|"discharge") ||
+           !matches!(status,"draft"|"final"|"amendment"){
+            bail!("Lloji/statusi i raportit nuk mbështetet.");
+        }
+        if narrative.chars().count()<15 || narrative.chars().count()>25000{
+            bail!("Raporti kërkon përshkrim klinik 15–25000 karaktere.");
+        }
+        if status=="amendment" && reason.chars().count()<10 {
+            bail!("Amendamenti kërkon arsye klinike.");
+        }
+        // Clinical snapshot contains saved events, not HTML or client-authored
+        // pseudo-history. Record is immutable even when later data change.
+        let sessions=self.physiotherapy_sessions_list(ep)?;
+        let measurements=self.physiotherapy_measurements_list(ep)?;
+        let plans=self.physiotherapy_care_plans_list(ep)?;
+        let hep=self.physiotherapy_hep_list(ep)?;
+        let snapshot=serde_json::json!({
+            "sessions":sessions,"measurements":measurements,
+            "care_plans":plans,"home_exercises":hep
+        }).to_string();
+        let mut conn=self.conn.lock().unwrap();
+        let tx=conn.transaction()?;
+        let episode_state:Option<String>=tx.query_row(
+            "SELECT e.status FROM physiotherapy_episodes f
+             JOIN orthopedic_episodes e ON e.id=f.orthopedic_episode_id
+             WHERE f.id=?1",[ep],|r|r.get(0)).optional()?;
+        if episode_state.is_none(){bail!("Episodi nuk ekziston.");}
+        if episode_state.as_deref()==Some("closed") && status!="amendment" {
+            bail!("Pas mbylljes pranohen vetëm amendamente të raporteve finale.");
+        }
+        let last:i64=tx.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM physiotherapy_reports
+             WHERE physiotherapy_episode_id=?1 AND type=?2",
+            rusqlite::params![ep,kind],|r|r.get(0))?;
+        if status=="amendment" {
+            let signed:i64=tx.query_row(
+                "SELECT COUNT(*) FROM physiotherapy_reports
+                 WHERE physiotherapy_episode_id=?1 AND type=?2 AND status='final'",
+                rusqlite::params![ep,kind],|r|r.get(0))?;
+            if signed==0{bail!("Amendamenti kërkon raport final ekzistues.");}
+        }
+        let id=Uuid::new_v4().to_string();let now=now_iso();let version=last+1;
+        tx.execute(
+            "INSERT INTO physiotherapy_reports
+             (id,physiotherapy_episode_id,type,version,status,narrative,
+             clinical_summary_json,author_id,reason,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![id,ep,kind,version,status,narrative,snapshot,actor,reason,now]
+        )?;
+        tx.commit()?;
+        Ok(serde_json::json!({"id":id,"physiotherapy_episode_id":ep,
+            "type":kind,"version":version,"status":status,"narrative":narrative,
+            "clinical_summary_json":snapshot,"author_id":actor,
+            "reason":reason,"created_at":now}))
+    }
+
+    /// Patient identity and restrictions are retrieved exclusively through
+    /// server-side joins. Can be used for both clinical reports and referrals.
+    pub fn physiotherapy_document_data(&self,document_id:&str,kind:&str)
+        ->anyhow::Result<serde_json::Value>{
+        let conn=self.conn.lock().unwrap();
+        if kind=="referral" {
+            return conn.query_row(
+                "SELECT f.id,f.client_id,c.name,e.diagnosis,e.region,e.laterality,
+                 p.protocol,p.phase,COALESCE(p.load_restrictions,''),
+                 COALESCE(p.rom_restrictions,''),f.created_by,f.created_at
+                 FROM physiotherapy_episodes f
+                 JOIN clients c ON c.id=f.client_id
+                 JOIN orthopedic_episodes e ON e.id=f.orthopedic_episode_id
+                 JOIN orthopedic_rehab_plans p ON p.id=f.rehab_plan_id
+                 WHERE f.id=?1", [document_id], |r|Ok(serde_json::json!({
+                    "id":r.get::<_,String>(0)?,"patient_id":r.get::<_,String>(1)?,
+                    "patient_name":r.get::<_,String>(2)?,
+                    "diagnosis":r.get::<_,String>(3)?,"region":r.get::<_,String>(4)?,
+                    "laterality":r.get::<_,String>(5)?,
+                    "protocol":r.get::<_,String>(6)?,
+                    "phase":r.get::<_,String>(7)?,
+                    "load_restrictions":r.get::<_,String>(8)?,
+                    "rom_restrictions":r.get::<_,String>(9)?,
+                    "author_id":r.get::<_,String>(10)?,
+                    "created_at":r.get::<_,String>(11)?
+                }))
+            ).optional()?.ok_or_else(||anyhow!("Referimi nuk u gjet."));
+        }
+        conn.query_row(
+            "SELECT r.id,r.physiotherapy_episode_id,r.type,r.version,r.status,
+             r.narrative,r.clinical_summary_json,r.author_id,r.reason,r.created_at,
+             c.name,c.id,e.diagnosis,e.region,e.laterality,p.protocol,p.phase,
+             COALESCE(p.load_restrictions,''),COALESCE(p.rom_restrictions,'')
+             FROM physiotherapy_reports r
+             JOIN physiotherapy_episodes f ON f.id=r.physiotherapy_episode_id
+             JOIN clients c ON c.id=f.client_id
+             JOIN orthopedic_episodes e ON e.id=f.orthopedic_episode_id
+             JOIN orthopedic_rehab_plans p ON p.id=f.rehab_plan_id
+             WHERE r.id=?1",[document_id],|r|Ok(serde_json::json!({
+                "id":r.get::<_,String>(0)?,
+                "physiotherapy_episode_id":r.get::<_,String>(1)?,
+                "type":r.get::<_,String>(2)?,"version":r.get::<_,i64>(3)?,
+                "status":r.get::<_,String>(4)?,
+                "narrative":r.get::<_,String>(5)?,
+                "clinical_summary_json":r.get::<_,String>(6)?,
+                "author_id":r.get::<_,String>(7)?,
+                "reason":r.get::<_,String>(8)?,
+                "created_at":r.get::<_,String>(9)?,
+                "patient_name":r.get::<_,String>(10)?,
+                "patient_id":r.get::<_,String>(11)?,
+                "diagnosis":r.get::<_,String>(12)?,
+                "region":r.get::<_,String>(13)?,
+                "laterality":r.get::<_,String>(14)?,
+                "protocol":r.get::<_,String>(15)?,
+                "phase":r.get::<_,String>(16)?,
+                "load_restrictions":r.get::<_,String>(17)?,
+                "rom_restrictions":r.get::<_,String>(18)?
+            }))
+        ).optional()?.ok_or_else(||anyhow!("Versioni i raportit nuk u gjet."))
+    }
+
     pub fn orthopedic_episodes_list(&self, client_id: Option<String>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, client_id, diagnosis, region, laterality, status, notes, created_at, updated_at FROM orthopedic_episodes WHERE (?1 IS NULL OR client_id = ?1) ORDER BY updated_at DESC")?;
