@@ -1544,9 +1544,10 @@ async fn orthopedic_reports_list(
 async fn orthopedic_report_version_create(
     state: tauri::State<'_, AppState>, value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let clinician = match require_orthopedic_surgeon(&state).await? {
+    // Distinguish medical report signing from surgery finalization.
+    let clinician = match require_orthopedic_clinician(&state).await? {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
-        _ => return Err("Kërkohet mjeku për nënshkrimin e raportit.".to_string()),
+        _ => return Err("Për nënshkrimin e raportit duhet të identifikohesh si Mjek, jo si Pronar.".to_string()),
     };
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_report_version_create(&value,&clinician))
