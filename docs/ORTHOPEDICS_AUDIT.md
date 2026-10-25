@@ -49,3 +49,18 @@ See `docs/ORTHOPEDICS_WORKFLOWS.md`, `docs/ORTHOPEDICS_TEST_REPORT.md`,
 and `src-tauri/migrations/orthopedics_v4.sql`. Remaining PACS, shared
 inventory, Physiotherapy, synchronization, and platform verification gaps
 are **unchanged**. Not certified or approved for clinical release.
+
+## Integration update — Ortopedi ⇄ Fizioterapi (2026-10-25)
+
+The previously missing **shared therapy referral/session flow** has received
+its first implementation in both repositories: immutable physiotherapy
+referrals tied to `orthopedic_episodes`/`orthopedic_rehab_plans`, a dedicated
+Physiotherapy page, authored session history (NRS/ROM/MMT), orthopedic
+progress visibility and closed-episode guards. See
+`docs/ORTHOPEDICS_REHABILITATION.md`.
+
+The broader rehabilitation checklist remains **PARTIAL**: dedicated licensed
+physiotherapist permissions, standalone cases, HEP/video, instrument catalogs,
+formal versioned therapist reports and PDF, patient ACL, multi-device cloud
+sync and Windows/macOS E2E validation have not been completed. The prior
+50/50 Windows test result predates these commits.
