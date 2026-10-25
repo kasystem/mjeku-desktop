@@ -815,6 +815,181 @@ impl Db {
         }))
     }
 
+    /// All physiotherapy writes derive actor identity from the Tauri session.
+    /// The linked orthopedic episode must still be active.
+    fn physio_require_active(conn: &Connection, id: &str) -> anyhow::Result<()> {
+        let valid:bool=conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM physiotherapy_episodes f
+             JOIN orthopedic_episodes e ON e.id=f.orthopedic_episode_id
+             WHERE f.id=?1 AND f.status='active' AND e.status='active')",
+            [id],|r|r.get(0))?;
+        if !valid { bail!("Episodi i fizioterapisë nuk është aktiv ose nuk ekziston."); }
+        Ok(())
+    }
+
+    pub fn physiotherapy_measurements_list(&self, episode: &str)
+        -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn.lock().unwrap();
+        let mut stmt=conn.prepare(
+            "SELECT id,physiotherapy_episode_id,session_id,kind,region,laterality,movement,
+             value,unit,method,instrument,instrument_version,context,interpretation,
+             assessor_id,assessed_at,correction_of,correction_reason,created_at
+             FROM physiotherapy_measurements WHERE physiotherapy_episode_id=?1
+             ORDER BY assessed_at DESC,created_at DESC")?;
+        let rows=stmt.query_map([episode],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"physiotherapy_episode_id":r.get::<_,String>(1)?,
+            "session_id":r.get::<_,Option<String>>(2)?,"kind":r.get::<_,String>(3)?,
+            "region":r.get::<_,String>(4)?,"laterality":r.get::<_,String>(5)?,
+            "movement":r.get::<_,String>(6)?,"value":r.get::<_,f64>(7)?,
+            "unit":r.get::<_,String>(8)?,"method":r.get::<_,String>(9)?,
+            "instrument":r.get::<_,String>(10)?,"instrument_version":r.get::<_,String>(11)?,
+            "context":r.get::<_,String>(12)?,"interpretation":r.get::<_,String>(13)?,
+            "assessor_id":r.get::<_,String>(14)?,"assessed_at":r.get::<_,String>(15)?,
+            "correction_of":r.get::<_,Option<String>>(16)?,
+            "correction_reason":r.get::<_,String>(17)?,
+            "created_at":r.get::<_,String>(18)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_measurement_add(
+        &self,v:&serde_json::Value,actor:&str
+    )->anyhow::Result<serde_json::Value> {
+        if actor.trim().is_empty() { bail!("Kërkohet profesionist klinik i identifikuar."); }
+        let ep=v["physiotherapy_episode_id"].as_str().unwrap_or_default();
+        let kind=v["kind"].as_str().unwrap_or_default();
+        let value=v["value"].as_f64().ok_or_else(|| anyhow!("Matja kërkon vlerë numerike."))?;
+        if !value.is_finite() || value<0.0 || value>=1_000_000.0 {
+            bail!("Vlerë matjeje jashtë kufijve.");
+        }
+        let (max,unit,integers)=match kind {
+            "rom"=>(360.0,"deg",false),
+            "mmt"=>(5.0,"grade_0_5",true),
+            "nrs"=>(10.0,"nrs_0_10",true),
+            "functional"=>(999999.0,"",false),
+            _=>bail!("Lloji i matjes është i pavlefshëm.")
+        };
+        if value>max || (integers && value.fract()!=0.0) { bail!("Vlera nuk përputhet me shkallën klinike."); }
+        let claimed_unit=v["unit"].as_str().unwrap_or_default();
+        if kind!="functional" && claimed_unit!=unit { bail!("Njësi e papërshtatshme matjeje."); }
+        if kind=="functional" && (claimed_unit.trim().is_empty() ||
+            v["instrument"].as_str().unwrap_or_default().trim().is_empty() ||
+            v["instrument_version"].as_str().unwrap_or_default().trim().is_empty()) {
+            bail!("Testi funksional kërkon instrument, version dhe njësi.");
+        }
+        let region=v["region"].as_str().unwrap_or_default();
+        let movement=v["movement"].as_str().unwrap_or_default();
+        if (kind=="rom" && (region.trim().is_empty() || movement.trim().is_empty())) ||
+           (kind=="mmt" && region.trim().is_empty()) {
+            bail!("Matja kërkon regjionin dhe lëvizjen e përcaktuar.");
+        }
+        let side=v["laterality"].as_str().unwrap_or("not_applicable");
+        if !matches!(side,"left"|"right"|"bilateral"|"midline"|"not_applicable") { bail!("Ana anatomike është e pavlefshme."); }
+        let method=v["method"].as_str().unwrap_or_default();
+        if method.trim().is_empty() { bail!("Metoda klinike është e detyrueshme."); }
+        let assessed=v["assessed_at"].as_str().unwrap_or_default();
+        chrono::NaiveDate::parse_from_str(assessed,"%Y-%m-%d")
+            .map_err(|_|anyhow!("Data e matjes është e pavlefshme."))?;
+        let correction=v["correction_of"].as_str().filter(|s|!s.trim().is_empty());
+        let reason=v["correction_reason"].as_str().unwrap_or_default();
+        if correction.is_some() && reason.trim().chars().count()<10 {
+            bail!("Korrigjimi kërkon arsye klinike me të paktën 10 karaktere.");
+        }
+        let conn=self.conn.lock().unwrap();
+        Self::physio_require_active(&conn,ep)?;
+        let id=Uuid::new_v4().to_string();let now=now_iso();
+        conn.execute(
+            "INSERT INTO physiotherapy_measurements(
+             id,physiotherapy_episode_id,session_id,kind,region,laterality,movement,value,
+             unit,method,instrument,instrument_version,context,interpretation,assessor_id,
+             assessed_at,correction_of,correction_reason,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            rusqlite::params![id,ep,v["session_id"].as_str().filter(|s|!s.is_empty()),
+                kind,region,side,movement,value,claimed_unit,method,
+                v["instrument"].as_str().unwrap_or_default(),
+                v["instrument_version"].as_str().unwrap_or_default(),
+                v["context"].as_str().unwrap_or_default(),
+                v["interpretation"].as_str().unwrap_or_default(),
+                actor,assessed,correction,reason.trim(),now]
+        )?;
+        Ok(serde_json::json!({"id":id,"physiotherapy_episode_id":ep,"kind":kind,
+            "region":region,"laterality":side,"movement":movement,"value":value,
+            "unit":claimed_unit,"method":method,"instrument":v["instrument"],
+            "instrument_version":v["instrument_version"],"context":v["context"],
+            "interpretation":v["interpretation"],"assessor_id":actor,
+            "assessed_at":assessed,"correction_of":correction,
+            "correction_reason":reason.trim(),"created_at":now}))
+    }
+
+    pub fn physiotherapy_care_plans_list(&self,ep:&str)->anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn.lock().unwrap();
+        let mut s=conn.prepare(
+            "SELECT id,physiotherapy_episode_id,version,status,goal,measurable_target,
+             frequency,duration,interventions,precautions,phase,clinician_id,reason,created_at
+             FROM physiotherapy_care_plans WHERE physiotherapy_episode_id=?1 ORDER BY version DESC")?;
+        let rows=s.query_map([ep],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"physiotherapy_episode_id":r.get::<_,String>(1)?,
+            "version":r.get::<_,i64>(2)?,"status":r.get::<_,String>(3)?,
+            "goal":r.get::<_,String>(4)?,"measurable_target":r.get::<_,String>(5)?,
+            "frequency":r.get::<_,String>(6)?,"duration":r.get::<_,String>(7)?,
+            "interventions":r.get::<_,String>(8)?,"precautions":r.get::<_,String>(9)?,
+            "phase":r.get::<_,String>(10)?,"clinician_id":r.get::<_,String>(11)?,
+            "reason":r.get::<_,String>(12)?,"created_at":r.get::<_,String>(13)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_care_plan_create(
+        &self,v:&serde_json::Value,actor:&str
+    )->anyhow::Result<serde_json::Value> {
+        if actor.trim().is_empty(){bail!("Kërkohet profesionist i identifikuar.");}
+        let ep=v["physiotherapy_episode_id"].as_str().unwrap_or_default();
+        let goal=v["goal"].as_str().unwrap_or_default().trim();
+        let status=v["status"].as_str().unwrap_or("draft");
+        let reason=v["reason"].as_str().unwrap_or_default();
+        if goal.chars().count()<8 || goal.chars().count()>3000 {
+            bail!("Plani kërkon objektiv klinik (8–3000 karaktere).");
+        }
+        if !matches!(status,"draft"|"approved"|"amendment") {bail!("Status i pavlefshëm i planit.");}
+        if status=="amendment" && reason.trim().chars().count()<10 {
+            bail!("Amendamenti kërkon arsyetim.");
+        }
+        let mut conn=self.conn.lock().unwrap();
+        let tx=conn.transaction()?;
+        Self::physio_require_active(&tx,ep)?;
+        let last:i64=tx.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM physiotherapy_care_plans
+             WHERE physiotherapy_episode_id=?1",[ep],|r|r.get(0))?;
+        if status=="amendment" {
+            let n:i64=tx.query_row(
+                "SELECT COUNT(*) FROM physiotherapy_care_plans
+                 WHERE physiotherapy_episode_id=?1 AND status IN ('approved','amendment')",
+                [ep],|r|r.get(0))?;
+            if n==0 {bail!("Amendamenti kërkon plan të miratuar më parë.");}
+        }
+        let id=Uuid::new_v4().to_string();let now=now_iso();let version=last+1;
+        tx.execute(
+            "INSERT INTO physiotherapy_care_plans(
+             id,physiotherapy_episode_id,version,status,goal,measurable_target,frequency,
+             duration,interventions,precautions,phase,clinician_id,reason,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            rusqlite::params![id,ep,version,status,goal,
+                v["measurable_target"].as_str().unwrap_or_default(),
+                v["frequency"].as_str().unwrap_or_default(),
+                v["duration"].as_str().unwrap_or_default(),
+                v["interventions"].as_str().unwrap_or_default(),
+                v["precautions"].as_str().unwrap_or_default(),
+                v["phase"].as_str().unwrap_or_default(),actor,reason.trim(),now]
+        )?;
+        tx.commit()?;
+        Ok(serde_json::json!({"id":id,"physiotherapy_episode_id":ep,
+            "version":version,"status":status,"goal":goal,
+            "measurable_target":v["measurable_target"],"frequency":v["frequency"],
+            "duration":v["duration"],"interventions":v["interventions"],
+            "precautions":v["precautions"],"phase":v["phase"],
+            "clinician_id":actor,"reason":reason.trim(),"created_at":now}))
+    }
+
     pub fn orthopedic_episodes_list(&self, client_id: Option<String>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, client_id, diagnosis, region, laterality, status, notes, created_at, updated_at FROM orthopedic_episodes WHERE (?1 IS NULL OR client_id = ?1) ORDER BY updated_at DESC")?;
