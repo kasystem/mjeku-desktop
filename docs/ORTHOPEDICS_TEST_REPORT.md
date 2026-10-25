@@ -18,10 +18,15 @@ contains:
    reports after close, permits reasoned signed amendment, rejects deletion
    of lifecycle event, reopens and permits new marker, preserves both events.
 
-## Test execution status
-**Not run in this connected GitHub environment.**
-No claim of passing Cargo/TypeScript tests, Windows build or medical
-end-to-end validation. No workflow/CI was activated.
+## Test execution status — verified on local Windows machine, 2026-10-25
+The user supplied PowerShell output after pulling the fixes. On the actual Windows
+checkout, `npm run typecheck` completed successfully, `npm run build` completed
+successfully (Vite v5.4.21, 76 modules transformed, production UI artifacts),
+and `npm run cargo:test` completed successfully: **50 passed; 0 failed**.
+This includes both new orthopedic lifecycle regression tests.
+Rust emitted 12 non-blocking compiler warnings. No workflow/CI was activated.
+These results **do not** prove full Tauri/NSIS .exe packaging, hardware integration,
+clinical E2E acceptance or medical certification.
 
 ### On Windows, in existing local checkouts
 ```powershell
@@ -55,7 +60,7 @@ npm run tauri:dev
 10. Restart Windows app, confirm episode status and transition history persist.
 
 ### Remaining verification
-- Cargo test and TypeScript build in real local checkout.
+- TypeScript build and Rust unit tests: **passed on local Windows checkout** (see latest evidence below).
 - Upgrade an existing SQLite clinic database containing legacy episodes.
 - Windows/macOS packaging and platform E2E.
 - Clinical sign-off, PACS, implant inventory and physiotherapy integration.
@@ -84,9 +89,28 @@ Code fixes have been committed directly to the existing development branches:
 - Orthopedic idempotence test: reruns v4 twice and checks 16 tables plus the
   lifecycle table and critical triggers.
 
-**Post-fix verification status: NOT RUN**. The 46/50 numbers describe the
-*pre-fix* run only. Rerun `npm run typecheck`, `npm run build`, and
-`npm run cargo:test` locally before asserting 50/50 or releasing.
+**Post-fix verification status: PASSED in user-provided Windows PowerShell output.**
+The 46/50 numbers above describe the *pre-fix* run. A subsequent Windows run
+confirmed 50/50 Rust unit tests, TypeScript typechecking and Vite production UI build.
+This does not replace clinical E2E verification or a Windows .exe packaging test.
 The local generated `src-tauri/resources/ui-seed.zip` and
 `ui-seed-version.txt` may be dirty; do not reset these user-local files
 merely to run or pull the tests.
+
+## Final post-fix Windows execution evidence — 2026-10-25
+
+From the user's second PowerShell log after pulling `mjeku-ui` commit
+`b0eeb1d` and `mjeku-desktop` commit `b2caf3a`:
+
+| Check | Verified output |
+| --- | --- |
+| `npm run typecheck` | `tsc --noEmit` completed with no diagnostics |
+| `npm run build` | Vite v5.4.21: 76 modules transformed, build successful; manifest and UI bundle written |
+| `npm run cargo:test` | `test result: ok. 50 passed; 0 failed; 0 ignored` |
+| Orthopedics lifecycle | Both new tests `...closed_episode_is_read_only...` and `...discharge_requires_signed_final_summary...` reported `ok` |
+| Existing PDF and periodontal tests | All formerly failing tests reported `ok` |
+| Rust warnings | 12, non-fatal, remain to be triaged |
+
+Verified status is based on the user-provided log from their local Windows PC,
+not a server-side test run. UI production build is not the same as installing
+or launching the Tauri .exe. Do not claim patient-ready clinical certification.
