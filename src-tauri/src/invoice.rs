@@ -1071,9 +1071,11 @@ mod tests {
             non_fiscal_total: 40.0,
         };
         let pdf = render_invoice_pdf(&data).expect("render invoice");
-        let path = "C:/Users/Fatlind Mazreku/Desktop/sample_fature.pdf";
-        std::fs::write(path, &pdf).expect("write pdf");
-        println!("Saved {} bytes to {}", pdf.len(), path);
+        // Keep the test independent from the developer's Windows account and filesystem.
+        // Rendering must produce a complete PDF document in memory.
+        assert!(pdf.starts_with(b"%PDF-"), "invoice is not a PDF document");
+        assert!(pdf.windows(5).any(|part| part == b"%%EOF"), "invoice PDF is incomplete");
+        assert!(pdf.len() > 1000, "invoice PDF is unexpectedly small");
     }
 
     #[test]
@@ -1135,9 +1137,10 @@ mod tests {
             total: 90.0,
         };
         let pdf = render_visit_pdf(&data).expect("render visit");
-        let path = "C:/Users/Fatlind Mazreku/Desktop/sample_vizite.pdf";
-        std::fs::write(path, &pdf).expect("write pdf");
-        println!("Saved {} bytes to {}", pdf.len(), path);
+        // Portable across Windows accounts, macOS and CI: no hardcoded output path.
+        assert!(pdf.starts_with(b"%PDF-"), "visit is not a PDF document");
+        assert!(pdf.windows(5).any(|part| part == b"%%EOF"), "visit PDF is incomplete");
+        assert!(pdf.len() > 1000, "visit PDF is unexpectedly small");
     }
 }
 
