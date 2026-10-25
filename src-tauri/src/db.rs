@@ -444,6 +444,19 @@ impl Db {
                 rusqlite::params![client_id], |r| r.get::<_, bool>(0))? {
             bail!("Episodi ortopedik duhet të lidhet me një pacient ekzistues.");
         }
+        let incoming_status = episode["status"].as_str().unwrap_or("active");
+        if incoming_status != "active" {
+            bail!("Statusi i episodit ndryshohet vetëm përmes procesit të mbylljes/rihapjes.");
+        }
+        let episode_id = episode["id"].as_str().unwrap_or_default();
+        if episode_id.trim().is_empty() { bail!("Mungon identifikuesi i episodit."); }
+        let existing: Option<(String,String)> = conn.query_row(
+            "SELECT client_id,status FROM orthopedic_episodes WHERE id=?1", [episode_id],
+            |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((patient, status)) = existing {
+            if patient != client_id { bail!("Pacienti i episodit ekzistues nuk mund të ndryshohet."); }
+            if status != "active" { bail!("Episodi i mbyllur nuk mund të modifikohet."); }
+        }
         let side = episode["laterality"].as_str().unwrap_or_default();
         if !matches!(side, "left" | "right" | "bilateral" | "midline" | "not_applicable") {
             bail!("Ana anatomike nuk është e vlefshme.");
@@ -463,6 +476,78 @@ impl Db {
         // of finalized clinical records. Keep local audit immutable until
         // an authenticated, conflict-aware clinical sync migration is deployed.
         Ok(())
+    }
+
+    /// Versioned discharge and reopening. Actor identity comes from the authenticated
+    /// Tauri session, never the request body. Both writes share one transaction.
+    pub fn orthopedic_episode_transition(
+        &self, episode_id: &str, action: &str, reason: &str, clinician: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        if clinician.trim().is_empty() { bail!("Kërkohet identiteti i mjekut."); }
+        if reason.trim().chars().count() < 10 || reason.chars().count() > 2000 {
+            bail!("Arsyeja klinike duhet të jetë 10 deri në 2000 karaktere.");
+        }
+        let (expected, next) = match action {
+            "close" => ("active", "closed"),
+            "reopen" => ("closed", "active"),
+            _ => bail!("Veprim i panjohur për episodin."),
+        };
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current: String = tx.query_row(
+            "SELECT status FROM orthopedic_episodes WHERE id=?1",
+            [episode_id], |r| r.get(0)
+        ).optional()?.ok_or_else(|| anyhow!("Episodi ortopedik nuk ekziston."))?;
+        if current != expected {
+            bail!("Kalimi i statusit nuk lejohet nga gjendja aktuale e episodit.");
+        }
+        // Closing requires an actual final_summary report signed by a doctor.
+        let final_report_id: Option<String> = if action == "close" {
+            Some(tx.query_row(
+                "SELECT id FROM orthopedic_report_versions
+                 WHERE episode_id=?1 AND type='final_summary' AND status='final'
+                 ORDER BY version DESC LIMIT 1",
+                [episode_id], |r| r.get(0)
+            ).optional()?.ok_or_else(|| anyhow!(
+                "Mbyllja kërkon raportin final 'Përmbledhja finale' të nënshkruar nga mjeku."
+            ))?)
+        } else { None };
+        let at = now_iso();
+        tx.execute(
+            "UPDATE orthopedic_episodes SET status=?1,updated_at=?2 WHERE id=?3 AND status=?4",
+            rusqlite::params![next,at,episode_id,expected]
+        )?;
+        let id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO orthopedic_episode_transitions
+             (id,episode_id,from_status,to_status,reason,clinician_id,final_report_id,occurred_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![id,episode_id,expected,next,reason.trim(),clinician,final_report_id,at]
+        )?;
+        tx.commit()?;
+        Ok(serde_json::json!({"id":id,"episode_id":episode_id,"from_status":expected,
+           "to_status":next,"reason":reason.trim(),"clinician_id":clinician,
+           "final_report_id":final_report_id,"occurred_at":at}))
+    }
+
+    pub fn orthopedic_episode_transitions_list(
+        &self, episode_id: &str,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&conn, episode_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT id,episode_id,from_status,to_status,reason,clinician_id,final_report_id,occurred_at
+             FROM orthopedic_episode_transitions WHERE episode_id=?1
+             ORDER BY occurred_at DESC,rowid DESC"
+        )?;
+        let entries = stmt.query_map([episode_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"episode_id":r.get::<_,String>(1)?,
+            "from_status":r.get::<_,String>(2)?,"to_status":r.get::<_,String>(3)?,
+            "reason":r.get::<_,String>(4)?,"clinician_id":r.get::<_,String>(5)?,
+            "final_report_id":r.get::<_,Option<String>>(6)?,
+            "occurred_at":r.get::<_,String>(7)?
+        })))?;
+        Ok(entries.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn orthopedic_surgery_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
@@ -809,6 +894,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql"))?;
+        conn.execute_batch(include_str!("../migrations/orthopedics_v4.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -831,6 +917,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql"))?;
+        conn.execute_batch(include_str!("../migrations/orthopedics_v4.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -7187,8 +7274,12 @@ impl Db {
         let last:i64=tx.query_row(
             "SELECT COALESCE(MAX(version),0) FROM orthopedic_report_versions WHERE episode_id=?1 AND type=?2",
             rusqlite::params![episode,kind],|r|r.get(0))?;
-        if status=="amendment" && last == 0 {
-            bail!("Nuk mund të amendohet raporti pa version paraardhës.");
+        if status=="amendment" {
+            let signed:i64 = tx.query_row(
+                "SELECT COUNT(*) FROM orthopedic_report_versions
+                 WHERE episode_id=?1 AND type=?2 AND status='final'",
+                rusqlite::params![episode,kind], |r|r.get(0))?;
+            if signed == 0 { bail!("Amendamenti kërkon një raport final ekzistues."); }
         }
         let version = last+1;
         let id=Uuid::new_v4().to_string(); let now=now_iso();
