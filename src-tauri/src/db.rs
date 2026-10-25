@@ -682,7 +682,9 @@ impl Db {
         let mut stmt = conn.prepare("SELECT payload_json FROM orthopedic_surgeries WHERE episode_id=?1 ORDER BY created_at DESC")?;
         let items = stmt.query_map(rusqlite::params![episode_id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
-        items.into_iter().map(|v| Ok(serde_json::from_str(&v)?)).collect()
+        items.into_iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(anyhow::Error::from))
+            .collect()
     }
 
     pub fn orthopedic_implants_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -690,7 +692,9 @@ impl Db {
         let mut stmt = conn.prepare("SELECT i.payload_json FROM orthopedic_implants i JOIN orthopedic_surgeries s ON s.id=i.surgery_id WHERE s.episode_id=?1 ORDER BY i.created_at DESC")?;
         let items = stmt.query_map(rusqlite::params![episode_id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
-        items.into_iter().map(|v| Ok(serde_json::from_str(&v)?)).collect()
+        items.into_iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(anyhow::Error::from))
+            .collect()
     }
 
     pub fn orthopedic_rehab_plans_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -698,7 +702,9 @@ impl Db {
         let mut stmt = conn.prepare("SELECT payload_json FROM orthopedic_rehab_plans WHERE episode_id=?1 ORDER BY created_at DESC")?;
         let items = stmt.query_map(rusqlite::params![episode_id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
-        items.into_iter().map(|v| Ok(serde_json::from_str(&v)?)).collect()
+        items.into_iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(anyhow::Error::from))
+            .collect()
     }
 
     pub fn orthopedic_markers_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
