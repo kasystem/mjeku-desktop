@@ -626,6 +626,7 @@ impl Db {
         // when installing a clean clinic database.
         conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
+        conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -647,6 +648,7 @@ impl Db {
         // when installing a clean clinic database.
         conn.execute_batch(include_str!("../migrations/orthopedics_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql"))?;
+        conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
