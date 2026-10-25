@@ -504,6 +504,10 @@ impl Db {
         let previous: Option<(String,String)> = tx.query_row(
             "SELECT status,removal_status FROM orthopedic_implants WHERE id=?1",
             rusqlite::params![id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if status=="implanted" && removal=="removed" &&
+           previous.as_ref().map(|(old,_)|old.as_str()) != Some("implanted") {
+            bail!("Implanti nuk mund të shënohet i hequr pa histori implantimi.");
+        }
         if let Some((ref old_status,ref old_removal)) = previous {
             if old_status == "implanted" && status != "implanted" {
                 bail!("Implanti i vendosur nuk rikthehet në rezervim.");
@@ -544,7 +548,7 @@ impl Db {
                 v["implantation_date"].as_str().unwrap_or_default(),removal,
                 v.to_string(),v["created_at"].as_str().unwrap_or_default()
             ])?;
-        let event = if previous.is_none() { Some("reserved") }
+        let event = if previous.is_none() { Some(status) }
             else if previous.as_ref().map(|(s,_)|s.as_str()) != Some(status) {
                 Some("implanted")
             } else if previous.as_ref().map(|(_,r)|r.as_str()) != Some(removal)
