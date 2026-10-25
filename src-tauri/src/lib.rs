@@ -1449,6 +1449,59 @@ async fn orthopedic_implants_list(state: tauri::State<'_, AppState>, episode_id:
     tokio::task::spawn_blocking(move || db.orthopedic_implants_list(&episode_id)).await.map_err(err_string)?.map_err(err_string)
 }
 
+/// An authenticated doctor links an existing orthopedic rehabilitation
+/// protocol to the shared Physiotherapy core. The patient ID is derived by SQL.
+#[tauri::command]
+async fn physiotherapy_referral_create(
+    state: tauri::State<'_, AppState>,
+    orthopedic_episode_id: String, rehab_plan_id: String,
+) -> Result<serde_json::Value, String> {
+    let actor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet identiteti i mjekut.".into()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_referral_create(
+        &orthopedic_episode_id,&rehab_plan_id,&actor
+    )).await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_episodes_list(
+    state: tauri::State<'_, AppState>, orthopedic_episode_id: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _=require_orthopedic_clinician(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_episodes_list(orthopedic_episode_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_sessions_list(
+    state: tauri::State<'_, AppState>, physiotherapy_episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _=require_orthopedic_clinician(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_sessions_list(
+        &physiotherapy_episode_id
+    )).await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_session_add(
+    state: tauri::State<'_, AppState>, value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // Only authenticated Doctor sessions may document treatment in the
+    // current auth model. A separate physiotherapist role is future work.
+    let actor=match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet profesionist klinik i identifikuar.".into()),
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_session_add(&value,&actor))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
 #[tauri::command]
 async fn orthopedic_rehab_plans_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -4831,6 +4884,10 @@ pub fn run() {
             orthopedic_operation_finalize,
             orthopedic_implants_list,
             orthopedic_rehab_plans_list,
+            physiotherapy_referral_create,
+            physiotherapy_episodes_list,
+            physiotherapy_sessions_list,
+            physiotherapy_session_add,
             orthopedic_rehab_phase_reviews_list,
             orthopedic_rehab_phase_review_add,
             orthopedic_reports_list,
