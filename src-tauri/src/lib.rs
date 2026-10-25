@@ -4,6 +4,7 @@ mod desktop_updates;
 mod error_logs;
 mod invoice;
 mod orthopedics_pdf;
+mod physiotherapy_pdf;
 mod lab_devices;
 mod license_engine;
 mod models;
@@ -1617,6 +1618,50 @@ async fn physiotherapy_report_create(state: tauri::State<'_, AppState>, value: s
     let db=state.db.clone();
     tokio::task::spawn_blocking(move || db.physiotherapy_report_create(&value,&doctor))
         .await.map_err(err_string)?.map_err(err_string)
+}
+
+/// Export a clinical referral or a specific immutable report version.
+/// The receiving reader gets the actual PDF, not a rendered WebView screen.
+#[tauri::command]
+async fn physiotherapy_document_export_pdf(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    document_id: String, kind: String,
+) -> Result<String, String> {
+    let _=require_orthopedic_surgeon(&state).await?;
+    if !matches!(kind.as_str(),"referral"|"report") {
+        return Err("Zgjidh referimin ose raportin klinik.".to_string());
+    }
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let record=db.physiotherapy_document_data(&document_id,&kind)
+            .map_err(err_string)?;
+        let clinic=db.setting_get("clinic_name").map_err(err_string)?
+            .unwrap_or_else(||"Klinika".into());
+        let bytes=crate::physiotherapy_pdf::render(&record,&clinic,&kind)
+            .map_err(err_string)?;
+        let safe_id:String=document_id.chars()
+            .filter(|c|c.is_ascii_alphanumeric()).take(12).collect();
+        let name=if kind=="referral" {"Fizioterapi-Referim"}else{"Fizioterapi-Raport"};
+        let file=format!("{}-{}.pdf",name,safe_id);
+        #[cfg(mobile)]
+        { return save_pdf_via_dialog(&app,&file,&bytes); }
+        #[cfg(desktop)]
+        {
+            use tauri_plugin_dialog::DialogExt;
+            let picked=app.dialog().file()
+                .set_title("Ruaj dokumentin klinik PDF")
+                .set_file_name(&file).add_filter("PDF",&["pdf"])
+                .blocking_save_file()
+                .ok_or_else(||"Ruajtja e dokumentit u anulua.".to_string())?;
+            let path=picked.as_path().ok_or_else(
+                ||"Përzgjidh një destinacion skedari.".to_string())?;
+            std::fs::write(path,&bytes).map_err(err_string)?;
+            #[cfg(target_os="windows")]
+            {let _=std::process::Command::new("explorer.exe").arg(path).spawn();}
+            Ok(path.display().to_string())
+        }
+    }).await.map_err(err_string)?
 }
 
 #[tauri::command]
@@ -5016,6 +5061,7 @@ pub fn run() {
             physiotherapy_hep_log_add,
             physiotherapy_reports_list,
             physiotherapy_report_create,
+            physiotherapy_document_export_pdf,
             orthopedic_rehab_phase_reviews_list,
             orthopedic_rehab_phase_review_add,
             orthopedic_reports_list,
