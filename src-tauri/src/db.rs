@@ -429,6 +429,29 @@ mod orthopedic_lifecycle_tests {
     }
 
     #[test]
+    fn pdf_data_uses_persisted_patient_and_report_version() {
+        let db = setup_episode();
+        assert!(db.orthopedic_report_pdf_data("nonexistent-report").is_err());
+        let report = db.orthopedic_report_version_create(&serde_json::json!({
+            "episode_id":"ortho-episode","type":"final_summary","status":"final",
+            "body_json":serde_json::json!({
+                "narrative":"Stable source-of-truth clinical notes",
+                "fractures":[{"boneRegion":"Femur","currentStatus":"healing"}]
+            }).to_string()
+        }), "doctor-a").unwrap();
+        let record = db.orthopedic_report_pdf_data(report["id"].as_str().unwrap()).unwrap();
+        assert_eq!(record["patient_name"],"Test Patient");
+        assert_eq!(record["diagnosis"],"Clinical test");
+        assert_eq!(record["episode_id"],"ortho-episode");
+        assert_eq!(record["status"],"final");
+        assert_eq!(record["author_id"],"doctor-a");
+        assert_eq!(record["body_json"],report["body_json"]);
+        let pdf = crate::orthopedics_pdf::render_orthopedic_pdf(&record,"Test Clinic").unwrap();
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(pdf.len()>1500);
+    }
+
+    #[test]
     fn discharge_requires_signed_final_summary_and_valid_transition_reason() {
         let db = setup_episode();
         assert!(db.orthopedic_episode_transition(
