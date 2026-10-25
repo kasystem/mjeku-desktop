@@ -1096,6 +1096,14 @@ impl Db {
         let mut conn=self.conn.lock().unwrap();
         let tx=conn.transaction()?;
         Self::physio_require_active(&tx,ep)?;
+        let source_phase:String=tx.query_row(
+            "SELECT p.phase FROM physiotherapy_episodes f
+             JOIN orthopedic_rehab_plans p ON p.id=f.rehab_plan_id
+             WHERE f.id=?1",[ep],|r|r.get(0))?;
+        let incoming_phase=v["phase"].as_str().unwrap_or_default();
+        if !incoming_phase.is_empty() && incoming_phase!=source_phase {
+            bail!("Faza e trajtimit duhet të përputhet me protokollin ortopedik të miratuar.");
+        }
         let last:i64=tx.query_row(
             "SELECT COALESCE(MAX(version),0) FROM physiotherapy_care_plans
              WHERE physiotherapy_episode_id=?1",[ep],|r|r.get(0))?;
@@ -1118,7 +1126,7 @@ impl Db {
                 v["duration"].as_str().unwrap_or_default(),
                 v["interventions"].as_str().unwrap_or_default(),
                 v["precautions"].as_str().unwrap_or_default(),
-                v["phase"].as_str().unwrap_or_default(),actor,reason.trim(),now]
+                source_phase,actor,reason.trim(),now]
         )?;
         tx.commit()?;
         Ok(serde_json::json!({"id":id,"physiotherapy_episode_id":ep,
@@ -1192,6 +1200,10 @@ impl Db {
               WHERE l.hep_id=h.id AND l.performed=1),
              (CASE WHEN h.load_restrictions_snapshot=COALESCE(p.load_restrictions,'')
                AND h.rom_restrictions_snapshot=COALESCE(p.rom_restrictions,'')
+               AND h.care_plan_id=(
+                SELECT id FROM physiotherapy_care_plans cp
+                WHERE cp.physiotherapy_episode_id=h.physiotherapy_episode_id
+                ORDER BY version DESC LIMIT 1)
                THEN 0 ELSE 1 END)
              FROM physiotherapy_hep h
              JOIN physiotherapy_exercises x ON x.id=h.exercise_id
@@ -1301,7 +1313,11 @@ impl Db {
              AND NOT EXISTS(SELECT 1 FROM physiotherapy_hep h2
                WHERE h2.replaces_id=h.id)
              AND h.load_restrictions_snapshot=COALESCE(p.load_restrictions,'')
-             AND h.rom_restrictions_snapshot=COALESCE(p.rom_restrictions,''))",
+             AND h.rom_restrictions_snapshot=COALESCE(p.rom_restrictions,'')
+             AND h.care_plan_id=(
+                SELECT id FROM physiotherapy_care_plans cp
+                WHERE cp.physiotherapy_episode_id=f.id
+                ORDER BY version DESC LIMIT 1))",
             [hep],|r|r.get(0))?;
         if !valid{bail!("Ushtrimi kërkon rishikim ose nuk është më aktiv.");}
         let id=Uuid::new_v4().to_string();let now=now_iso();
