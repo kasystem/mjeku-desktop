@@ -410,6 +410,97 @@ mod vat_service_tests {
     }
 }
 
+#[cfg(test)]
+mod orthopedic_lifecycle_tests {
+    use super::*;
+
+    fn setup_episode() -> Db {
+        let db = Db::new_in_memory().expect("clinic schema including orthopedics v4");
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO clients(id,name,deleted) VALUES('ortho-patient','Test Patient',0)", []
+        ).unwrap();
+        db.orthopedic_episode_upsert(&serde_json::json!({
+            "id":"ortho-episode","client_id":"ortho-patient",
+            "diagnosis":"Clinical test","region":"Knee","laterality":"left",
+            "status":"active","notes":"","created_at":"2026-10-25T12:00:00Z",
+            "updated_at":"2026-10-25T12:00:00Z"
+        })).unwrap();
+        db
+    }
+
+    #[test]
+    fn discharge_requires_signed_final_summary_and_valid_transition_reason() {
+        let db = setup_episode();
+        assert!(db.orthopedic_episode_transition(
+            "ortho-episode","close","Documented recovery complete","doctor-a"
+        ).is_err());
+        let report = db.orthopedic_report_version_create(&serde_json::json!({
+            "episode_id":"ortho-episode","type":"final_summary","status":"final",
+            "body_json":"{\"narrative\":\"Clinical findings and final plan\"}"
+        }),"doctor-a").unwrap();
+        assert!(db.orthopedic_episode_transition(
+            "ortho-episode","close","short","doctor-a"
+        ).is_err());
+        let closed = db.orthopedic_episode_transition(
+            "ortho-episode","close","Documented recovery complete","doctor-a"
+        ).unwrap();
+        assert_eq!(closed["to_status"],"closed");
+        assert_eq!(closed["final_report_id"],report["id"]);
+        assert!(db.orthopedic_episode_transition(
+            "ortho-episode","close","Duplicate closing event","doctor-a"
+        ).is_err());
+        assert!(db.orthopedic_episode_transition(
+            "ortho-episode","reopen","short","doctor-a"
+        ).is_err());
+    }
+
+    #[test]
+    fn closed_episode_is_read_only_but_signed_amendments_and_reopening_work() {
+        let db = setup_episode();
+        db.orthopedic_report_version_create(&serde_json::json!({
+            "episode_id":"ortho-episode","type":"final_summary","status":"final",
+            "body_json":"{\"narrative\":\"Discharge plan\"}"
+        }),"doctor-a").unwrap();
+        db.orthopedic_episode_transition(
+            "ortho-episode","close","Final clinical discharge summary","doctor-a"
+        ).unwrap();
+
+        let marker = serde_json::json!({
+            "id":"marker-a","episode_id":"ortho-episode","region":"left_knee",
+            "side":"left","view":"anterior","injury_type":"fracture",
+            "note":"","x":0.5,"y":0.5,"created_at":"2026-10-25"
+        });
+        assert!(db.orthopedic_marker_upsert(&marker).is_err());
+        assert!(db.orthopedic_episode_upsert(&serde_json::json!({
+            "id":"ortho-episode","client_id":"ortho-patient","diagnosis":"Tampering",
+            "region":"Knee","laterality":"left","status":"active"
+        })).is_err());
+        assert!(db.orthopedic_report_version_create(&serde_json::json!({
+            "episode_id":"ortho-episode","type":"final_summary","status":"draft",
+            "body_json":"{\"narrative\":\"Not an amendment\"}"
+        }),"doctor-a").is_err());
+        assert!(db.orthopedic_report_version_create(&serde_json::json!({
+            "episode_id":"ortho-episode","type":"final_summary","status":"amendment",
+            "reason":"Corrected postoperative finding",
+            "body_json":"{\"narrative\":\"Corrected description\"}"
+        }),"doctor-a").is_ok());
+        let history = db.orthopedic_episode_transitions_list("ortho-episode").unwrap();
+        assert_eq!(history.len(),1);
+        assert_eq!(history[0]["clinician_id"],"doctor-a");
+        assert!(db.conn.lock().unwrap().execute(
+            "DELETE FROM orthopedic_episode_transitions WHERE episode_id='ortho-episode'",[]
+        ).is_err());
+
+        db.orthopedic_episode_transition(
+            "ortho-episode","reopen","New clinical finding requires review","doctor-b"
+        ).unwrap();
+        assert!(db.orthopedic_marker_upsert(&marker).is_ok());
+        let history = db.orthopedic_episode_transitions_list("ortho-episode").unwrap();
+        assert_eq!(history.len(),2);
+        assert_eq!(history[0]["to_status"],"active");
+    }
+}
+
 impl Db {
     fn orthopedic_require_episode(conn: &Connection, episode_id: &str) -> anyhow::Result<()> {
         if episode_id.trim().is_empty() ||
