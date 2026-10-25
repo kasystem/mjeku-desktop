@@ -521,6 +521,145 @@ mod orthopedic_lifecycle_tests {
         ).is_err());
     }
 
+    fn setup_physio() -> (Db,String) {
+        let db=setup_episode();
+        db.orthopedic_rehab_upsert(&serde_json::json!({
+            "id":"rehab-full","episode_id":"ortho-episode",
+            "protocol":"Clinical recovery",
+            "phase":"phase_1","load_restrictions":"Partial weight bearing",
+            "rom_restrictions":"Flexion 60 degrees",
+            "status":"active","created_at":"2026-10-26"
+        })).unwrap();
+        let referral=db.physiotherapy_referral_create(
+            "ortho-episode","rehab-full","doctor-a").unwrap();
+        (db,referral["id"].as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn physio_measurements_and_care_plans_keep_validation_and_versions() {
+        let (db,id)=setup_physio();
+        let rom=serde_json::json!({
+            "physiotherapy_episode_id":id,"kind":"rom","value":50.0,
+            "unit":"deg","region":"Knee","movement":"Flexion",
+            "laterality":"left","method":"Goniometer","assessed_at":"2026-10-26"
+        });
+        assert!(db.physiotherapy_measurement_add(&rom,"doctor-a").is_ok());
+        let mut bad=rom.clone();bad["value"]=serde_json::json!(370.0);
+        assert!(db.physiotherapy_measurement_add(&bad,"doctor-a").is_err());
+        bad=rom.clone();bad["unit"]=serde_json::json!("percent");
+        assert!(db.physiotherapy_measurement_add(&bad,"doctor-a").is_err());
+        let measured=db.physiotherapy_measurements_list(&id).unwrap();
+        assert_eq!(measured.len(),1);
+        let first=&measured[0];
+        let mut correction=rom.clone();
+        correction["value"]=serde_json::json!(49.0);
+        correction["correction_of"]=first["id"].clone();
+        assert!(db.physiotherapy_measurement_add(&correction,"doctor-a").is_err());
+        correction["correction_reason"]=serde_json::json!("Calibration reviewed with goniometer");
+        assert!(db.physiotherapy_measurement_add(&correction,"doctor-a").is_ok());
+        assert_eq!(db.physiotherapy_measurements_list(&id).unwrap().len(),2);
+
+        let plan=serde_json::json!({
+            "physiotherapy_episode_id":id,"goal":"Restore controlled knee movement",
+            "measurable_target":"Flexion 60 degrees",
+            "frequency":"3 sessions per week","duration":"4 weeks",
+            "interventions":"Supervised motion","status":"approved",
+            "phase":"phase_1"
+        });
+        let first=db.physiotherapy_care_plan_create(&plan,"doctor-a").unwrap();
+        assert_eq!(first["version"],1);
+        let second=db.physiotherapy_care_plan_create(&plan,"doctor-a").unwrap();
+        assert_eq!(second["version"],2);
+        let list=db.physiotherapy_care_plans_list(&id).unwrap();
+        assert_eq!(list.len(),2);
+        assert_eq!(list[0]["version"],2);
+        assert!(db.conn.lock().unwrap().execute(
+            "UPDATE physiotherapy_care_plans SET goal='tampered' WHERE id=?1",
+            [first["id"].as_str().unwrap()]
+        ).is_err());
+    }
+
+    #[test]
+    fn physio_hep_requires_current_approved_plan_and_snapshot_restrictions() {
+        let (db,id)=setup_physio();
+        let exercise=serde_json::json!({
+            "title":"Gentle knee flexion","instructions":"Flex only within surgeon limits",
+            "anatomical_region":"Knee","contraindications":"Stop with increased pain"
+        });
+        let created=db.physiotherapy_exercise_create(&exercise,"doctor-a").unwrap();
+        let bad_video=serde_json::json!({
+            "title":"Unsafe video","instructions":"Perform exercise carefully",
+            "media_ref":"https://example.org/clip.mp4"
+        });
+        assert!(db.physiotherapy_exercise_create(&bad_video,"doctor-a").is_err());
+        let plan=serde_json::json!({
+            "physiotherapy_episode_id":id,"goal":"Return to measured activity",
+            "status":"approved","frequency":"Weekly"
+        });
+        let care=db.physiotherapy_care_plan_create(&plan,"doctor-a").unwrap();
+        let hep=serde_json::json!({
+            "physiotherapy_episode_id":id,
+            "care_plan_id":care["id"],"exercise_id":created["id"],
+            "sets":3,"repetitions":10,"frequency":"Every day","status":"approved"
+        });
+        let assigned=db.physiotherapy_hep_assign(&hep,"doctor-a").unwrap();
+        assert_eq!(assigned["load_restrictions_snapshot"],"Partial weight bearing");
+        let list=db.physiotherapy_hep_list(&id).unwrap();
+        assert_eq!(list.len(),1);
+        assert_eq!(list[0]["needs_review"],false);
+        let record=serde_json::json!({
+            "hep_id":assigned["id"],"performed_date":"2026-10-26",
+            "performed":true,"self_reported":true,"response":"Patient reports no difficulty"
+        });
+        assert!(db.physiotherapy_hep_log_add(&record,"doctor-a").is_ok());
+        assert_eq!(db.physiotherapy_hep_list(&id).unwrap()[0]["completed_logs"],1);
+        db.conn.lock().unwrap().execute(
+            "UPDATE orthopedic_rehab_plans SET load_restrictions='No weight bearing' WHERE id='rehab-full'",
+            []
+        ).unwrap();
+        assert_eq!(db.physiotherapy_hep_list(&id).unwrap()[0]["needs_review"],true);
+        assert!(db.physiotherapy_hep_log_add(&record,"doctor-a").is_err());
+        assert!(db.physiotherapy_hep_assign(&hep,"doctor-a").is_ok(),
+            "new authorized assignment captures latest restrictions");
+    }
+
+    #[test]
+    fn physio_saved_reports_and_documents_preserve_patient_identity() {
+        let (db,id)=setup_physio();
+        let report=serde_json::json!({
+            "physiotherapy_episode_id":id,"type":"progress","status":"final",
+            "narrative":"Patient shows progress with supervised rehabilitation"
+        });
+        let signed=db.physiotherapy_report_create(&report,"doctor-a").unwrap();
+        assert_eq!(signed["version"],1);
+        let data=db.physiotherapy_document_data(signed["id"].as_str().unwrap(),"report").unwrap();
+        assert_eq!(data["patient_name"],"Test Patient");
+        assert_eq!(data["status"],"final");
+        assert!(data["clinical_summary_json"].as_str().unwrap().contains("sessions"));
+        let amendment=serde_json::json!({
+            "physiotherapy_episode_id":id,"type":"progress","status":"amendment",
+            "narrative":"Professional reassessment after new findings",
+            "reason":"Corrected functional limitation after examination"
+        });
+        assert_eq!(db.physiotherapy_report_create(&amendment,"doctor-a").unwrap()["version"],2);
+        assert!(db.conn.lock().unwrap().execute(
+            "DELETE FROM physiotherapy_reports WHERE id=?1",
+            [signed["id"].as_str().unwrap()]
+        ).is_err());
+        let docs=db.physiotherapy_document_register(
+            "ortho-episode","progress","Report.pdf","rehab-pdf/unique.pdf",
+            &"a".repeat(64),1000,"Therapist report","doctor-a").unwrap();
+        assert_eq!(docs["client_id"],"ortho-patient");
+        assert_eq!(db.physiotherapy_documents_list("ortho-episode").unwrap().len(),1);
+        assert!(db.physiotherapy_document_register(
+            "other-episode","progress","Report.pdf","rehab-pdf/other.pdf",
+            &"b".repeat(64),1000,"","doctor-a").is_err());
+        assert!(db.conn.lock().unwrap().execute(
+            "UPDATE physiotherapy_documents SET client_id='wrong' WHERE id=?1",
+            [docs["id"].as_str().unwrap()]
+        ).is_err());
+    }
+
     #[test]
     fn pdf_data_uses_persisted_patient_and_report_version() {
         let db = setup_episode();
