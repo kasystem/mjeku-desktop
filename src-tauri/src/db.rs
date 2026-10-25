@@ -437,6 +437,26 @@ mod orthopedic_lifecycle_tests {
             "rom_restrictions":"Flexion maximum 60 degrees",
             "status":"active","created_at":"2026-10-25T18:00:00Z"
         })).expect("source orthopedic protocol");
+        {
+            let conn=db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO clients(id,name,deleted) VALUES('other-physio-patient','Other Patient',0)",
+                []
+            ).unwrap();
+        }
+        db.orthopedic_episode_upsert(&serde_json::json!({
+            "id":"other-ortho-episode","client_id":"other-physio-patient",
+            "diagnosis":"Other case","region":"Ankle","laterality":"right",
+            "status":"active","created_at":"2026-10-25","updated_at":"2026-10-25"
+        })).unwrap();
+        db.orthopedic_rehab_upsert(&serde_json::json!({
+            "id":"other-rehab","episode_id":"other-ortho-episode",
+            "protocol":"Other protocol","phase":"phase_1","status":"active",
+            "created_at":"2026-10-25"
+        })).unwrap();
+        assert!(db.physiotherapy_referral_create(
+            "ortho-episode","other-rehab","doctor-a"
+        ).is_err(),"Cross-patient rehabilitation referral must be denied");
         assert!(db.physiotherapy_referral_create("ortho-episode","unknown-plan","doctor-a").is_err());
         let referral=db.physiotherapy_referral_create(
             "ortho-episode","rehab-p0","doctor-a"
@@ -462,6 +482,15 @@ mod orthopedic_lifecycle_tests {
             "next_plan":"Repeat only with therapist"
         });
         assert!(db.physiotherapy_session_add(&session,"").is_err());
+        let mut invalid=session.clone();
+        invalid["pain_before"]=serde_json::json!(11);
+        assert!(db.physiotherapy_session_add(&invalid,"doctor-a").is_err());
+        invalid=session.clone();
+        invalid["mmt_grade"]=serde_json::json!(8);
+        assert!(db.physiotherapy_session_add(&invalid,"doctor-a").is_err());
+        invalid=session.clone();
+        invalid["rom_degrees"]=serde_json::json!(400.0);
+        assert!(db.physiotherapy_session_add(&invalid,"doctor-a").is_err());
         let row=db.physiotherapy_session_add(&session,"doctor-a").unwrap();
         assert_eq!(row["pain_before"],5);
         assert_eq!(row["pain_after"],3);
