@@ -1334,6 +1334,31 @@ async fn orthopedic_episode_upsert(state: tauri::State<'_, AppState>, episode: s
 }
 
 #[tauri::command]
+async fn orthopedic_episode_transition(
+    state: tauri::State<'_, AppState>, episode_id: String,
+    action: String, reason: String,
+) -> Result<serde_json::Value, String> {
+    let doctor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet mjeku i identifikuar.".to_string()),
+    };
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_episode_transition(
+        &episode_id, &action, &reason, &doctor,
+    )).await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn orthopedic_episode_transitions_list(
+    state: tauri::State<'_, AppState>, episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_episode_transitions_list(&episode_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
 async fn orthopedic_surgery_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> {
     let status = value["status"].as_str().unwrap_or("draft");
     if matches!(status, "approved" | "scheduled" | "ready" | "in_progress" | "completed") {
@@ -4743,6 +4768,8 @@ pub fn run() {
             settings_get_all,
             orthopedic_episodes_list,
             orthopedic_episode_upsert,
+            orthopedic_episode_transition,
+            orthopedic_episode_transitions_list,
             orthopedic_surgery_upsert,
             orthopedic_surgeries_list,
             orthopedic_fracture_followups_list,
