@@ -1343,11 +1343,23 @@ async fn orthopedic_surgery_upsert(state: tauri::State<'_, AppState>, value: ser
     } let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_surgery_upsert(&value)?; db.orthopedic_audit("surgery",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 #[tauri::command]
 async fn orthopedic_implant_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> {
-    if value["status"].as_str() == Some("implanted") {
-        let _ = require_orthopedic_surgeon(&state).await?;
+    let session = if value["status"].as_str() == Some("implanted")
+       || value["removal_status"].as_str() == Some("removed") {
+        require_orthopedic_surgeon(&state).await?
     } else {
-        let _ = require_orthopedic_clinician(&state).await?;
-    } let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_implant_upsert(&value)?; db.orthopedic_audit("implant",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+        require_orthopedic_clinician(&state).await?
+    };
+    let actor = match session {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        SessionKind::User { role: crate::auth::UserRole::Owner } => "clinic_owner".to_string(),
+        _ => return Err("Nuk ke autorizim për implante.".to_string()),
+    };
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_implant_upsert(&value, &actor)?;
+        db.orthopedic_audit("implant", value["id"].as_str().unwrap_or_default(), &value)
+    }).await.map_err(err_string)?.map_err(err_string)
+}
 #[tauri::command]
 async fn orthopedic_rehab_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_rehab_upsert(&value)?; db.orthopedic_audit("rehab",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 
