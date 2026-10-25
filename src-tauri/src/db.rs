@@ -7103,3 +7103,96 @@ impl Db {
         Ok(result)
     }
 }
+
+impl Db {
+    pub fn orthopedic_rehab_phase_reviews_list(&self, rehab_plan_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id,rehab_plan_id,phase,criteria,decision,clinician_id,reason,reviewed_at FROM orthopedic_rehab_phase_reviews WHERE rehab_plan_id=?1 ORDER BY reviewed_at DESC")?;
+        let rows = stmt.query_map([rehab_plan_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"rehab_plan_id":r.get::<_,String>(1)?,
+            "phase":r.get::<_,String>(2)?,"criteria":r.get::<_,String>(3)?,
+            "decision":r.get::<_,String>(4)?,"clinician_id":r.get::<_,String>(5)?,
+            "reason":r.get::<_,String>(6)?,"reviewed_at":r.get::<_,String>(7)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn orthopedic_rehab_phase_review_add(&self, value: &serde_json::Value, clinician: &str) -> anyhow::Result<()> {
+        if clinician.trim().is_empty() { bail!("Identiteti i profesionistit kërkohet."); }
+        let conn = self.conn.lock().unwrap();
+        let plan = value["rehab_plan_id"].as_str().unwrap_or_default();
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM orthopedic_rehab_plans WHERE id=?1)",[plan],|r|r.get::<_,bool>(0))? {
+            bail!("Protokolli i rehabilitimit nuk ekziston.");
+        }
+        let decision = value["decision"].as_str().unwrap_or_default();
+        let reason = value["reason"].as_str().unwrap_or_default();
+        let criteria = value["criteria"].as_str().unwrap_or_default();
+        if !matches!(decision, "continue"|"advance"|"hold"|"stop") ||
+            criteria.trim().is_empty() || reason.trim().is_empty() {
+            bail!("Kalimi i fazës kërkon kritere, vlerësim dhe arsye klinike.");
+        }
+        conn.execute("INSERT INTO orthopedic_rehab_phase_reviews(
+            id,rehab_plan_id,phase,criteria,decision,clinician_id,reason,reviewed_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",rusqlite::params![
+            Uuid::new_v4().to_string(),plan,value["phase"].as_str().unwrap_or_default(),
+            criteria,decision,clinician,reason,now_iso()])?;
+        Ok(())
+    }
+
+    pub fn orthopedic_reports_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id,episode_id,type,version,status,body_json,author_id,reason,created_at FROM orthopedic_report_versions WHERE episode_id=?1 ORDER BY type,version DESC")?;
+        let rows = stmt.query_map([episode_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"episode_id":r.get::<_,String>(1)?,
+            "type":r.get::<_,String>(2)?,"version":r.get::<_,i64>(3)?,
+            "status":r.get::<_,String>(4)?,"body_json":r.get::<_,String>(5)?,
+            "author_id":r.get::<_,String>(6)?,"reason":r.get::<_,String>(7)?,
+            "created_at":r.get::<_,String>(8)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn orthopedic_report_version_create(&self,value: &serde_json::Value, clinician: &str) -> anyhow::Result<serde_json::Value> {
+        if clinician.trim().is_empty() { bail!("Mjeku i identifikuar kërkohet."); }
+        let episode = value["episode_id"].as_str().unwrap_or_default();
+        let kind = value["type"].as_str().unwrap_or_default();
+        let status = value["status"].as_str().unwrap_or_default();
+        let body = value["body_json"].as_str().unwrap_or_default();
+        let reason = value["reason"].as_str().unwrap_or_default();
+        if !matches!(kind,"initial_assessment"|"fracture_followup"|"surgical_plan"|
+            "operative_report"|"implant_record"|"postoperative_followup"|
+            "rehabilitation_progress"|"final_summary") {
+            bail!("Lloji i raportit ortopedik nuk mbështetet.");
+        }
+        if !matches!(status,"draft"|"final"|"amendment") {
+            bail!("Statusi i raportit është i pavlefshëm.");
+        }
+        if body.trim().is_empty() || body.len()>200_000 {
+            bail!("Raporti kërkon përmbajtje reale dhe gjatësi të kufizuar.");
+        }
+        let _:serde_json::Value = serde_json::from_str(body)?;
+        if status=="amendment" && reason.trim().is_empty() {
+            bail!("Amendamenti i një raporti final kërkon arsye.");
+        }
+        let mut conn = self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&conn,episode)?;
+        let tx = conn.transaction()?;
+        let last:i64=tx.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM orthopedic_report_versions WHERE episode_id=?1 AND type=?2",
+            rusqlite::params![episode,kind],|r|r.get(0))?;
+        if status=="amendment" && last == 0 {
+            bail!("Nuk mund të amendohet raporti pa version paraardhës.");
+        }
+        let version = last+1;
+        let id=Uuid::new_v4().to_string(); let now=now_iso();
+        tx.execute("INSERT INTO orthopedic_report_versions(
+            id,episode_id,type,version,status,body_json,author_id,reason,created_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            rusqlite::params![id,episode,kind,version,status,body,clinician,reason,now])?;
+        tx.commit()?;
+        Ok(serde_json::json!({"id":id,"episode_id":episode,"type":kind,
+            "version":version,"status":status,"body_json":body,
+            "author_id":clinician,"reason":reason,"created_at":now}))
+    }
+}
