@@ -7020,9 +7020,23 @@ mod dental_findings_tests {
         assert_eq!(history.len(),1);
         assert_eq!(history[0]["id"],saved["id"]);
         assert_eq!(history[0]["measurements"].as_array().unwrap().len(),2);
-        assert_eq!(history[0]["measurements"][0]["bleeding"],serde_json::json!(true));
-        assert!(history[0]["measurements"][1]["probingDepthMm"].is_null());
-        assert_eq!(history[0]["measurements"][1]["gingivalMarginMm"],serde_json::json!(-1.0));
+        // SQLite sorts by tooth/site, not by the original input array index:
+        // B precedes MB. Compare by tooth+site to verify the persisted observations.
+        let measures = history[0]["measurements"].as_array().expect("measurements");
+        let mb = measures.iter().find(|m|
+            m["tooth"].as_str() == Some("16") && m["site"].as_str() == Some("MB")
+        ).expect("mesio-buccal site");
+        let b = measures.iter().find(|m|
+            m["tooth"].as_str() == Some("16") && m["site"].as_str() == Some("B")
+        ).expect("buccal site");
+        assert_eq!(mb["bleeding"],serde_json::json!(true));
+        assert_eq!(mb["plaque"],serde_json::json!(false));
+        assert!(mb["suppuration"].is_null());
+        assert!(b["probingDepthMm"].is_null());
+        assert_eq!(b["gingivalMarginMm"],serde_json::json!(-1.0));
+        assert!(b["bleeding"].is_null());
+        assert_eq!(b["plaque"],serde_json::json!(true));
+        assert_eq!(b["suppuration"],serde_json::json!(false));
     }
 
     #[test]
@@ -7085,12 +7099,27 @@ mod dental_findings_tests {
         conn.execute_batch(include_str!("../migrations/orthopedics_v2.sql")).unwrap();
         conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql")).unwrap();
         conn.execute_batch(include_str!("../migrations/orthopedics_v3.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/orthopedics_v4.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/orthopedics_v4.sql")).unwrap();
         let count: i64 = conn.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'orthopedic_%'",
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(count, 15);
+        // v4 adds orthopedic_episode_transitions to the previous 15 tables.
+        assert_eq!(count, 16);
+        for name in [
+            "orthopedic_episode_transitions",
+            "ortho_episode_transition_no_update",
+            "ortho_markers_closed_insert",
+            "ortho_implants_closed_update",
+        ] {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name=?1", [name],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(n, 1, "missing migration artifact: {}", name);
+        }
     }
 
     #[test]
