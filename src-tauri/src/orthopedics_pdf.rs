@@ -12,15 +12,10 @@ use serde_json::Value;
 const PAGE_WIDTH: f32 = 210.0;
 const PAGE_HEIGHT: f32 = 297.0;
 const LEFT: f32 = 17.0;
-const TEXT_W: f32 = 176.0;
 const POS_LOGO: &[u8] = include_bytes!("../resources/programeri-pos-logo.png");
 
 fn value<'a>(obj: &'a Value, key: &str) -> &'a str {
     obj.get(key).and_then(Value::as_str).unwrap_or("")
-}
-fn summary_value(obj: &Value, first: &str, second: &str) -> String {
-    let v = value(obj, first);
-    if !v.is_empty() { v.to_owned() } else { value(obj, second).to_owned() }
 }
 fn field(obj: &Value, key: &str, display: &str) -> Option<String> {
     let s = value(obj, key).trim();
