@@ -1518,6 +1518,13 @@ async fn orthopedic_report_export_pdf(
             let path = chosen.as_path()
                 .ok_or_else(|| "Zgjedh një vendndodhje skedari në Windows.".to_string())?;
             std::fs::write(path, &bytes).map_err(err_string)?;
+            // Open the generated PDF in Windows' registered PDF reader so the
+            // clinician sees the actual A4 document and can use its Print dialog.
+            // Never trigger WebView/window.print or run a shell command string.
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+            }
             Ok(path.display().to_string())
         }
     }).await.map_err(err_string)?
