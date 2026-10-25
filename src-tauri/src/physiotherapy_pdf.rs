@@ -1,12 +1,13 @@
 //! A4 physiotherapy care document from authoritative SQLite records, never WebView.
 use anyhow::{Context,Result};
-use printpdf::{BuiltinFont, Color, IndirectFontRef, Mm, PdfDocument,
+use printpdf::{BuiltinFont, Color, Image, ImageTransform, IndirectFontRef, Mm, PdfDocument,
     PdfDocumentReference, PdfLayerReference, Rgb};
 use serde_json::Value;
 use std::io::{BufWriter, Cursor};
 
 const W:f32=210.0;
 const H:f32=297.0;
+const POS_LOGO:&[u8]=include_bytes!("../resources/programeri-pos-logo.png");
 fn f<'a>(r:&'a Value,key:&str)->&'a str {r[key].as_str().unwrap_or("")}
 
 struct Canvas {
@@ -33,11 +34,28 @@ impl Canvas {
         self.header();
     }
     fn header(&self){
+        let mut cursor=Cursor::new(POS_LOGO);
+        if let Ok(decoder)=printpdf::image_crate::codecs::png::PngDecoder::new(&mut cursor) {
+            if let Ok(img)=Image::try_from(decoder) {
+                let w=img.image.width.0 as f32;
+                let h=img.image.height.0 as f32;
+                if w>0.0 && h>0.0 {
+                    let dpi=300.0_f32;
+                    img.add_to_layer(self.page.clone(),ImageTransform{
+                        translate_x:Some(Mm(10.0)),translate_y:Some(Mm(254.0)),
+                        rotate:None,
+                        scale_x:Some(35.0*dpi/(w*25.4)),
+                        scale_y:Some(35.0*dpi/(h*25.4)),
+                        dpi:Some(dpi)
+                    });
+                }
+            }
+        }
         self.page.set_fill_color(Color::Rgb(Rgb::new(0.0,0.42,0.51,None)));
-        self.page.use_text("PROGRAMERI POS",13.0,Mm(16.0),Mm(283.0),&self.strong);
+        self.page.use_text("PROGRAMERI POS",13.0,Mm(46.0),Mm(283.0),&self.strong);
         self.page.use_text(
             format!("Fizioterapi dhe Rehabilitim  |  Faqe {}",self.count),
-            9.0,Mm(16.0),Mm(276.0),&self.normal);
+            9.0,Mm(46.0),Mm(276.0),&self.normal);
     }
     fn line(&mut self,s:&str,bold:bool,size:f32) {
         if self.y<22.0{self.next();}
