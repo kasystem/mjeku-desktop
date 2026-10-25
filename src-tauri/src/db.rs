@@ -411,6 +411,24 @@ mod vat_service_tests {
 }
 
 impl Db {
+    fn orthopedic_require_episode(conn: &Connection, episode_id: &str) -> anyhow::Result<()> {
+        if episode_id.trim().is_empty() ||
+            !conn.query_row("SELECT EXISTS(SELECT 1 FROM orthopedic_episodes WHERE id=?1)",
+                rusqlite::params![episode_id], |r| r.get::<_, bool>(0))? {
+            bail!("Episodi ortopedik nuk ekziston.");
+        }
+        Ok(())
+    }
+
+    fn orthopedic_require_surgery(conn: &Connection, surgery_id: &str) -> anyhow::Result<()> {
+        if surgery_id.trim().is_empty() ||
+            !conn.query_row("SELECT EXISTS(SELECT 1 FROM orthopedic_surgeries WHERE id=?1)",
+                rusqlite::params![surgery_id], |r| r.get::<_, bool>(0))? {
+            bail!("Plani kirurgjik nuk ekziston.");
+        }
+        Ok(())
+    }
+
     pub fn orthopedic_episodes_list(&self, client_id: Option<String>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, client_id, diagnosis, region, laterality, status, notes, created_at, updated_at FROM orthopedic_episodes WHERE (?1 IS NULL OR client_id = ?1) ORDER BY updated_at DESC")?;
@@ -420,6 +438,16 @@ impl Db {
 
     pub fn orthopedic_episode_upsert(&self, episode: &serde_json::Value) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        let client_id = episode["client_id"].as_str().unwrap_or_default();
+        if client_id.trim().is_empty() ||
+            !conn.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1 AND deleted=0)",
+                rusqlite::params![client_id], |r| r.get::<_, bool>(0))? {
+            bail!("Episodi ortopedik duhet të lidhet me një pacient ekzistues.");
+        }
+        let side = episode["laterality"].as_str().unwrap_or_default();
+        if !matches!(side, "left" | "right" | "bilateral" | "midline" | "not_applicable") {
+            bail!("Ana anatomike nuk është e vlefshme.");
+        }
         conn.execute("INSERT INTO orthopedic_episodes (id,client_id,diagnosis,region,laterality,status,notes,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET diagnosis=excluded.diagnosis,region=excluded.region,laterality=excluded.laterality,status=excluded.status,notes=excluded.notes,updated_at=excluded.updated_at", rusqlite::params![episode["id"].as_str().unwrap_or_default(),episode["client_id"].as_str().unwrap_or_default(),episode["diagnosis"].as_str().unwrap_or_default(),episode["region"].as_str().unwrap_or_default(),episode["laterality"].as_str().unwrap_or_default(),episode["status"].as_str().unwrap_or("active"),episode["notes"].as_str().unwrap_or_default(),episode["created_at"].as_str().unwrap_or_default(),episode["updated_at"].as_str().unwrap_or_default()])?;
         drop(conn);
         self.orthopedic_audit("episode", episode["id"].as_str().unwrap_or_default(), episode)
@@ -429,20 +457,46 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let body = payload.to_string();
         conn.execute("INSERT INTO orthopedic_audit_log(id,entity_type,entity_id,action,payload_json,created_at) VALUES(?1,?2,?3,'upsert',?4,datetime('now'))", rusqlite::params![uuid::Uuid::new_v4().to_string(), entity_type, entity_id, body.clone()])?;
-        conn.execute("DELETE FROM sync_queue WHERE table_name=?1 AND row_id=?2 AND status IN ('pending','failed')", rusqlite::params![format!("orthopedic_{}", entity_type), entity_id])?;
-        conn.execute("INSERT INTO sync_queue(id,table_name,row_id,op,payload,created_at,status) VALUES(?1,?2,?3,'upsert',?4,datetime('now'),'pending')", rusqlite::params![uuid::Uuid::new_v4().to_string(), format!("orthopedic_{}", entity_type), entity_id, body])?;
+        // Do NOT enqueue orthopedics records into the existing generic sync
+        // queue: Supabase MJEKU has no versioned orthopedic remote schema yet.
+        // Queuing them would repeatedly fail, and last-write-wins risks loss
+        // of finalized clinical records. Keep local audit immutable until
+        // an authenticated, conflict-aware clinical sync migration is deployed.
         Ok(())
     }
 
     pub fn orthopedic_surgery_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
-        let c=self.conn.lock().unwrap(); let now=v["created_at"].as_str().unwrap_or_default();
+        let c=self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&c, v["episode_id"].as_str().unwrap_or_default())?;
+        if matches!(v["status"].as_str().unwrap_or("draft"), "in_progress" | "completed") {
+            bail!("Plani kirurgjik nuk është raport operativ. Regjistro ndërhyrjen reale veçmas.");
+        } let now=v["created_at"].as_str().unwrap_or_default();
         c.execute("INSERT INTO orthopedic_surgeries(id,episode_id,procedure,status,side,site,team,consent_status,planned_date,preop_checklist,postop_plan,payload_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13) ON CONFLICT(id) DO UPDATE SET procedure=excluded.procedure,status=excluded.status,side=excluded.side,site=excluded.site,team=excluded.team,consent_status=excluded.consent_status,planned_date=excluded.planned_date,preop_checklist=excluded.preop_checklist,postop_plan=excluded.postop_plan,payload_json=excluded.payload_json,updated_at=excluded.updated_at", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["procedure"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("draft"),v["side"].as_str().unwrap_or_default(),v["site"].as_str().unwrap_or_default(),v["team"].as_str().unwrap_or_default(),v["consent_status"].as_str().unwrap_or("pending"),v["planned_date"].as_str().unwrap_or_default(),v["preop_checklist"].as_str().unwrap_or_default(),v["postop_plan"].as_str().unwrap_or_default(),v.to_string(),now])?; Ok(())
     }
     pub fn orthopedic_implant_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
-        let c=self.conn.lock().unwrap(); c.execute("INSERT INTO orthopedic_implants(id,surgery_id,udi,lot,serial,status,manufacturer,model,catalog_ref,udi_di,udi_pi,expiration_date,sterility_status,anatomical_site,implantation_date,removal_status,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(id) DO UPDATE SET serial=excluded.serial,status=excluded.status,manufacturer=excluded.manufacturer,model=excluded.model,catalog_ref=excluded.catalog_ref,udi_di=excluded.udi_di,udi_pi=excluded.udi_pi,expiration_date=excluded.expiration_date,sterility_status=excluded.sterility_status,anatomical_site=excluded.anatomical_site,implantation_date=excluded.implantation_date,removal_status=excluded.removal_status,payload_json=excluded.payload_json", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["surgery_id"].as_str().unwrap_or_default(),v["udi"].as_str().unwrap_or_default(),v["lot"].as_str().unwrap_or_default(),v["serial"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("reserved"),v["manufacturer"].as_str().unwrap_or_default(),v["model"].as_str().unwrap_or_default(),v["catalog_ref"].as_str().unwrap_or_default(),v["udi_di"].as_str().unwrap_or_default(),v["udi_pi"].as_str().unwrap_or_default(),v["expiration_date"].as_str().unwrap_or_default(),v["sterility_status"].as_str().unwrap_or_default(),v["anatomical_site"].as_str().unwrap_or_default(),v["implantation_date"].as_str().unwrap_or_default(),v["removal_status"].as_str().unwrap_or("in_body"),v.to_string(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+        let c=self.conn.lock().unwrap();
+        Self::orthopedic_require_surgery(&c, v["surgery_id"].as_str().unwrap_or_default())?;
+        let id = v["id"].as_str().unwrap_or_default();
+        let serial = v["serial"].as_str().unwrap_or_default().trim();
+        let status = v["status"].as_str().unwrap_or("reserved");
+        if status == "implanted" {
+            if v["sterility_status"].as_str() != Some("sterile") {
+                bail!("Implanti nuk është konfirmuar steril.");
+            }
+            let expires = v["expiration_date"].as_str().unwrap_or_default();
+            if !expires.is_empty() && expires < chrono::Utc::now().format("%Y-%m-%d").to_string().as_str() {
+                bail!("Implanti ka skaduar dhe nuk mund të konfirmohet.");
+            }
+            if !serial.is_empty() && c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orthopedic_implants WHERE serial=?1 AND id<>?2 AND status='implanted' AND removal_status='in_body')",
+                rusqlite::params![serial,id], |r| r.get::<_, bool>(0))? {
+                bail!("Ky numër serial tashmë është implantuar te një pacient tjetër.");
+            }
+        } c.execute("INSERT INTO orthopedic_implants(id,surgery_id,udi,lot,serial,status,manufacturer,model,catalog_ref,udi_di,udi_pi,expiration_date,sterility_status,anatomical_site,implantation_date,removal_status,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(id) DO UPDATE SET serial=excluded.serial,status=excluded.status,manufacturer=excluded.manufacturer,model=excluded.model,catalog_ref=excluded.catalog_ref,udi_di=excluded.udi_di,udi_pi=excluded.udi_pi,expiration_date=excluded.expiration_date,sterility_status=excluded.sterility_status,anatomical_site=excluded.anatomical_site,implantation_date=excluded.implantation_date,removal_status=excluded.removal_status,payload_json=excluded.payload_json", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["surgery_id"].as_str().unwrap_or_default(),v["udi"].as_str().unwrap_or_default(),v["lot"].as_str().unwrap_or_default(),v["serial"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("reserved"),v["manufacturer"].as_str().unwrap_or_default(),v["model"].as_str().unwrap_or_default(),v["catalog_ref"].as_str().unwrap_or_default(),v["udi_di"].as_str().unwrap_or_default(),v["udi_pi"].as_str().unwrap_or_default(),v["expiration_date"].as_str().unwrap_or_default(),v["sterility_status"].as_str().unwrap_or_default(),v["anatomical_site"].as_str().unwrap_or_default(),v["implantation_date"].as_str().unwrap_or_default(),v["removal_status"].as_str().unwrap_or("in_body"),v.to_string(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
     }
     pub fn orthopedic_rehab_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
-        let c=self.conn.lock().unwrap(); c.execute("INSERT INTO orthopedic_rehab_plans(id,episode_id,protocol,phase,load_restrictions,rom_restrictions,approving_surgeon,start_date,status,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET protocol=excluded.protocol,phase=excluded.phase,load_restrictions=excluded.load_restrictions,rom_restrictions=excluded.rom_restrictions,approving_surgeon=excluded.approving_surgeon,start_date=excluded.start_date,status=excluded.status,payload_json=excluded.payload_json", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["protocol"].as_str().unwrap_or_default(),v["phase"].as_str().unwrap_or("phase_1"),v["load_restrictions"].as_str().unwrap_or_default(),v["rom_restrictions"].as_str().unwrap_or_default(),v["approving_surgeon"].as_str().unwrap_or_default(),v["start_date"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("active"),v.to_string(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
+        let c=self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&c, v["episode_id"].as_str().unwrap_or_default())?; c.execute("INSERT INTO orthopedic_rehab_plans(id,episode_id,protocol,phase,load_restrictions,rom_restrictions,approving_surgeon,start_date,status,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET protocol=excluded.protocol,phase=excluded.phase,load_restrictions=excluded.load_restrictions,rom_restrictions=excluded.rom_restrictions,approving_surgeon=excluded.approving_surgeon,start_date=excluded.start_date,status=excluded.status,payload_json=excluded.payload_json", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["protocol"].as_str().unwrap_or_default(),v["phase"].as_str().unwrap_or("phase_1"),v["load_restrictions"].as_str().unwrap_or_default(),v["rom_restrictions"].as_str().unwrap_or_default(),v["approving_surgeon"].as_str().unwrap_or_default(),v["start_date"].as_str().unwrap_or_default(),v["status"].as_str().unwrap_or("active"),v.to_string(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
     }
 
     // Keep the full structured payload for existing WIP records. The linked
@@ -479,6 +533,12 @@ impl Db {
     }
     pub fn orthopedic_marker_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
         let c = self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&c, v["episode_id"].as_str().unwrap_or_default())?;
+        let x = v["x"].as_f64().ok_or_else(|| anyhow!("Mungon koordinata X."))?;
+        let y = v["y"].as_f64().ok_or_else(|| anyhow!("Mungon koordinata Y."))?;
+        if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+            bail!("Markerët skeletorë kërkojnë koordinata të normalizuara 0..1.");
+        }
         c.execute("INSERT INTO orthopedic_markers(id,episode_id,view,region,side,injury_type,note,x,y,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO UPDATE SET view=excluded.view,region=excluded.region,side=excluded.side,injury_type=excluded.injury_type,note=excluded.note,x=excluded.x,y=excluded.y", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["view"].as_str().unwrap_or("anterior"),v["region"].as_str().unwrap_or_default(),v["side"].as_str().unwrap_or_default(),v["injury_type"].as_str().unwrap_or_default(),v["note"].as_str().unwrap_or_default(),v["x"].as_f64().unwrap_or(0.0),v["y"].as_f64().unwrap_or(0.0),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
     }
 
@@ -490,6 +550,13 @@ impl Db {
     }
     pub fn orthopedic_assessment_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
         let c = self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&c, v["episode_id"].as_str().unwrap_or_default())?;
+        let category = v["category"].as_str().unwrap_or("rom");
+        if !matches!(category, "rom" | "special_test" | "deformity") { bail!("Kategori vlerësimi e pavlefshme."); }
+        if category == "special_test" && !matches!(v["test_result"].as_str().unwrap_or_default(),
+            "positive" | "negative" | "indeterminate" | "not_performed") {
+            bail!("Testi special kërkon status të vlefshëm, përfshirë not_performed.");
+        }
         c.execute("INSERT INTO orthopedic_assessments(id,episode_id,payload_json,category,joint,movement,method,degrees,pain,test_name,test_result,note,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json,category=excluded.category,joint=excluded.joint,movement=excluded.movement,method=excluded.method,degrees=excluded.degrees,pain=excluded.pain,test_name=excluded.test_name,test_result=excluded.test_result,note=excluded.note", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v.to_string(),v["category"].as_str().unwrap_or("rom"),v["joint"].as_str().unwrap_or_default(),v["movement"].as_str().unwrap_or_default(),v["method"].as_str().unwrap_or("clinical"),v["degrees"].as_str().unwrap_or_default(),v["pain"].as_str().unwrap_or_default(),v["test_name"].as_str().unwrap_or_default(),v["test_result"].as_str().unwrap_or_default(),v["note"].as_str().unwrap_or_default(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
     }
 
@@ -501,6 +568,11 @@ impl Db {
     }
     pub fn orthopedic_fracture_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
         let c = self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&c, v["episode_id"].as_str().unwrap_or_default())?;
+        if !matches!(v["current_status"].as_str().unwrap_or("unknown"),
+            "unknown" | "under_treatment" | "healing" | "healed" | "delayed_union" | "nonunion" | "malunion") {
+            bail!("Statusi i frakturës është i pavlefshëm.");
+        }
         c.execute("INSERT INTO orthopedic_fractures(id,episode_id,payload_json,bone_region,laterality,segment,fracture_pattern,open_closed,displacement,classification,classification_source,injury_date,treatment_strategy,current_status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json,bone_region=excluded.bone_region,laterality=excluded.laterality,segment=excluded.segment,fracture_pattern=excluded.fracture_pattern,open_closed=excluded.open_closed,displacement=excluded.displacement,classification=excluded.classification,classification_source=excluded.classification_source,injury_date=excluded.injury_date,treatment_strategy=excluded.treatment_strategy,current_status=excluded.current_status", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v.to_string(),v["bone_region"].as_str().unwrap_or_default(),v["laterality"].as_str().unwrap_or_default(),v["segment"].as_str().unwrap_or_default(),v["fracture_pattern"].as_str().unwrap_or_default(),v["open_closed"].as_str().unwrap_or("closed"),v["displacement"].as_str().unwrap_or_default(),v["classification"].as_str().unwrap_or_default(),v["classification_source"].as_str().unwrap_or_default(),v["injury_date"].as_str().unwrap_or_default(),v["treatment_strategy"].as_str().unwrap_or_default(),v["current_status"].as_str().unwrap_or("unknown"),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
     }
 
@@ -512,6 +584,7 @@ impl Db {
     }
     pub fn orthopedic_imaging_link_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
         let c = self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&c, v["episode_id"].as_str().unwrap_or_default())?;
         c.execute("INSERT INTO orthopedic_imaging_links(id,episode_id,fracture_id,study_ref,modality,taken_at,reviewer_note,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET fracture_id=excluded.fracture_id,study_ref=excluded.study_ref,modality=excluded.modality,taken_at=excluded.taken_at,reviewer_note=excluded.reviewer_note", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["fracture_id"].as_str().unwrap_or_default(),v["study_ref"].as_str().unwrap_or_default(),v["modality"].as_str().unwrap_or_default(),v["taken_at"].as_str().unwrap_or_default(),v["reviewer_note"].as_str().unwrap_or_default(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
     }
 
@@ -523,6 +596,7 @@ impl Db {
     }
     pub fn orthopedic_postop_visit_upsert(&self, v: &serde_json::Value) -> anyhow::Result<()> {
         let c = self.conn.lock().unwrap();
+        Self::orthopedic_require_episode(&c, v["episode_id"].as_str().unwrap_or_default())?;
         c.execute("INSERT INTO orthopedic_postop_visits(id,episode_id,surgery_id,visit_date,findings,complications,next_step,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET surgery_id=excluded.surgery_id,visit_date=excluded.visit_date,findings=excluded.findings,complications=excluded.complications,next_step=excluded.next_step", rusqlite::params![v["id"].as_str().unwrap_or_default(),v["episode_id"].as_str().unwrap_or_default(),v["surgery_id"].as_str().unwrap_or_default(),v["visit_date"].as_str().unwrap_or_default(),v["findings"].as_str().unwrap_or_default(),v["complications"].as_str().unwrap_or_default(),v["next_step"].as_str().unwrap_or_default(),v["created_at"].as_str().unwrap_or_default()])?; Ok(())
     }
 
