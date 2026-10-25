@@ -1322,6 +1322,67 @@ impl Db {
         ).optional()?.ok_or_else(||anyhow!("Versioni i raportit nuk u gjet."))
     }
 
+    pub fn physiotherapy_document_register(
+        &self,episode:&str,category:&str,filename:&str,
+        relative_path:&str,sha256:&str,size:i64,source_note:&str,actor:&str
+    )->anyhow::Result<serde_json::Value>{
+        if !matches!(category,"assessment"|"progress"|"discharge"|"other") ||
+            actor.trim().is_empty() || filename.trim().is_empty() ||
+            source_note.chars().count()>2000 || size < 100 || size > 20*1024*1024 ||
+            sha256.len()!=64 || !sha256.bytes().all(|b|b.is_ascii_hexdigit()) ||
+            !relative_path.starts_with("rehab-pdf/") {
+            bail!("Regjistrimi i dokumentit klinik është i pavlefshëm.");
+        }
+        let conn=self.conn.lock().unwrap();
+        let client:String=conn.query_row(
+            "SELECT client_id FROM orthopedic_episodes WHERE id=?1 AND status='active'",
+            [episode],|r|r.get(0)).optional()?.ok_or_else(
+                ||anyhow!("Episodi ortopedik nuk është aktiv."))?;
+        let id=Uuid::new_v4().to_string();let created=now_iso();
+        conn.execute(
+            "INSERT INTO physiotherapy_documents
+             (id,orthopedic_episode_id,client_id,category,display_name,storage_path,
+              content_sha256,content_size,source_note,clinician_id,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            rusqlite::params![id,episode,client,category,filename,relative_path,
+                sha256,size,source_note,actor,created]
+        )?;
+        Ok(serde_json::json!({
+            "id":id,"orthopedic_episode_id":episode,"client_id":client,
+            "category":category,"display_name":filename,
+            "content_sha256":sha256,"content_size":size,
+            "source_note":source_note,"clinician_id":actor,"created_at":created
+        }))
+    }
+
+    pub fn physiotherapy_documents_list(&self,episode:&str)
+        ->anyhow::Result<Vec<serde_json::Value>>{
+        let conn=self.conn.lock().unwrap();
+        let mut stmt=conn.prepare(
+            "SELECT id,orthopedic_episode_id,client_id,category,display_name,
+             content_sha256,content_size,source_note,clinician_id,created_at
+             FROM physiotherapy_documents WHERE orthopedic_episode_id=?1
+             ORDER BY created_at DESC")?;
+        let rows=stmt.query_map([episode],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"orthopedic_episode_id":r.get::<_,String>(1)?,
+            "client_id":r.get::<_,String>(2)?,"category":r.get::<_,String>(3)?,
+            "display_name":r.get::<_,String>(4)?,"content_sha256":r.get::<_,String>(5)?,
+            "content_size":r.get::<_,i64>(6)?,"source_note":r.get::<_,String>(7)?,
+            "clinician_id":r.get::<_,String>(8)?,"created_at":r.get::<_,String>(9)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_document_file(&self,id:&str)
+        ->anyhow::Result<(String,String)>{
+        let conn=self.conn.lock().unwrap();
+        let row=conn.query_row(
+            "SELECT storage_path,content_sha256 FROM physiotherapy_documents WHERE id=?1",
+            [id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))
+        ).optional()?.ok_or_else(||anyhow!("Dokumenti nuk u gjet."))?;
+        Ok(row)
+    }
+
     pub fn orthopedic_episodes_list(&self, client_id: Option<String>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, client_id, diagnosis, region, laterality, status, notes, created_at, updated_at FROM orthopedic_episodes WHERE (?1 IS NULL OR client_id = ?1) ORDER BY updated_at DESC")?;
@@ -1790,6 +1851,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/orthopedics_v4.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v2.sql"))?;
+        conn.execute_batch(include_str!("../migrations/physiotherapy_v3.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -1815,6 +1877,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/orthopedics_v4.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v2.sql"))?;
+        conn.execute_batch(include_str!("../migrations/physiotherapy_v3.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
