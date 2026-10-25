@@ -1133,7 +1133,7 @@ impl Db {
             "version":version,"status":status,"goal":goal,
             "measurable_target":v["measurable_target"],"frequency":v["frequency"],
             "duration":v["duration"],"interventions":v["interventions"],
-            "precautions":v["precautions"],"phase":v["phase"],
+            "precautions":v["precautions"],"phase":source_phase,
             "clinician_id":actor,"reason":reason.trim(),"created_at":now}))
     }
 
