@@ -3,6 +3,7 @@ mod db;
 mod desktop_updates;
 mod error_logs;
 mod invoice;
+mod orthopedics_pdf;
 mod lab_devices;
 mod license_engine;
 mod models;
@@ -1476,6 +1477,50 @@ async fn orthopedic_rehab_phase_review_add(
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_rehab_phase_review_add(&value,&clinician))
         .await.map_err(err_string)?.map_err(err_string)
+}
+
+/// Native A4 PDF export of an existing, immutable clinical report version.
+/// The report/patient data come from SQLite, not from the webview DOM.
+#[tauri::command]
+async fn orthopedic_report_export_pdf(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    report_id: String,
+) -> Result<String, String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    if report_id.trim().is_empty() {
+        return Err("Zgjidh një raport të ruajtur për eksport.".to_string());
+    }
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let record = db.orthopedic_report_pdf_data(&report_id).map_err(err_string)?;
+        let clinic = db.setting_get("clinic_name")
+            .map_err(err_string)?
+            .unwrap_or_else(|| "Klinika".to_string());
+        let bytes = crate::orthopedics_pdf::render_orthopedic_pdf(&record, &clinic)
+            .map_err(err_string)?;
+        let version = record["version"].as_i64().unwrap_or(1);
+        let id: String = report_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect();
+        let filename = format!("Ortopedi-Raport-v{}-{}.pdf", version, id);
+        #[cfg(mobile)]
+        {
+            return save_pdf_via_dialog(&app, &filename, &bytes);
+        }
+        #[cfg(desktop)]
+        {
+            use tauri_plugin_dialog::DialogExt;
+            let chosen = app.dialog().file()
+                .set_title("Ruaj raportin klinik PDF - A4")
+                .set_file_name(&filename)
+                .add_filter("PDF", &["pdf"])
+                .blocking_save_file()
+                .ok_or_else(|| "Ruajtja e PDF u anulua.".to_string())?;
+            let path = chosen.as_path()
+                .ok_or_else(|| "Zgjedh një vendndodhje skedari në Windows.".to_string())?;
+            std::fs::write(path, &bytes).map_err(err_string)?;
+            Ok(path.display().to_string())
+        }
+    }).await.map_err(err_string)?
 }
 
 #[tauri::command]
@@ -4781,6 +4826,7 @@ pub fn run() {
             orthopedic_rehab_phase_reviews_list,
             orthopedic_rehab_phase_review_add,
             orthopedic_reports_list,
+            orthopedic_report_export_pdf,
             orthopedic_report_version_create,
             orthopedic_implant_upsert,
             orthopedic_rehab_upsert,
