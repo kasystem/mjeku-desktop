@@ -87,3 +87,33 @@ separate `Fizioterapi.docx` did not previously exist; the new specification is
 
 **Code is committed, but current new Physiotherapy changes are not yet
 confirmed by a user-provided Windows build/test run. No CI and no merge.**
+
+## F2–F4 extension, 2026-10-26 (new commits, NOT Windows-verified)
+
+The initial referral/session flow described above has been extended through
+additional additive SQLite migrations `physiotherapy_v2.sql`,
+`physiotherapy_v3.sql` and `physiotherapy_v4.sql`:
+
+- Shared, append-only assessments for ROM/MMT/NRS and versioned functional
+  instruments, with explicit correction events.
+- Physiotherapy's own versioned SMART care plans, synchronized to the
+  approved source phase (no automatic phase advancement).
+- Clinician-authored exercises and approved HEP prescriptions with dose,
+  exercise video provenance, precautions and adherence observations.
+- New care-plan versions or changed orthopedic restrictions invalidate
+  an earlier HEP prescription pending clinical review.
+- Native A4 referral PDFs available straight from the orthopedic rehab plan.
+- Versioned physiotherapist reports appear in the orthopedic rehab view.
+- The orthopedic episode can also retain and reopen independently supplied
+  rehabilitation PDFs, verified by SHA-256 and immutable metadata.
+- Physiotherapy reports are native A4 PDF files generated from the saved
+  clinical report, not from WebView.
+
+See `docs/PHYSIOTHERAPY_IMPLEMENTATION_2026_10.md` for the implementation
+map, privacy/safety boundaries and full acceptance checklist.
+
+**Previous text above reflects v1 status only.** The full physiotherapy
+specialty is not ready for clinical release without verified role policies,
+patient-specific ACL, independent physiotherapy case creation, safe
+clinical data exchange, end-to-end tests and institutional approval.
+No CI or merge.
