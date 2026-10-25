@@ -1295,75 +1295,110 @@ async fn settings_get_all(
     Ok(map)
 }
 
+/// Clinical data is not available to cashier or logs-only accounts.
+async fn require_orthopedic_clinician(
+    state: &tauri::State<'_, AppState>,
+) -> Result<SessionKind, String> {
+    let session = require_login(state).await?;
+    match session {
+        SessionKind::Doctor { .. } |
+        SessionKind::User { role: crate::auth::UserRole::Owner } => Ok(session),
+        _ => Err("Kërkohet rol klinik për të dhënat ortopedike.".to_string()),
+    }
+}
+
+/// Only a doctor may authorize actual surgery or implantation; a clinic
+/// administrator can manage clinic settings but cannot certify procedures.
+async fn require_orthopedic_surgeon(
+    state: &tauri::State<'_, AppState>,
+) -> Result<SessionKind, String> {
+    let session = require_orthopedic_clinician(state).await?;
+    match session {
+        SessionKind::Doctor { .. } => Ok(session),
+        _ => Err("Vetëm mjeku i identifikuar mund të finalizojë ndërhyrje/implante.".to_string()),
+    }
+}
+
 #[tauri::command]
 async fn orthopedic_episodes_list(state: tauri::State<'_, AppState>, client_id: Option<String>) -> Result<Vec<serde_json::Value>, String> {
-    let _ = require_login(&state).await?;
+    let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_episodes_list(client_id)).await.map_err(err_string)?.map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_episode_upsert(state: tauri::State<'_, AppState>, episode: serde_json::Value) -> Result<(), String> {
-    let _ = require_login(&state).await?;
+    let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_episode_upsert(&episode)).await.map_err(err_string)?.map_err(err_string)
 }
 
 #[tauri::command]
-async fn orthopedic_surgery_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_surgery_upsert(&value)?; db.orthopedic_audit("surgery",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_surgery_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> {
+    let status = value["status"].as_str().unwrap_or("draft");
+    if matches!(status, "approved" | "scheduled" | "ready" | "in_progress" | "completed") {
+        let _ = require_orthopedic_surgeon(&state).await?;
+    } else {
+        let _ = require_orthopedic_clinician(&state).await?;
+    } let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_surgery_upsert(&value)?; db.orthopedic_audit("surgery",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 #[tauri::command]
-async fn orthopedic_implant_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_implant_upsert(&value)?; db.orthopedic_audit("implant",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_implant_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> {
+    if value["status"].as_str() == Some("implanted") {
+        let _ = require_orthopedic_surgeon(&state).await?;
+    } else {
+        let _ = require_orthopedic_clinician(&state).await?;
+    } let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_implant_upsert(&value)?; db.orthopedic_audit("implant",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 #[tauri::command]
-async fn orthopedic_rehab_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_rehab_upsert(&value)?; db.orthopedic_audit("rehab",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_rehab_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_rehab_upsert(&value)?; db.orthopedic_audit("rehab",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 
 #[tauri::command]
 async fn orthopedic_surgeries_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
-    let _ = require_login(&state).await?;
+    let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_surgeries_list(&episode_id)).await.map_err(err_string)?.map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_implants_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
-    let _ = require_login(&state).await?;
+    let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_implants_list(&episode_id)).await.map_err(err_string)?.map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_rehab_plans_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
-    let _ = require_login(&state).await?;
+    let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_rehab_plans_list(&episode_id)).await.map_err(err_string)?.map_err(err_string)
 }
 
 #[tauri::command]
-async fn orthopedic_markers_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_markers_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_markers_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_markers_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
 #[tauri::command]
-async fn orthopedic_marker_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_marker_upsert(&value)?; db.orthopedic_audit("marker",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_marker_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_marker_upsert(&value)?; db.orthopedic_audit("marker",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 
 #[tauri::command]
-async fn orthopedic_assessments_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_assessments_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_assessments_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_assessments_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
 #[tauri::command]
-async fn orthopedic_assessment_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_assessment_upsert(&value)?; db.orthopedic_audit("assessment",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_assessment_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_assessment_upsert(&value)?; db.orthopedic_audit("assessment",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 
 #[tauri::command]
-async fn orthopedic_fractures_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_fractures_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_fractures_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_fractures_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
 #[tauri::command]
-async fn orthopedic_fracture_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_fracture_upsert(&value)?; db.orthopedic_audit("fracture",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_fracture_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_fracture_upsert(&value)?; db.orthopedic_audit("fracture",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 
 #[tauri::command]
-async fn orthopedic_imaging_links_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_imaging_links_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_imaging_links_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_imaging_links_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
 #[tauri::command]
-async fn orthopedic_imaging_link_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_imaging_link_upsert(&value)?; db.orthopedic_audit("imaging_link",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_imaging_link_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_imaging_link_upsert(&value)?; db.orthopedic_audit("imaging_link",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 
 #[tauri::command]
-async fn orthopedic_postop_visits_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_postop_visits_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_postop_visits_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_postop_visits_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
 #[tauri::command]
-async fn orthopedic_postop_visit_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_postop_visit_upsert(&value)?; db.orthopedic_audit("postop_visit",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_postop_visit_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_postop_visit_upsert(&value)?; db.orthopedic_audit("postop_visit",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
 
 #[tauri::command]
-async fn orthopedic_implants_search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<serde_json::Value>, String> { let _=require_login(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_implants_search(&query)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_implants_search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_implants_search(&query)).await.map_err(err_string)?.map_err(err_string) }
 
 #[tauri::command]
 async fn settings_set(
