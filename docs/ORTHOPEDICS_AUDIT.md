@@ -30,3 +30,22 @@ Desktop `src-tauri/src/db.rs`, `src-tauri/src/lib.rs`,
 
 **No claims of completed medical certification, E2E PACS, inventory transaction or passed Windows build.**
 Clinical specialist validation is required before live patient use.
+
+## Update — 2026-10-25: episode lifecycle (v4)
+
+The previous **episode discharge/closure state machine** gap is now implemented
+in the active development branches (not yet build-verified). Added:
+- Clinician-authorized `close`/`reopen` Tauri commands.
+- Mandatory signed `final_summary` report before closing.
+- Transactional episode status change with append-only clinician/reason history.
+- Database triggers guarding clinical writes to closed episodes, including
+  indirectly linked implants and rehabilitation reviews.
+- Signed report amendments remain possible, but ordinary draft/final writes
+  to a closed episode are rejected.
+- Visible status panel/history UI and two Rust regression test cases.
+- Dedicated workflow and verification docs.
+
+See `docs/ORTHOPEDICS_WORKFLOWS.md`, `docs/ORTHOPEDICS_TEST_REPORT.md`,
+and `src-tauri/migrations/orthopedics_v4.sql`. Remaining PACS, shared
+inventory, Physiotherapy, synchronization, and platform verification gaps
+are **unchanged**. Not certified or approved for clinical release.
