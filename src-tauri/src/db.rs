@@ -429,6 +429,70 @@ mod orthopedic_lifecycle_tests {
     }
 
     #[test]
+    fn physiotherapy_link_preserves_patient_and_immutable_session_history() {
+        let db=setup_episode();
+        db.orthopedic_rehab_upsert(&serde_json::json!({
+            "id":"rehab-p0","episode_id":"ortho-episode","protocol":"Postoperative knee",
+            "phase":"phase_1","load_restrictions":"No full weight bearing",
+            "rom_restrictions":"Flexion maximum 60 degrees",
+            "status":"active","created_at":"2026-10-25T18:00:00Z"
+        })).expect("source orthopedic protocol");
+        assert!(db.physiotherapy_referral_create("ortho-episode","unknown-plan","doctor-a").is_err());
+        let referral=db.physiotherapy_referral_create(
+            "ortho-episode","rehab-p0","doctor-a"
+        ).expect("referral from real orthopedic plan");
+        assert_eq!(referral["client_id"],"ortho-patient");
+        let repeat=db.physiotherapy_referral_create(
+            "ortho-episode","rehab-p0","doctor-a"
+        ).unwrap();
+        assert_eq!(referral["id"],repeat["id"],"referrals are idempotent per plan");
+        let episode_id=referral["id"].as_str().unwrap();
+        let list=db.physiotherapy_episodes_list(Some("ortho-episode".into())).unwrap();
+        assert_eq!(list.len(),1);
+        assert_eq!(list[0]["patient_name"],"Test Patient");
+        assert_eq!(list[0]["load_restrictions"],"No full weight bearing");
+        assert_eq!(list[0]["rom_restrictions"],"Flexion maximum 60 degrees");
+
+        let session=serde_json::json!({
+            "physiotherapy_episode_id":episode_id,
+            "session_date":"2026-10-25","intervention":"Supervised ROM exercise",
+            "response":"Tolerated within restrictions",
+            "pain_before":5,"pain_after":3,"rom_joint":"Knee",
+            "rom_movement":"Flexion","rom_degrees":50.0,"mmt_grade":3,
+            "next_plan":"Repeat only with therapist"
+        });
+        assert!(db.physiotherapy_session_add(&session,"").is_err());
+        let row=db.physiotherapy_session_add(&session,"doctor-a").unwrap();
+        assert_eq!(row["pain_before"],5);
+        assert_eq!(row["pain_after"],3);
+        let history=db.physiotherapy_sessions_list(episode_id).unwrap();
+        assert_eq!(history.len(),1);
+        assert_eq!(history[0]["rom_degrees"],50.0);
+        assert_eq!(history[0]["therapist_id"],"doctor-a");
+
+        let conn=db.conn.lock().unwrap();
+        assert!(conn.execute("UPDATE physiotherapy_sessions SET pain_after=0 WHERE id=?1",
+            [row["id"].as_str().unwrap()]).is_err());
+        drop(conn);
+        db.orthopedic_report_version_create(&serde_json::json!({
+            "episode_id":"ortho-episode","type":"final_summary","status":"final",
+            "body_json":"{\"narrative\":\"Discharge referral test\"}"
+        }),"doctor-a").unwrap();
+        db.orthopedic_episode_transition(
+            "ortho-episode","close","Clinically complete after rehabilitation","doctor-a"
+        ).unwrap();
+        assert!(db.physiotherapy_session_add(&session,"doctor-a").is_err());
+        // A bypass of Tauri still cannot insert while linked orthopedics is closed.
+        let conn=db.conn.lock().unwrap();
+        assert!(conn.execute(
+            "INSERT INTO physiotherapy_sessions(
+             id,physiotherapy_episode_id,session_date,therapist_id,intervention,created_at)
+             VALUES('fake-bypass',?1,'2026-10-26','fake','Unauthorized','2026-10-26')",
+            [episode_id]
+        ).is_err());
+    }
+
+    #[test]
     fn pdf_data_uses_persisted_patient_and_report_version() {
         let db = setup_episode();
         assert!(db.orthopedic_report_pdf_data("nonexistent-report").is_err());
