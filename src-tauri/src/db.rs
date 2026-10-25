@@ -501,6 +501,112 @@ impl Db {
 
     // Keep the full structured payload for existing WIP records. The linked
     // episode is verified by SQL JOIN; records never leak across patients.
+    pub fn orthopedic_fracture_followups_list(&self, fracture_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id,fracture_id,episode_id,assessment_date,clinical_findings,pain_score,functional_status,alignment,healing_status,imaging_ref,complications,treatment_changes,next_step,clinician_id,created_at FROM orthopedic_fracture_followups WHERE fracture_id=?1 ORDER BY assessment_date,created_at")?;
+        let rows = stmt.query_map(rusqlite::params![fracture_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?, "fracture_id":r.get::<_,String>(1)?,
+            "episode_id":r.get::<_,String>(2)?, "assessment_date":r.get::<_,String>(3)?,
+            "clinical_findings":r.get::<_,String>(4)?, "pain_score":r.get::<_,Option<i64>>(5)?,
+            "functional_status":r.get::<_,String>(6)?, "alignment":r.get::<_,String>(7)?,
+            "healing_status":r.get::<_,String>(8)?, "imaging_ref":r.get::<_,String>(9)?,
+            "complications":r.get::<_,String>(10)?, "treatment_changes":r.get::<_,String>(11)?,
+            "next_step":r.get::<_,String>(12)?, "clinician_id":r.get::<_,String>(13)?,
+            "created_at":r.get::<_,String>(14)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn orthopedic_fracture_followup_add(&self, v: &serde_json::Value, clinician_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let episode = v["episode_id"].as_str().unwrap_or_default();
+        Self::orthopedic_require_episode(&conn, episode)?;
+        let fracture = v["fracture_id"].as_str().unwrap_or_default();
+        let owner: Option<String> = conn.query_row(
+            "SELECT episode_id FROM orthopedic_fractures WHERE id=?1", [fracture], |r| r.get(0)
+        ).optional()?;
+        if owner.as_deref() != Some(episode) { bail!("Fraktura nuk i përket episodit të zgjedhur."); }
+        if v["assessment_date"].as_str().unwrap_or_default().trim().is_empty()
+           || clinician_id.trim().is_empty() { bail!("Kontrolli kërkon datë dhe mjekun vlerësues."); }
+        conn.execute("INSERT INTO orthopedic_fracture_followups
+            (id,fracture_id,episode_id,assessment_date,clinical_findings,pain_score,functional_status,alignment,healing_status,imaging_ref,complications,treatment_changes,next_step,clinician_id,created_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            rusqlite::params![
+                v["id"].as_str().unwrap_or_default(),fracture,episode,
+                v["assessment_date"].as_str().unwrap_or_default(),
+                v["clinical_findings"].as_str().unwrap_or_default(),
+                v["pain_score"].as_i64(),
+                v["functional_status"].as_str().unwrap_or_default(),
+                v["alignment"].as_str().unwrap_or_default(),
+                v["healing_status"].as_str().unwrap_or("unknown"),
+                v["imaging_ref"].as_str().unwrap_or_default(),
+                v["complications"].as_str().unwrap_or_default(),
+                v["treatment_changes"].as_str().unwrap_or_default(),
+                v["next_step"].as_str().unwrap_or_default(),
+                clinician_id,now_iso()
+            ])?;
+        Ok(())
+    }
+
+    pub fn orthopedic_operations_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id,plan_id,episode_id,actual_procedure,operative_site,laterality,start_at,end_at,surgical_team,findings,technique,complications,operative_note,postop_instructions,surgeon_id,finalized_at FROM orthopedic_operations WHERE episode_id=?1 ORDER BY finalized_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![episode_id], |r| Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?, "plan_id":r.get::<_,String>(1)?,
+            "episode_id":r.get::<_,String>(2)?, "actual_procedure":r.get::<_,String>(3)?,
+            "operative_site":r.get::<_,String>(4)?, "laterality":r.get::<_,String>(5)?,
+            "start_at":r.get::<_,String>(6)?, "end_at":r.get::<_,String>(7)?,
+            "surgical_team":r.get::<_,String>(8)?, "findings":r.get::<_,String>(9)?,
+            "technique":r.get::<_,String>(10)?, "complications":r.get::<_,String>(11)?,
+            "operative_note":r.get::<_,String>(12)?, "postop_instructions":r.get::<_,String>(13)?,
+            "surgeon_id":r.get::<_,String>(14)?, "finalized_at":r.get::<_,String>(15)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn orthopedic_operation_finalize(&self, v: &serde_json::Value, surgeon_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let episode = v["episode_id"].as_str().unwrap_or_default();
+        Self::orthopedic_require_episode(&conn, episode)?;
+        let plan_id = v["plan_id"].as_str().unwrap_or_default();
+        let owner: Option<(String,String,String)> = conn.query_row(
+            "SELECT episode_id,side,consent_status FROM orthopedic_surgeries WHERE id=?1",
+            [plan_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let (plan_episode, plan_side, consent) = owner.ok_or_else(|| anyhow!("Plani kirurgjik nuk ekziston."))?;
+        if plan_episode != episode || plan_side != v["laterality"].as_str().unwrap_or_default() {
+            bail!("Pacienti/episodi ose ana operative nuk përputhet me planin.");
+        }
+        if consent != "informed_signed" { bail!("Nuk ekziston pëlqimi i informuar i dokumentuar."); }
+        for field in ["consent_verified","patient_verified","site_verified","laterality_verified"] {
+            if v[field].as_bool() != Some(true) { bail!("Verifikimet kirurgjike janë të paplota: {}",field); }
+        }
+        for field in ["id","actual_procedure","operative_site","start_at","end_at","surgical_team","operative_note"] {
+            if v[field].as_str().unwrap_or_default().trim().is_empty() {
+                bail!("Raporti operativ kërkon: {}",field);
+            }
+        }
+        let start = v["start_at"].as_str().unwrap_or_default();
+        let end = v["end_at"].as_str().unwrap_or_default();
+        if end <= start { bail!("Koha e përfundimit duhet të jetë pas fillimit."); }
+        conn.execute("INSERT INTO orthopedic_operations(
+            id,plan_id,episode_id,actual_procedure,operative_site,laterality,start_at,end_at,surgical_team,findings,technique,complications,operative_note,postop_instructions,consent_verified,patient_verified,site_verified,laterality_verified,surgeon_id,finalized_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,1,1,1,1,?15,?16)",
+            rusqlite::params![
+                v["id"].as_str().unwrap_or_default(),plan_id,episode,
+                v["actual_procedure"].as_str().unwrap_or_default(),
+                v["operative_site"].as_str().unwrap_or_default(),
+                v["laterality"].as_str().unwrap_or_default(),start,end,
+                v["surgical_team"].as_str().unwrap_or_default(),
+                v["findings"].as_str().unwrap_or_default(),
+                v["technique"].as_str().unwrap_or_default(),
+                v["complications"].as_str().unwrap_or_default(),
+                v["operative_note"].as_str().unwrap_or_default(),
+                v["postop_instructions"].as_str().unwrap_or_default(),
+                surgeon_id,now_iso()
+            ])?;
+        Ok(())
+    }
+
     pub fn orthopedic_surgeries_list(&self, episode_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT payload_json FROM orthopedic_surgeries WHERE episode_id=?1 ORDER BY created_at DESC")?;
