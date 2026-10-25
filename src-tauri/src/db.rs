@@ -990,6 +990,194 @@ impl Db {
             "clinician_id":actor,"reason":reason.trim(),"created_at":now}))
     }
 
+    pub fn physiotherapy_exercises_list(&self)->anyhow::Result<Vec<serde_json::Value>>{
+        let conn=self.conn.lock().unwrap();
+        let mut stmt=conn.prepare(
+            "SELECT id,title,anatomical_region,instructions,media_ref,media_rights,
+             contraindications,version,created_by,created_at
+             FROM physiotherapy_exercises ORDER BY title,version DESC")?;
+        let rows=stmt.query_map([],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,
+            "anatomical_region":r.get::<_,String>(2)?,
+            "instructions":r.get::<_,String>(3)?,"media_ref":r.get::<_,String>(4)?,
+            "media_rights":r.get::<_,String>(5)?,
+            "contraindications":r.get::<_,String>(6)?,
+            "version":r.get::<_,i64>(7)?,
+            "created_by":r.get::<_,String>(8)?,"created_at":r.get::<_,String>(9)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_exercise_create(
+        &self,v:&serde_json::Value,actor:&str
+    )->anyhow::Result<serde_json::Value>{
+        if actor.trim().is_empty(){bail!("Kërkohet identiteti i profesionistit.");}
+        let title=v["title"].as_str().unwrap_or_default().trim();
+        let instructions=v["instructions"].as_str().unwrap_or_default().trim();
+        let media=v["media_ref"].as_str().unwrap_or_default().trim();
+        let rights=v["media_rights"].as_str().unwrap_or_default().trim();
+        if title.chars().count()<3 || title.chars().count()>160 ||
+           instructions.chars().count()<8 || instructions.chars().count()>4000 {
+            bail!("Emri dhe udhëzimet e ushtrimit nuk janë të plota.");
+        }
+        if !media.is_empty() && (!media.starts_with("https://") || rights.len()<5 || media.len()>1500) {
+            bail!("Video kërkon referencë HTTPS dhe konfirmim të të drejtave të përdorimit.");
+        }
+        let id=Uuid::new_v4().to_string();let now=now_iso();
+        let conn=self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO physiotherapy_exercises
+             (id,title,anatomical_region,instructions,media_ref,media_rights,
+              contraindications,version,created_by,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9)",
+            rusqlite::params![id,title,v["anatomical_region"].as_str().unwrap_or_default(),
+                instructions,media,rights,v["contraindications"].as_str().unwrap_or_default(),
+                actor,now]
+        )?;
+        Ok(serde_json::json!({"id":id,"title":title,
+            "anatomical_region":v["anatomical_region"],"instructions":instructions,
+            "media_ref":media,"media_rights":rights,
+            "contraindications":v["contraindications"],"version":1,
+            "created_by":actor,"created_at":now}))
+    }
+
+    pub fn physiotherapy_hep_list(&self,ep:&str)->anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn.lock().unwrap();
+        let mut stmt=conn.prepare(
+            "SELECT h.id,h.physiotherapy_episode_id,h.care_plan_id,h.exercise_id,
+             x.title,x.instructions,x.media_ref,x.contraindications,
+             h.sets,h.repetitions,h.frequency,h.duration_seconds,
+             h.instructions,h.authorized_by,h.load_restrictions_snapshot,
+             h.rom_restrictions_snapshot,h.status,h.replaces_id,h.created_at,
+             (SELECT COUNT(*) FROM physiotherapy_hep_logs l
+              WHERE l.hep_id=h.id AND l.performed=1),
+             (CASE WHEN h.load_restrictions_snapshot=COALESCE(p.load_restrictions,'')
+               AND h.rom_restrictions_snapshot=COALESCE(p.rom_restrictions,'')
+               THEN 0 ELSE 1 END)
+             FROM physiotherapy_hep h
+             JOIN physiotherapy_exercises x ON x.id=h.exercise_id
+             JOIN physiotherapy_episodes f ON f.id=h.physiotherapy_episode_id
+             JOIN orthopedic_rehab_plans p ON p.id=f.rehab_plan_id
+             WHERE h.physiotherapy_episode_id=?1 ORDER BY h.created_at DESC")?;
+        let rows=stmt.query_map([ep],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"physiotherapy_episode_id":r.get::<_,String>(1)?,
+            "care_plan_id":r.get::<_,String>(2)?,"exercise_id":r.get::<_,String>(3)?,
+            "title":r.get::<_,String>(4)?,"exercise_instructions":r.get::<_,String>(5)?,
+            "media_ref":r.get::<_,String>(6)?,"contraindications":r.get::<_,String>(7)?,
+            "sets":r.get::<_,i64>(8)?,"repetitions":r.get::<_,i64>(9)?,
+            "frequency":r.get::<_,String>(10)?,"duration_seconds":r.get::<_,Option<i64>>(11)?,
+            "instructions":r.get::<_,String>(12)?,
+            "authorized_by":r.get::<_,String>(13)?,
+            "load_restrictions_snapshot":r.get::<_,String>(14)?,
+            "rom_restrictions_snapshot":r.get::<_,String>(15)?,
+            "status":r.get::<_,String>(16)?,"replaces_id":r.get::<_,Option<String>>(17)?,
+            "created_at":r.get::<_,String>(18)?,"completed_logs":r.get::<_,i64>(19)?,
+            "needs_review":r.get::<_,i64>(20)?==1
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_hep_assign(
+        &self,v:&serde_json::Value,actor:&str
+    )->anyhow::Result<serde_json::Value>{
+        if actor.trim().is_empty(){bail!("Kërkohet miratues klinik.");}
+        let ep=v["physiotherapy_episode_id"].as_str().unwrap_or_default();
+        let plan=v["care_plan_id"].as_str().unwrap_or_default();
+        let exercise=v["exercise_id"].as_str().unwrap_or_default();
+        let sets=v["sets"].as_i64().unwrap_or(0);
+        let reps=v["repetitions"].as_i64().unwrap_or(0);
+        let freq=v["frequency"].as_str().unwrap_or_default().trim();
+        if !(1..=30).contains(&sets) || !(1..=500).contains(&reps) ||
+           freq.len()<3 || freq.len()>160 { bail!("Doza dhe frekuenca e HEP janë të pavlefshme."); }
+        let duration=v["duration_seconds"].as_i64();
+        if duration.map(|n|n<1||n>36000).unwrap_or(false) { bail!("Kohëzgjatje e pavlefshme."); }
+        let status=v["status"].as_str().unwrap_or("approved");
+        if !matches!(status,"approved"|"withdrawn"){bail!("Status HEP i pavlefshëm.");}
+        let replacement=v["replaces_id"].as_str().filter(|s|!s.trim().is_empty());
+        let conn=self.conn.lock().unwrap();
+        Self::physio_require_active(&conn,ep)?;
+        let permitted: Option<(String,String)>=conn.query_row(
+            "SELECT COALESCE(p.load_restrictions,''),COALESCE(p.rom_restrictions,'')
+             FROM physiotherapy_episodes f
+             JOIN orthopedic_rehab_plans p ON p.id=f.rehab_plan_id
+             JOIN physiotherapy_care_plans cp ON cp.physiotherapy_episode_id=f.id
+             WHERE f.id=?1 AND cp.id=?2 AND cp.status IN ('approved','amendment')
+             AND cp.version=(SELECT MAX(version) FROM physiotherapy_care_plans
+                 WHERE physiotherapy_episode_id=f.id)",
+            rusqlite::params![ep,plan],
+            |r|Ok((r.get(0)?,r.get(1)?))
+        ).optional()?;
+        let (load,rom)=permitted.ok_or_else(||anyhow!(
+            "HEP kërkon versionin aktual të planit të miratuar."
+        ))?;
+        let exercise_exists:bool=conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM physiotherapy_exercises WHERE id=?1)",
+            [exercise],|r|r.get(0))?;
+        if !exercise_exists{bail!("Ushtrimi nuk ekziston në katalog.");}
+        if let Some(old_id)=replacement {
+            let old_exists:bool=conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM physiotherapy_hep
+                 WHERE id=?1 AND physiotherapy_episode_id=?2)",
+                rusqlite::params![old_id,ep],|r|r.get(0))?;
+            if !old_exists{bail!("Ushtrimi i zëvendësuar nuk i përket episodit.");}
+        }
+        let id=Uuid::new_v4().to_string();let now=now_iso();
+        conn.execute(
+            "INSERT INTO physiotherapy_hep
+             (id,physiotherapy_episode_id,care_plan_id,exercise_id,sets,repetitions,
+             frequency,duration_seconds,instructions,authorized_by,
+             load_restrictions_snapshot,rom_restrictions_snapshot,status,replaces_id,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            rusqlite::params![id,ep,plan,exercise,sets,reps,freq,duration,
+                v["instructions"].as_str().unwrap_or_default(),actor,load,rom,
+                status,replacement,now]
+        )?;
+        Ok(serde_json::json!({"id":id,"physiotherapy_episode_id":ep,
+            "care_plan_id":plan,"exercise_id":exercise,"sets":sets,"repetitions":reps,
+            "frequency":freq,"duration_seconds":duration,"authorized_by":actor,
+            "load_restrictions_snapshot":load,"rom_restrictions_snapshot":rom,
+            "status":status,"replaces_id":replacement,"created_at":now}))
+    }
+
+    pub fn physiotherapy_hep_log_add(
+        &self,v:&serde_json::Value,actor:&str
+    )->anyhow::Result<serde_json::Value>{
+        if actor.trim().is_empty(){bail!("Kërkohet përdorues i identifikuar.");}
+        let hep=v["hep_id"].as_str().unwrap_or_default();
+        let day=v["performed_date"].as_str().unwrap_or_default();
+        chrono::NaiveDate::parse_from_str(day,"%Y-%m-%d")
+            .map_err(|_|anyhow!("Data e ushtrimit nuk është e vlefshme."))?;
+        let response=v["response"].as_str().unwrap_or_default();
+        if response.len()>2000 {bail!("Përgjigje shumë e gjatë.");}
+        let performed=v["performed"].as_bool().ok_or_else(||anyhow!("Mungon statusi i kryerjes."))?;
+        let self_reported=v["self_reported"].as_bool().unwrap_or(true);
+        let conn=self.conn.lock().unwrap();
+        let valid:bool=conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM physiotherapy_hep h
+             JOIN physiotherapy_episodes f ON f.id=h.physiotherapy_episode_id
+             JOIN orthopedic_episodes e ON e.id=f.orthopedic_episode_id
+             JOIN orthopedic_rehab_plans p ON p.id=f.rehab_plan_id
+             WHERE h.id=?1 AND h.status='approved' AND f.status='active'
+             AND e.status='active'
+             AND NOT EXISTS(SELECT 1 FROM physiotherapy_hep h2
+               WHERE h2.replaces_id=h.id)
+             AND h.load_restrictions_snapshot=COALESCE(p.load_restrictions,'')
+             AND h.rom_restrictions_snapshot=COALESCE(p.rom_restrictions,''))",
+            [hep],|r|r.get(0))?;
+        if !valid{bail!("Ushtrimi kërkon rishikim ose nuk është më aktiv.");}
+        let id=Uuid::new_v4().to_string();let now=now_iso();
+        conn.execute(
+            "INSERT INTO physiotherapy_hep_logs
+             (id,hep_id,performed_date,self_reported,performed,response,recorded_by,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![id,hep,day,if self_reported{1}else{0},
+                if performed{1}else{0},response,actor,now]
+        )?;
+        Ok(serde_json::json!({"id":id,"hep_id":hep,"performed_date":day,
+            "self_reported":self_reported,"performed":performed,
+            "response":response,"recorded_by":actor,"created_at":now}))
+    }
+
     pub fn orthopedic_episodes_list(&self, client_id: Option<String>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, client_id, diagnosis, region, laterality, status, notes, created_at, updated_at FROM orthopedic_episodes WHERE (?1 IS NULL OR client_id = ?1) ORDER BY updated_at DESC")?;
