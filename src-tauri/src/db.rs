@@ -2138,6 +2138,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v4.sql"))?;
+            conn.execute_batch(include_str!("../migrations/sef_mjeku_v5.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -2170,6 +2171,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v4.sql"))?;
+            conn.execute_batch(include_str!("../migrations/sef_mjeku_v5.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -8611,6 +8613,57 @@ impl Db {
 }
 
 
+/// Hashes only minimal fiscal state metadata, never clinical content.
+fn sef_event_canonical(tx: &rusqlite::Transaction<'_>, kind: &str, event_id: i64) -> anyhow::Result<String> {
+    let sql=match kind {
+        "SALE" => "SELECT sale_id,event_type,COALESCE(from_status,''),to_status,COALESCE(error_code,''),occurred_at FROM sef_mjeku_events WHERE id=?1",
+        "ACTION" => "SELECT request_id,event_type,COALESCE(from_status,''),to_status,COALESCE(error_code,''),occurred_at FROM sef_mjeku_action_events WHERE id=?1",
+        _=>bail!("Unknown fiscal audit event kind"),
+    };
+    let fields:(String,String,String,String,String,String)=tx.query_row(sql,[event_id],|r|Ok((
+        r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?
+    )))?;
+    Ok(serde_json::to_string(&(kind,event_id,fields))?)
+}
+
+fn sef_event_hash(previous:&str, canonical:&str)->String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(format!("{previous}\\n{canonical}").as_bytes()))
+}
+
+/// Full verification before each fiscal state mutation. Existing pre-migration
+/// events are append-only but are not retrospectively covered by the chain.
+fn sef_verify_chain_tx(tx:&rusqlite::Transaction<'_>) -> anyhow::Result<usize> {
+    let mut stmt=tx.prepare(
+        "SELECT source_kind,source_event_id,previous_hash,event_hash
+         FROM sef_mjeku_event_chain ORDER BY sequence_no")?;
+    let entries=stmt.query_map([],|r|Ok((
+        r.get::<_,String>(0)?,r.get::<_,i64>(1)?,
+        r.get::<_,String>(2)?,r.get::<_,String>(3)?
+    )))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut previous="0".repeat(64);
+    for (kind,event_id,prev,hash) in &entries {
+        if prev!=&previous || sef_event_hash(&previous,&sef_event_canonical(tx,kind,*event_id)?)!=*hash {
+            bail!("Integriteti i historikut SEF nuk përputhet; veprimet fiskale janë bllokuar.");
+        }
+        previous=hash.clone();
+    }
+    Ok(entries.len())
+}
+
+fn sef_append_chain_tx(tx:&rusqlite::Transaction<'_>,kind:&str)->anyhow::Result<()> {
+    let event_id=tx.last_insert_rowid();
+    let previous:String=tx.query_row(
+        "SELECT event_hash FROM sef_mjeku_event_chain ORDER BY sequence_no DESC LIMIT 1",
+        [],|r|r.get(0)).optional()?.unwrap_or_else(||"0".repeat(64));
+    let canonical=sef_event_canonical(tx,kind,event_id)?;
+    let hash=sef_event_hash(&previous,&canonical);
+    tx.execute("INSERT INTO sef_mjeku_event_chain(source_kind,source_event_id,previous_hash,event_hash,created_at)
+               VALUES(?1,?2,?3,?4,?5)",params![kind,event_id,previous,hash,now_iso()])?;
+    Ok(())
+}
+
 /// Local commercial-only fiscal attempt. Never serialize this struct to the WebView.
 #[derive(Debug, Clone)]
 pub struct SefLedgerRecord {
@@ -8651,6 +8704,7 @@ impl Db {
         }
         let mut conn=self.conn()?;
         let tx=conn.transaction()?;
+        sef_verify_chain_tx(&tx)?;
         let now=now_iso();
         let inserted=tx.execute(
             "INSERT OR IGNORE INTO sef_mjeku_transactions(
@@ -8663,6 +8717,7 @@ impl Db {
             tx.execute("INSERT INTO sef_mjeku_events(
                 sale_id,event_type,from_status,to_status,occurred_at)
                 VALUES(?1,'PREPARED',NULL,'READY',?2)",params![sale_id,now])?;
+            sef_append_chain_tx(&tx,"SALE")?;
         }
         let old=tx.query_row(
             "SELECT sale_id,request_sha256,request_json,allow_any,total_cents,context_id,status,coupon_id
@@ -8689,6 +8744,7 @@ impl Db {
     ) -> anyhow::Result<()> {
         let mut conn=self.conn()?;
         let tx=conn.transaction()?;
+        sef_verify_chain_tx(&tx)?;
         let old:(String,Option<String>)=tx.query_row(
             "SELECT status,coupon_id FROM sef_mjeku_transactions WHERE sale_id=?1",
             [sale_id],|r|Ok((r.get(0)?,r.get(1)?))
@@ -8727,6 +8783,7 @@ impl Db {
             sale_id,event_type,from_status,to_status,error_code,occurred_at)
             VALUES(?1,?2,?3,?4,?5,?6)",
             params![sale_id,event,old.0,next,error_code,now])?;
+        sef_append_chain_tx(&tx,"SALE")?;
         tx.commit()?;
         Ok(())
     }
@@ -8821,6 +8878,7 @@ impl Db {
         let now=now_iso();
         let mut conn=self.conn()?;
         let tx=conn.transaction()?;
+        sef_verify_chain_tx(&tx)?;
         tx.execute("INSERT INTO sef_mjeku_actions(
             request_id,kind,original_coupon_id,context_id,request_sha256,request_json,
             status,created_at,updated_at)
@@ -8829,6 +8887,7 @@ impl Db {
         tx.execute("INSERT INTO sef_mjeku_action_events(
             request_id,event_type,from_status,to_status,occurred_at)
             VALUES(?1,'PREPARED',NULL,'READY',?2)",params![request_id,now])?;
+        sef_append_chain_tx(&tx,"ACTION")?;
         tx.commit()?;
         Ok(SefActionRecord {
             request_id,kind:kind.to_string(),original_coupon_id:original_coupon_id.to_string(),
@@ -8855,6 +8914,7 @@ impl Db {
     )->anyhow::Result<()> {
         let mut conn=self.conn()?;
         let tx=conn.transaction()?;
+        sef_verify_chain_tx(&tx)?;
         let old:(String,Option<String>)=tx.query_row(
             "SELECT status,coupon_id FROM sef_mjeku_actions WHERE request_id=?1",
             [request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
@@ -8888,6 +8948,7 @@ impl Db {
             request_id,event_type,from_status,to_status,error_code,occurred_at)
             VALUES(?1,?2,?3,?4,?5,?6)",
             params![request_id,event,old.0,next,error_code,now])?;
+        sef_append_chain_tx(&tx,"ACTION")?;
         tx.commit()?;
         Ok(())
     }
