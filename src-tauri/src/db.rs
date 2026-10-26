@@ -8780,3 +8780,156 @@ mod sef_mjeku_ledger_tests {
         assert_eq!(events,5);
     }
 }
+
+
+/// Durable local record of a fiscal return/cancel. No patient identifiers or clinical notes.
+#[derive(Debug, Clone)]
+pub struct SefActionRecord {
+    pub request_id: String,
+    pub kind: String,
+    pub original_coupon_id: String,
+    pub context_id: String,
+    pub request_sha256: String,
+    pub request_json: String,
+    pub status: String,
+    pub coupon_id: Option<String>,
+}
+
+impl Db {
+    /// A fresh UUID is written in the same transaction as the immutable request.
+    /// A partial/unknown previous action on this coupon prevents a new one.
+    pub fn sef_action_prepare(
+        &self, kind: &str, original_coupon_id: &str,
+        params_json: &serde_json::Value, context: &str,
+    ) -> anyhow::Result<SefActionRecord> {
+        use sha2::Digest;
+        if !matches!(kind,"RETURN"|"CANCEL") ||
+           original_coupon_id.trim().parse::<i64>().ok().filter(|x|*x>0).is_none() ||
+           context.trim().is_empty() {
+            bail!("Kërkesa SEF për kthim/anulim nuk është e vlefshme.");
+        }
+        let request_id=Uuid::new_v4().to_string();
+        let mut payload=params_json.clone();
+        let obj=payload.as_object_mut().ok_or_else(||anyhow::anyhow!("Invalid SEF action payload"))?;
+        obj.insert("requestId".into(),serde_json::json!(request_id));
+        let request_json=serde_json::to_string(&payload)?;
+        let request_sha256=hex::encode(sha2::Sha256::digest(request_json.as_bytes()));
+        let now=now_iso();
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        tx.execute("INSERT INTO sef_mjeku_actions(
+            request_id,kind,original_coupon_id,context_id,request_sha256,request_json,
+            status,created_at,updated_at)
+            VALUES(?1,?2,?3,?4,?5,?6,'READY',?7,?7)",
+            params![request_id,kind,original_coupon_id,context,request_sha256,request_json,now])?;
+        tx.execute("INSERT INTO sef_mjeku_action_events(
+            request_id,event_type,from_status,to_status,occurred_at)
+            VALUES(?1,'PREPARED',NULL,'READY',?2)",params![request_id,now])?;
+        tx.commit()?;
+        Ok(SefActionRecord {
+            request_id,kind:kind.to_string(),original_coupon_id:original_coupon_id.to_string(),
+            context_id:context.to_string(),request_sha256,request_json,
+            status:"READY".into(),coupon_id:None
+        })
+    }
+
+    pub fn sef_action_get(&self, request_id:&str)->anyhow::Result<Option<SefActionRecord>> {
+        let conn=self.conn()?;
+        conn.query_row("SELECT request_id,kind,original_coupon_id,context_id,
+            request_sha256,request_json,status,coupon_id FROM sef_mjeku_actions WHERE request_id=?1",
+            [request_id],|r|Ok(SefActionRecord{
+                request_id:r.get(0)?,kind:r.get(1)?,original_coupon_id:r.get(2)?,
+                context_id:r.get(3)?,request_sha256:r.get(4)?,request_json:r.get(5)?,
+                status:r.get(6)?,coupon_id:r.get(7)?
+            })).optional().map_err(Into::into)
+    }
+
+    /// State changes and immutable audit events commit atomically.
+    pub fn sef_action_transition(
+        &self,request_id:&str,next:&str,event:&str,
+        coupon_id:Option<&str>,daily_number:Option<i64>,error_code:Option<&str>
+    )->anyhow::Result<()> {
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let old:(String,Option<String>)=tx.query_row(
+            "SELECT status,coupon_id FROM sef_mjeku_actions WHERE request_id=?1",
+            [request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if old.0==next {
+            if let (Some(existing),Some(incoming))=(old.1.as_deref(),coupon_id) {
+                if existing!=incoming {bail!("Kuponi SEF i veprimit ndryshoi.");}
+            }
+            tx.commit()?;
+            return Ok(());
+        }
+        let allowed=matches!((old.0.as_str(),next),
+            ("READY","IN_FLIGHT") |
+            ("IN_FLIGHT","UNKNOWN"|"FISCALIZED"|"PENDING_OFFLINE"|"FAILED") |
+            ("UNKNOWN","FISCALIZED"|"PENDING_OFFLINE"|"FAILED") |
+            ("PENDING_OFFLINE","FISCALIZED"|"FAILED")
+        );
+        if !allowed {bail!("Kalimi i statusit të veprimit SEF nuk lejohet.");}
+        if matches!(next,"FISCALIZED"|"PENDING_OFFLINE") &&
+           coupon_id.or(old.1.as_deref()).is_none() {
+            bail!("Kuponi i veprimit nuk është konfirmuar nga POS.");
+        }
+        if let (Some(existing),Some(incoming))=(old.1.as_deref(),coupon_id) {
+            if existing!=incoming {bail!("Kuponi i veprimit nuk mund të ndryshojë.");}
+        }
+        let now=now_iso();
+        tx.execute("UPDATE sef_mjeku_actions SET status=?2,
+            coupon_id=COALESCE(coupon_id,?3),daily_number=COALESCE(daily_number,?4),
+            error_code=?5,updated_at=?6 WHERE request_id=?1",
+            params![request_id,next,coupon_id,daily_number,error_code,now])?;
+        tx.execute("INSERT INTO sef_mjeku_action_events(
+            request_id,event_type,from_status,to_status,error_code,occurred_at)
+            VALUES(?1,?2,?3,?4,?5,?6)",
+            params![request_id,event,old.0,next,error_code,now])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn sef_action_list(&self)->anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare("SELECT request_id,kind,original_coupon_id,status,
+            coupon_id,daily_number,error_code,created_at,updated_at
+            FROM sef_mjeku_actions ORDER BY updated_at DESC LIMIT 200")?;
+        let rows=stmt.query_map([],|r|Ok(serde_json::json!({
+            "requestId":r.get::<_,String>(0)?,
+            "kind":r.get::<_,String>(1)?,
+            "originalCouponId":r.get::<_,String>(2)?,
+            "status":r.get::<_,String>(3)?,
+            "couponId":r.get::<_,Option<String>>(4)?,
+            "dailyNumber":r.get::<_,Option<i64>>(5)?,
+            "errorCode":r.get::<_,Option<String>>(6)?,
+            "createdAt":r.get::<_,String>(7)?,
+            "updatedAt":r.get::<_,String>(8)?
+        })))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod sef_mjeku_action_tests {
+    use super::*;
+
+    #[test]
+    fn action_journal_is_immutable_and_fail_closed_on_uncertain_result() {
+        let db=Db::new_in_memory().unwrap();
+        let params=serde_json::json!({"couponId":"1001","reason":"Gabim"});
+        let first=db.sef_action_prepare("CANCEL","1001",&params,"ctx").unwrap();
+        assert_eq!(first.status,"READY");
+        assert!(first.request_json.contains(&first.request_id));
+        assert!(db.sef_action_prepare("RETURN","1001",&params,"ctx").is_err());
+        db.sef_action_transition(&first.request_id,"IN_FLIGHT","DISPATCH",None,None,None).unwrap();
+        db.sef_action_transition(&first.request_id,"UNKNOWN","TIMEOUT",None,None,Some("TIMEOUT")).unwrap();
+        assert!(db.sef_action_prepare("CANCEL","1001",&params,"ctx").is_err());
+        assert!(db.sef_action_transition(&first.request_id,"IN_FLIGHT","RETRY",None,None,None).is_err());
+        db.sef_action_transition(&first.request_id,"FISCALIZED","POS_RECONCILED",Some("2001"),Some(2),None).unwrap();
+        assert!(db.sef_action_prepare("RETURN","1001",&params,"ctx").is_ok());
+        let conn=db.conn().unwrap();
+        assert!(conn.execute("DELETE FROM sef_mjeku_actions WHERE request_id=?1",[&first.request_id]).is_err());
+        assert!(conn.execute("UPDATE sef_mjeku_actions SET request_json='{}' WHERE request_id=?1",[&first.request_id]).is_err());
+        assert!(conn.execute("DELETE FROM sef_mjeku_action_events",[]).is_err());
+        conn.execute_batch(include_str!("../migrations/sef_mjeku_v2.sql")).unwrap();
+    }
+}
