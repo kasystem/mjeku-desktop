@@ -1588,6 +1588,17 @@ async fn physiotherapy_hep_assign(state: tauri::State<'_, AppState>, value: serd
 }
 
 #[tauri::command]
+async fn physiotherapy_hep_logs_list(
+    state: tauri::State<'_, AppState>,physiotherapy_episode_id:String,
+)->Result<Vec<serde_json::Value>,String>{
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(
+        move || db.physiotherapy_hep_logs_list(&physiotherapy_episode_id)
+    ).await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
 async fn physiotherapy_hep_log_add(state: tauri::State<'_, AppState>, value: serde_json::Value)
     -> Result<serde_json::Value, String> {
     let doctor=match require_orthopedic_surgeon(&state).await? {
@@ -5164,6 +5175,7 @@ pub fn run() {
             physiotherapy_hep_list,
             physiotherapy_hep_assign,
             physiotherapy_hep_log_add,
+            physiotherapy_hep_logs_list,
             physiotherapy_reports_list,
             physiotherapy_report_create,
             physiotherapy_document_export_pdf,
