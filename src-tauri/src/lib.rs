@@ -5536,6 +5536,8 @@ pub fn run() {
             sef_coupon_copy,
             sef_coupon_return,
             sef_coupon_cancel,
+            sef_actions_list,
+            sef_action_reconcile,
             sef_report,
             sef_sale_items,
             sef_sale_coupon,
