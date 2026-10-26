@@ -2348,7 +2348,12 @@ async fn sales_upsert(
 async fn sales_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.sales_delete(&id))
+    tokio::task::spawn_blocking(move || {
+        if db.sef_ledger_get(&id)?.is_some() {
+            anyhow::bail!("Fatura ka histori SEF dhe nuk mund të fshihet.");
+        }
+        db.sales_delete(&id)
+    })
         .await
         .map_err(err_string)?
         .map_err(err_string)
@@ -2361,8 +2366,14 @@ async fn sales_mark_fiscalized_manual(
     reason: Option<String>,
 ) -> Result<(), String> {
     let _ = require_finance(&state).await?;
+    if get_fiscal_printer_provider(&state).await? == crate::sef_bridge::PROVIDER_VALUE {
+        return Err("SEF kërkon kuponin real të PROGRAMERI POS. Shënimi manual si i fiskalizuar nuk lejohet.".into());
+    }
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
+        if db.sef_ledger_get(&sale_id)?.is_some() {
+            anyhow::bail!("Fatura ka histori SEF; shënimi manual është i bllokuar.");
+        }
         db.sales_mark_fiscalized_manual(&sale_id, reason.as_deref())
     })
     .await
@@ -2379,6 +2390,9 @@ async fn sales_mark_non_fiscal_manual(
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
+        if db.sef_ledger_get(&sale_id)?.is_some() {
+            anyhow::bail!("Fatura ka një kërkesë SEF. Nuk mund të shënohet jo-fiskale para rikuperimit dhe kontrollit në POS.");
+        }
         db.sales_mark_non_fiscal_manual(&sale_id, reason.as_deref())
     })
     .await
