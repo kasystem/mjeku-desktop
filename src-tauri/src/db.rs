@@ -8678,6 +8678,24 @@ pub struct SefLedgerRecord {
 }
 
 impl Db {
+    /// Read-only audit of new SHA-256-chained events. Older immutable events
+    /// predate the chain; disclose that gap instead of pretending they were covered.
+    pub fn sef_audit_verify(&self) -> anyhow::Result<serde_json::Value> {
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let verified=sef_verify_chain_tx(&tx)?;
+        let existing:i64=tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM sef_mjeku_events) +
+                    (SELECT COUNT(*) FROM sef_mjeku_action_events)",
+            [],|r|r.get(0))?;
+        tx.commit()?;
+        Ok(serde_json::json!({
+            "verifiedEvents":verified,
+            "historicalUnchained":existing.saturating_sub(verified as i64),
+            "valid":true
+        }))
+    }
+
     pub fn sef_ledger_get(&self, sale_id: &str) -> anyhow::Result<Option<SefLedgerRecord>> {
         let conn = self.conn()?;
         conn.query_row(
