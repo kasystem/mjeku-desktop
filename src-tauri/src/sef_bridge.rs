@@ -388,6 +388,23 @@ pub fn money_to_cents(v: f64) -> Result<i64, BridgeError> {
     Ok(nudged.round() as i64)
 }
 
+/// Four-decimal euro unit price, represented exactly in ten-thousandths.
+pub fn money_to_ten_thousandths(v: f64) -> Result<i64, BridgeError> {
+    if !v.is_finite() || v < 0.0 || v > 100_000_000.0 {
+        return Err(local_validation("Çmimi për njësi nuk është i vlefshëm."));
+    }
+    let scaled=v*10_000.0;
+    if (scaled-scaled.round()).abs()>0.00001 {
+        return Err(local_validation("Çmimi për njësi lejon maksimumi katër shifra pas presjes."));
+    }
+    Ok((scaled+0.000001).round() as i64)
+}
+
+pub fn line_total_cents_precise(qty_milli: i64, unit_price_ten_thousandths: i64) -> i64 {
+    let value=qty_milli as i128 * unit_price_ten_thousandths as i128;
+    ((value+50_000)/100_000) as i64
+}
+
 /// Sasia → mijëshe (3 decimale), rrumbullakim half away from zero.
 pub fn qty_to_milli(q: f64) -> i64 {
     let scaled = q * 1000.0;
@@ -527,6 +544,7 @@ pub struct FiscalItem {
     pub title: String,
     pub qty: String,
     pub unit_price_cents: i64,
+    pub unit_price_ten_thousandths: i64,
     pub vat_rate_percent: u32,
 }
 
@@ -590,6 +608,7 @@ pub fn build_fiscalize_request(
             title: sanitize_title(&ln.title),
             qty: qty_string(qty_milli),
             unit_price_cents: unit_cents,
+            unit_price_ten_thousandths: unit_cents * 100,
             vat_rate_percent: rates.rate_for_code(&ln.vat_code),
         });
     }
