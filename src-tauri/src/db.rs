@@ -8699,11 +8699,11 @@ impl Db {
     /// Owner-only export via Tauri command; audit data are commercial references,
     /// state transitions and hash-chain proofs, never clinical notes or patient data.
     pub fn sef_audit_csv(&self) -> anyhow::Result<String> {
-        fn cell(s:&str)->String { format!("\\\"{}\\\"",s.replace('"',"\\\"\\\"")) }
+        fn cell(s:&str)->String { format!("\"{}\"",s.replace('"',"\"\"")) }
         let mut conn=self.conn()?;
         let tx=conn.transaction()?;
         sef_verify_chain_tx(&tx)?;
-        let mut output=String::from("kind,source_id,event_type,status,error_code,occurred_at,sha256\\n");
+        let mut output=String::from("kind,source_id,event_type,status,error_code,occurred_at,sha256\n");
         {
             let mut stmt=tx.prepare(
                 "SELECT e.sale_id,e.event_type,e.to_status,COALESCE(e.error_code,''),e.occurred_at,
@@ -8715,7 +8715,7 @@ impl Db {
                     row.get(3)?,row.get(4)?,row.get(5)?];
                 output.push_str("SALE,");
                 output.push_str(&values.iter().map(|x|cell(x)).collect::<Vec<_>>().join(","));
-                output.push('\\n');
+                output.push('\n');
             }
         }
         {
@@ -8729,7 +8729,7 @@ impl Db {
                     row.get(3)?,row.get(4)?,row.get(5)?];
                 output.push_str("ACTION,");
                 output.push_str(&values.iter().map(|x|cell(x)).collect::<Vec<_>>().join(","));
-                output.push('\\n');
+                output.push('\n');
             }
         }
         tx.commit()?;
