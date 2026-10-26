@@ -4093,6 +4093,15 @@ async fn sef_ledger_list(state: tauri::State<'_, AppState>)
         .await.map_err(err_string)?.map_err(err_string)
 }
 
+#[tauri::command]
+async fn sef_audit_verify(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let _=require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_audit_verify())
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
 /// Read-only POS lookup and local state repair. This command never issues a coupon.
 #[tauri::command]
 async fn sef_sale_reconcile(
@@ -5596,6 +5605,7 @@ pub fn run() {
             sef_bridge_status,
             sef_bridge_select_engine,
             sef_ledger_list,
+            sef_audit_verify,
             sef_sale_reconcile,
             sef_coupons_list,
             sef_coupon_copy,
