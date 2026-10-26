@@ -8603,3 +8603,178 @@ impl Db {
             "author_id":clinician,"reason":reason,"created_at":now}))
     }
 }
+
+
+/// Local commercial-only fiscal attempt. Never serialize this struct to the WebView.
+#[derive(Debug, Clone)]
+pub struct SefLedgerRecord {
+    pub sale_id: String,
+    pub request_sha256: String,
+    pub request_json: String,
+    pub allow_any: bool,
+    pub total_cents: i64,
+    pub context_id: String,
+    pub status: String,
+    pub coupon_id: Option<String>,
+}
+
+impl Db {
+    pub fn sef_ledger_get(&self, sale_id: &str) -> anyhow::Result<Option<SefLedgerRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT sale_id,request_sha256,request_json,allow_any,total_cents,context_id,status,coupon_id
+             FROM sef_mjeku_transactions WHERE sale_id=?1",
+            params![sale_id], |r| Ok(SefLedgerRecord {
+                sale_id:r.get(0)?, request_sha256:r.get(1)?,
+                request_json:r.get(2)?, allow_any:r.get::<_,i64>(3)? != 0,
+                total_cents:r.get(4)?, context_id:r.get(5)?,
+                status:r.get(6)?, coupon_id:r.get(7)?
+            })
+        ).optional().map_err(Into::into)
+    }
+
+    /// Snapshot and idempotency identity are immutable after the first submission.
+    /// The existing record is returned; never replace a prior commercial request.
+    pub fn sef_ledger_prepare(
+        &self, sale_id:&str, hash:&str, payload:&str, allow_any:bool,
+        total_cents:i64, context:&str
+    ) -> anyhow::Result<SefLedgerRecord> {
+        if sale_id.trim().is_empty() || hash.len()!=64 || payload.len()<3 ||
+           total_cents<=0 || context.trim().is_empty() {
+            bail!("Kërkesa fiskale nuk është e plotë.");
+        }
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let now=now_iso();
+        let inserted=tx.execute(
+            "INSERT OR IGNORE INTO sef_mjeku_transactions(
+             sale_id,request_sha256,request_json,allow_any,total_cents,context_id,
+             status,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,'READY',?7,?7)",
+            params![sale_id,hash,payload,i64::from(allow_any),total_cents,context,now]
+        )?;
+        if inserted==1 {
+            tx.execute("INSERT INTO sef_mjeku_events(
+                sale_id,event_type,from_status,to_status,occurred_at)
+                VALUES(?1,'PREPARED',NULL,'READY',?2)",params![sale_id,now])?;
+        }
+        let old=tx.query_row(
+            "SELECT sale_id,request_sha256,request_json,allow_any,total_cents,context_id,status,coupon_id
+             FROM sef_mjeku_transactions WHERE sale_id=?1",
+            [sale_id],|r|Ok(SefLedgerRecord {
+                sale_id:r.get(0)?,request_sha256:r.get(1)?,
+                request_json:r.get(2)?,allow_any:r.get::<_,i64>(3)?!=0,
+                total_cents:r.get(4)?,context_id:r.get(5)?,
+                status:r.get(6)?,coupon_id:r.get(7)?
+            })
+        )?;
+        if old.request_sha256!=hash || old.context_id!=context ||
+           old.total_cents!=total_cents || old.allow_any!=allow_any {
+            bail!("Kjo faturë ka një kërkesë SEF ekzistuese me përmbajtje ose kontekst tjetër. Nuk krijohet kupon i dytë.");
+        }
+        tx.commit()?;
+        Ok(old)
+    }
+
+    /// Every state transition is atomic with an append-only event.
+    pub fn sef_ledger_transition(
+        &self,sale_id:&str,next:&str,event:&str,
+        coupon_id:Option<&str>,daily_number:Option<i64>,error_code:Option<&str>
+    ) -> anyhow::Result<()> {
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let old:(String,Option<String>)=tx.query_row(
+            "SELECT status,coupon_id FROM sef_mjeku_transactions WHERE sale_id=?1",
+            [sale_id],|r|Ok((r.get(0)?,r.get(1)?))
+        )?;
+        if old.0==next {
+            if let Some(id)=coupon_id {
+                if old.1.as_deref()!=Some(id) {
+                    bail!("Identifikuesi SEF nuk përputhet me regjistrimin ekzistues.");
+                }
+            }
+            tx.commit()?;
+            return Ok(());
+        }
+        let allowed=matches!((old.0.as_str(),next),
+            ("READY","IN_FLIGHT") |
+            ("IN_FLIGHT","UNKNOWN"|"FISCALIZED"|"PENDING_OFFLINE"|"FAILED") |
+            ("UNKNOWN","FISCALIZED"|"PENDING_OFFLINE"|"FAILED") |
+            ("PENDING_OFFLINE","FISCALIZED"|"FAILED") |
+            ("FAILED","UNKNOWN")
+        );
+        if !allowed {bail!("Kalimi i statusit fiskal nuk lejohet.");}
+        if matches!(next,"FISCALIZED"|"PENDING_OFFLINE") &&
+           coupon_id.or(old.1.as_deref()).is_none() {
+            bail!("Kuponi i PROGRAMERI POS mungon.");
+        }
+        if let (Some(old_id),Some(new_id))=(old.1.as_deref(),coupon_id) {
+            if old_id!=new_id {bail!("Numri i kuponit fiskal nuk mund të ndryshojë.");}
+        }
+        let now=now_iso();
+        tx.execute("UPDATE sef_mjeku_transactions SET status=?2,
+            coupon_id=COALESCE(coupon_id,?3),
+            daily_number=COALESCE(daily_number,?4),
+            error_code=?5,updated_at=?6 WHERE sale_id=?1",
+            params![sale_id,next,coupon_id,daily_number,error_code,now])?;
+        tx.execute("INSERT INTO sef_mjeku_events(
+            sale_id,event_type,from_status,to_status,error_code,occurred_at)
+            VALUES(?1,?2,?3,?4,?5,?6)",
+            params![sale_id,event,old.0,next,error_code,now])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn sef_ledger_list(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare(
+            "SELECT sale_id,status,total_cents,coupon_id,daily_number,error_code,created_at,updated_at
+             FROM sef_mjeku_transactions ORDER BY updated_at DESC LIMIT 200")?;
+        let rows=stmt.query_map([],|r|Ok(serde_json::json!({
+            "saleId":r.get::<_,String>(0)?,
+            "status":r.get::<_,String>(1)?,
+            "totalCents":r.get::<_,i64>(2)?,
+            "couponId":r.get::<_,Option<String>>(3)?,
+            "dailyNumber":r.get::<_,Option<i64>>(4)?,
+            "errorCode":r.get::<_,Option<String>>(5)?,
+            "createdAt":r.get::<_,String>(6)?,
+            "updatedAt":r.get::<_,String>(7)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+#[cfg(test)]
+mod sef_mjeku_ledger_tests {
+    use super::*;
+
+    #[test]
+    fn sef_ledger_is_immutable_idempotent_and_append_only() {
+        let db=Db::new_in_memory().unwrap();
+        {
+            let conn=db.conn().unwrap();
+            conn.execute("INSERT INTO clients(id,name) VALUES('test-client','Test')",[]).unwrap();
+            conn.execute("INSERT INTO sales(id,client_id,total) VALUES('test-sale','test-client',25.0)",[]).unwrap();
+        }
+        let hash="a".repeat(64);
+        let snapshot=r#"{"source":"mjeku","saleId":"test-sale","items":[]}"#;
+        let first=db.sef_ledger_prepare("test-sale",&hash,snapshot,true,2500,"ctx-1").unwrap();
+        assert_eq!(first.status,"READY");
+        assert_eq!(db.sef_ledger_prepare("test-sale",&hash,snapshot,true,2500,"ctx-1").unwrap().status,"READY");
+        assert!(db.sef_ledger_prepare("test-sale",&"b".repeat(64),snapshot,true,2500,"ctx-1").is_err());
+        assert!(db.sef_ledger_prepare("test-sale",&hash,snapshot,true,2500,"ctx-2").is_err());
+        db.sef_ledger_transition("test-sale","IN_FLIGHT","DISPATCH",None,None,None).unwrap();
+        assert!(db.sef_ledger_transition("test-sale","IN_FLIGHT","DISPATCH",None,None,None).is_ok());
+        db.sef_ledger_transition("test-sale","UNKNOWN","TIMEOUT",None,None,Some("TIMEOUT")).unwrap();
+        assert!(db.sef_ledger_transition("test-sale","IN_FLIGHT","RETRY",None,None,None).is_err());
+        db.sef_ledger_transition("test-sale","PENDING_OFFLINE","RECONCILED",Some("1001"),Some(7),None).unwrap();
+        db.sef_ledger_transition("test-sale","FISCALIZED","POS_CONFIRMED",Some("1001"),Some(7),None).unwrap();
+        assert!(db.sef_ledger_transition("test-sale","FAILED","REVERT",None,None,None).is_err());
+        let conn=db.conn().unwrap();
+        assert!(conn.execute("DELETE FROM sef_mjeku_transactions WHERE sale_id='test-sale'",[]).is_err());
+        assert!(conn.execute("UPDATE sef_mjeku_events SET event_type='x'",[]).is_err());
+        assert!(conn.execute("DELETE FROM sef_mjeku_events",[]).is_err());
+        let events:i64=conn.query_row("SELECT COUNT(*) FROM sef_mjeku_events WHERE sale_id='test-sale'",[],|r|r.get(0)).unwrap();
+        assert_eq!(events,5);
+    }
+}
