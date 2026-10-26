@@ -1781,6 +1781,31 @@ async fn physiotherapy_document_open(
 }
 
 #[tauri::command]
+async fn physiotherapy_body_markers_list(
+    state:tauri::State<'_,AppState>,physiotherapy_episode_id:String,
+)->Result<Vec<serde_json::Value>,String>{
+    let _=require_orthopedic_surgeon(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(
+        move || db.physiotherapy_body_markers_list(&physiotherapy_episode_id)
+    ).await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn physiotherapy_body_marker_add(
+    state:tauri::State<'_,AppState>,value:serde_json::Value,
+)->Result<serde_json::Value,String>{
+    let actor=match require_orthopedic_surgeon(&state).await?{
+        SessionKind::Doctor{doctor_id,..}=>doctor_id,
+        _=>return Err("Kërkohet mjeku i identifikuar.".into())
+    };
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(
+        move || db.physiotherapy_body_marker_add(&value,&actor)
+    ).await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
 async fn orthopedic_rehab_plans_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
@@ -5176,6 +5201,8 @@ pub fn run() {
             physiotherapy_hep_assign,
             physiotherapy_hep_log_add,
             physiotherapy_hep_logs_list,
+            physiotherapy_body_markers_list,
+            physiotherapy_body_marker_add,
             physiotherapy_reports_list,
             physiotherapy_report_create,
             physiotherapy_document_export_pdf,
