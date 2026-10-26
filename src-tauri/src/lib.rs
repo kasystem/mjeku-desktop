@@ -3726,7 +3726,7 @@ fn sef_reconcile_blocking(
         return Err("Totali i kuponit në PROGRAMERI POS nuk përputhet me kërkesën e ruajtur. Kërko verifikim manual.".into());
     }
     if let Some(existing)=record.coupon_id.as_deref() {
-        if existing!=coupon.coupon_id {
+        if existing!=coupon.coupon_id.as_str() {
             return Err("Identiteti i kuponit ndryshoi. Fiskalizimi është bllokuar.".into());
         }
     }
