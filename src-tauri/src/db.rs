@@ -2136,6 +2136,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/physiotherapy_v5.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v2.sql"))?;
+        conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -2166,6 +2167,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/physiotherapy_v5.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v2.sql"))?;
+        conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
