@@ -1003,6 +1003,23 @@ mod tests {
     }
 
     #[test]
+    fn v2_sef_requires_explicit_catalog_and_configured_operator() {
+        let lines=[line("service",1.0,25.0,"D")];
+        let mut request=build_fiscalize_request_strict(&lines,&[pay("cash",25.0)],&VatRates::default()).unwrap();
+        request.items[0].category_code="BM".into();
+        request.items[0].unit_code="HUR".into();
+        assert!(fiscalize_params_v2("sale","2026-10-26T10:00:00Z","",&request).is_err());
+        let payload=fiscalize_params_v2("sale","2026-10-26T10:00:00Z","Arta Krasniqi",&request).unwrap();
+        assert_eq!(payload["payloadSchemaVersion"],2);
+        assert_eq!(payload["operatorName"],"Arta Krasniqi");
+        assert_eq!(payload["items"][0]["categoryCode"],"BM");
+        assert_eq!(payload["items"][0]["unitCode"],"HUR");
+        assert_eq!(payload["items"][0]["taxCode"],"D");
+        request.items[0].category_code="UNKNOWN".into();
+        assert!(fiscalize_params_v2("sale","2026-10-26T10:00:00Z","Arta",&request).is_err());
+    }
+
+    #[test]
     fn strict_sef_uses_four_decimal_unit_price_without_inventing_payment() {
         let rates=VatRates::default();
         let lines=[line("service",2.0,1.2345,"A")];
