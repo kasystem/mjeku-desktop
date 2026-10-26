@@ -178,3 +178,47 @@ TEST si certifikim të ri.
 **Bllokues që mbeten:** Windows build dhe testet reale ATK TEST/printer/QR;
 audit i plotë nen për nen, operatori fiskal i verifikuar, paketimi i nënshkruar,
 konfirmimi i certifikimit. Nuk janë provuar në këtë sesion.
+
+## Faza të implementuara pas auditimit — pa X/Z
+
+**Faza 1 — klasifikim fiskal dhe operator:**
+- POS: `payloadSchemaVersion=2`, `operatorName` nga statusi i motorit SEF
+  dhe krahasim në server me operatorin e konfiguruar. Artikujt kanë
+  `categoryCode` SM/BM/PM, `unitCode` EA/HUR/DAY, `taxCode` A/C/D/E;
+  serveri validon kategorinë, njësinë, kodin dhe normën e TVSH-së.
+  Hash-i i idempotencës për versionin e ri përfshin klasifikimin dhe operatorin;
+  kërkesat e vjetra të protokollit nuk ndryshojnë.
+- MJEKU: `sef_mjeku_v4.sql`, API Rust `sef_item_fiscal_catalog_*`,
+  fusha të reja te detajet e vizitës, dhe dërgim i versionit v2.
+  Fiskalizimi bllokohet derisa përdoruesi të ruajë kategorinë/njësinë dhe
+  POS të konfirmojë operatorin. Asnjë diagnozë/note klinike nuk dërgohet.
+
+**Faza 2 — integriteti lokal:**
+- `sef_mjeku_v5.sql` ruan SHA-256 zinxhir për ngjarjet e reja fiskale.
+  Kontrolli i zinxhirit kryhet para çdo ndryshimi të statusit, dhe është
+  ekspozuar një buton vetëm-lexim në faqen `Kuponët SEF`.
+  Ngjarjet historike para migrimit mbeten jashtë këtij zinxhiri;
+  aplikacioni e raporton këtë numër në vend që ta fshehë.
+
+**Faza 3 — parapamja e kuponit:**
+- `coupon.preview` merr PNG direkt nga `SefFiscalQueue.PreviewCopyAsync` në POS,
+  vetëm për një kupon ekzistues të lëshuar nga MJEKU, me QR dhe shenjën KOPJE.
+  UI shfaq këtë PNG, por NUK e printon WebView-in dhe NUK krijon kupon të ri.
+  Kopja fizike vazhdon të përdorë `coupon.copy`.
+
+**Teste të shkruara, ende të paekzekutuara në Windows:**
+- `MjekuBridgeTests` (POS): operatori, taksa, kategori/njësi, hash i
+  përmbajtjes, parapamja e kuponit ekzistues pa fiskalizim të dytë.
+- Testet Rust: validimi i kontratës v2, integriteti i eventeve të reja
+  dhe mbrojtja kundër shkrimit/fshirjes së tyre.
+
+**Mbeten pa u mbyllur:** ekzekutimi i build-it dhe testeve reale,
+VAT/ATK category/unit nga konfigurimi real, nënshkrimi Authenticode,
+hardening i signer allow-list të procesit, rikuperimi nga restart/offline
+me pajisje reale, eksport administrativ CSV/PDF i historikut, dërgimi
+elektronik i kuponit (email), pajtueshmëria e plotë nen-për-nen dhe
+konfirmimi zyrtar i certifikimit. Nuk po ndryshohen ose ridizajnohen
+Raportet X/Z sipas kërkesës së përdoruesit.
+
+**Kujdes:** Këto commit-e janë implementim kodor në branch-e zhvillimi,
+jo provë që u ekzekutuan, jo certifikim ATK dhe jo lëshim PROD.
