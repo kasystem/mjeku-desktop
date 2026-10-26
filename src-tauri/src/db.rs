@@ -8901,6 +8901,10 @@ mod sef_mjeku_ledger_tests {
         assert_eq!(audit["valid"],true);
         assert_eq!(audit["verifiedEvents"],5);
         assert_eq!(audit["historicalUnchained"],0);
+        let csv=db.sef_audit_csv().unwrap();
+        assert!(csv.starts_with("kind,source_id,event_type,status,error_code,occurred_at,sha256\n"));
+        assert!(csv.contains("SALE,"));
+        assert!(!csv.contains("diagnosis"));
         assert!(conn.execute("UPDATE sef_mjeku_event_chain SET event_hash=?1",[&"a".repeat(64)]).is_err());
         assert!(conn.execute("DELETE FROM sef_mjeku_event_chain",[]).is_err());
     }
