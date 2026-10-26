@@ -1290,6 +1290,30 @@ impl Db {
             "status":status,"replaces_id":replacement,"created_at":now}))
     }
 
+    pub fn physiotherapy_hep_logs_list(&self,ep:&str)
+        ->anyhow::Result<Vec<serde_json::Value>>{
+        let conn=self.conn.lock().unwrap();
+        let mut stmt=conn.prepare(
+            "SELECT l.id,l.hep_id,x.title,l.performed_date,l.self_reported,
+             l.performed,l.response,l.recorded_by,l.created_at
+             FROM physiotherapy_hep_logs l
+             JOIN physiotherapy_hep h ON h.id=l.hep_id
+             JOIN physiotherapy_exercises x ON x.id=h.exercise_id
+             WHERE h.physiotherapy_episode_id=?1
+             ORDER BY l.performed_date DESC,l.created_at DESC")?;
+        let rows=stmt.query_map([ep],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,"hep_id":r.get::<_,String>(1)?,
+            "exercise_title":r.get::<_,String>(2)?,
+            "performed_date":r.get::<_,String>(3)?,
+            "self_reported":r.get::<_,i64>(4)?==1,
+            "performed":r.get::<_,i64>(5)?==1,
+            "response":r.get::<_,String>(6)?,
+            "recorded_by":r.get::<_,String>(7)?,
+            "created_at":r.get::<_,String>(8)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn physiotherapy_hep_log_add(
         &self,v:&serde_json::Value,actor:&str
     )->anyhow::Result<serde_json::Value>{
