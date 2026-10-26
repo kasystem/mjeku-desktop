@@ -3691,11 +3691,16 @@ fn sef_build_sale(
     use sha2::Digest;
     let data = db.sef_collect_sale(sale_id, allow_any).map_err(err_string)?;
     let rates = crate::sef_bridge::VatRates::from_settings(|k| db.setting_get(k).ok().flatten());
-    let lines: Vec<crate::sef_bridge::SaleLine> = data.items.iter().map(|it|
-        crate::sef_bridge::SaleLine {
-            id: it.id.clone(), title: it.title.clone(), qty: it.qty,
+    let lines: Vec<crate::sef_bridge::SaleLine> = data.items.iter().map(|it| {
+        // The clinical procedure title/diagnosis must NEVER enter the POS fiscal ledger.
+        // The user explicitly maintains a separate fiscal-only description.
+        let title=db.sef_fiscal_title_for(&it.id).map_err(err_string)?
+            .ok_or_else(||format!("Mungon përshkrimi fiskal për një procedurë. Plotëso përshkrimin e kuponit te detajet e vizitës (pa të dhëna klinike)."))?;
+        Ok(crate::sef_bridge::SaleLine {
+            id: it.id.clone(), title, qty: it.qty,
             unit_price: it.unit_price, vat_code: it.vat_code.clone()
-        }).collect();
+        })
+    }).collect::<Result<Vec<_>,String>>()?;
     let payments: Vec<crate::sef_bridge::SalePayment> = data.payments.iter().map(|(m,a)|
         crate::sef_bridge::SalePayment { method:m.clone(), amount:*a }).collect();
     let req = crate::sef_bridge::build_fiscalize_request_strict(&lines, &payments, &rates)
