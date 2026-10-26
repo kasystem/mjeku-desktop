@@ -3684,7 +3684,7 @@ fn sef_build_sale(
         }).collect();
     let payments: Vec<crate::sef_bridge::SalePayment> = data.payments.iter().map(|(m,a)|
         crate::sef_bridge::SalePayment { method:m.clone(), amount:*a }).collect();
-    let req = crate::sef_bridge::build_fiscalize_request(&lines, &payments, &rates)
+    let req = crate::sef_bridge::build_fiscalize_request_strict(&lines, &payments, &rates)
         .map_err(err_string)?;
     let canonical = serde_json::to_vec(&serde_json::json!({
         "items": &req.items, "payments": &req.payments
