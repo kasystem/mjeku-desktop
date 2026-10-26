@@ -678,8 +678,8 @@ pub fn build_fiscalize_request_strict(
             return Err(local_validation("Sasia fiskale lejon maksimumi tri shifra pas presjes."));
         }
         let milli=qty_to_milli(line.qty) as i128;
-        let cents=money_to_cents(line.unit_price)? as i128;
-        checked_total+=(milli*cents+500)/1000;
+        let price4=money_to_ten_thousandths(line.unit_price)? as i128;
+        checked_total+=(milli*price4+50_000)/100_000;
         if checked_total > i64::MAX as i128 {
             return Err(local_validation("Shuma e faturës tejkalon kufirin e sigurt SEF."));
         }
@@ -694,12 +694,30 @@ pub fn build_fiscalize_request_strict(
         paid=paid.checked_add(money_to_cents(payment.amount)?)
             .ok_or_else(||local_validation("Shuma e pagesave është shumë e madhe."))?;
     }
-    let req=build_fiscalize_request(lines,payments,rates)?;
-    if req.total_cents as i128 != checked_total || paid!=req.total_cents {
+    let mut req=build_fiscalize_request(lines,payments,rates)?;
+    for (item,line) in req.items.iter_mut().zip(lines.iter()) {
+        item.unit_price_ten_thousandths=money_to_ten_thousandths(line.unit_price)?;
+    }
+    req.total_cents=checked_total as i64;
+    // Never use the legacy builder's fallback payment. Reconstruct actual payments.
+    req.payments.clear();
+    for payment in payments {
+        let cents=money_to_cents(payment.amount)?;
+        let method=map_payment_method(&payment.method);
+        if let Some(existing)=req.payments.iter_mut().find(|x|x.method==method) {
+            existing.amount_cents=existing.amount_cents.checked_add(cents)
+                .ok_or_else(||local_validation("Shuma e pagesave është shumë e madhe."))?;
+        } else {
+            req.payments.push(FiscalPayment { method:method.to_string(),amount_cents:cents });
+        }
+    }
+    let coupon_total=money_to_cents(lines.iter().map(|l|l.qty*l.unit_price).sum())?;
+    if paid!=req.total_cents || coupon_total!=req.total_cents {
         return Err(local_validation(
-            "Pagesat reale nuk përputhen me shumën e shërbimeve. SEF nuk do të krijojë pagesë automatike ose të ndryshojë metodën e pagesës."
+            "Pagesat ose rrumbullakimi i kuponit nuk përputhen me shumën e shërbimeve. SEF nuk ndryshon pagesat ose çmimet automatikisht."
         ));
     }
+    check_sums(&req)?;
     if req.total_cents<=0 {
         return Err(local_validation("Shuma e faturës SEF duhet të jetë pozitive."));
     }
@@ -713,7 +731,7 @@ pub fn check_sums(req: &FiscalizeRequest) -> Result<(), BridgeError> {
         .iter()
         .map(|i| {
             let milli = parse_qty_milli(&i.qty).unwrap_or(0);
-            line_total_cents(milli, i.unit_price_cents)
+            line_total_cents_precise(milli, if i.unit_price_ten_thousandths>0 { i.unit_price_ten_thousandths } else { i.unit_price_cents*100 })
         })
         .sum();
     let pays: i64 = req.payments.iter().map(|p| p.amount_cents).sum();
