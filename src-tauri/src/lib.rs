@@ -3859,7 +3859,7 @@ fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<Str
     }
     if coupon.duplicate==Some(true){msg.push_str(" Kupon ekzistues, pa dublim.");}
     match coupon.printed {
-        Some(true) => msg.push_str(" Kuponi u printua fizikisht nga printeri SEF i PROGRAMERI POS."),
+        Some(true) => msg.push_str(" Kuponi u dërgua me sukses te printeri fizik SEF i PROGRAMERI POS."),
         Some(false) => {
             msg.push_str(" KUJDES: kuponi u regjistrua fiskalisht, por NUK u printua fizikisht. Konfiguro printerin te SEF -> Printeri, pastaj shko te Kuponët SEF -> Printo kopje; MOS e fiskalizo sërish.");
             if let Some(error) = coupon.print_error.as_deref().filter(|s|!s.trim().is_empty()) {
