@@ -138,3 +138,25 @@ closed orthopedic episode write refusal, and restart persistence.
 Do not use as a fully validated production medical device or clinical
 record system until relevant security, audit, testing and sign-off steps
 are completed.
+
+## New addition: physiotherapy_v5.sql and reviewed progress charts
+
+- `physiotherapy_body_markers` stores patient's anatomical findings,
+  normalized (x,y), view, region, laterality, classification, author and
+  time. Markers are append-only, and inserts are refused for closed cases.
+- A real Body Map form in Physiotherapy uses the same anatomical SVG
+  infrastructure as Orthopedics, while preserving its own clinical evidence.
+- Trend charts group measurements by region, movement, laterality, method and
+  instrument version; unrelated joint measurements are no longer combined.
+  Superseded measurements remain in the audit history but are excluded from
+  the plotted current clinical series.
+- The existing HEP observation timeline now displays both completed and
+  uncompleted exercises, authored dates and provenance of self-report.
+- Physiotherapy's phase selector displays only the orthopedic-approved phase,
+  instead of allowing a silent parallel phase change.
+- An additional Rust test checks persisted Body Map coordinates and
+  author metadata; another verifies idempotent application of migrations
+  `physiotherapy_v1.sql` through `v5.sql`.
+
+**No new Windows compiler, test suite, installer or end-to-end run has been
+performed in this session.** Code and static command-registration checks only.
