@@ -4094,6 +4094,23 @@ async fn sef_ledger_list(state: tauri::State<'_, AppState>)
 }
 
 #[tauri::command]
+async fn sef_audit_export_csv(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let _=require_owner(&state).await?;
+    require_sef_provider(&state).await?;
+    let desktop=app.path().desktop_dir().map_err(err_string)?;
+    let db=state.db.clone();
+    let csv=tokio::task::spawn_blocking(move || db.sef_audit_csv())
+        .await.map_err(err_string)?.map_err(err_string)?;
+    let path=desktop.join(format!("MJEKU-SEF-AUDIT-{}.csv",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    std::fs::write(&path,csv.as_bytes()).map_err(err_string)?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
 async fn sef_audit_verify(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
     let _=require_finance(&state).await?;
     require_sef_provider(&state).await?;
@@ -5624,6 +5641,7 @@ pub fn run() {
             sef_bridge_select_engine,
             sef_ledger_list,
             sef_audit_verify,
+            sef_audit_export_csv,
             sef_sale_reconcile,
             sef_coupons_list,
             sef_coupon_copy,
