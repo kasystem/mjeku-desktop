@@ -3703,8 +3703,15 @@ fn sef_build_sale(
     }).collect::<Result<Vec<_>,String>>()?;
     let payments: Vec<crate::sef_bridge::SalePayment> = data.payments.iter().map(|(m,a)|
         crate::sef_bridge::SalePayment { method:m.clone(), amount:*a }).collect();
-    let req = crate::sef_bridge::build_fiscalize_request_strict(&lines, &payments, &rates)
+    let mut req = crate::sef_bridge::build_fiscalize_request_strict(&lines, &payments, &rates)
         .map_err(err_string)?;
+    for (line, source_item) in req.items.iter_mut().zip(data.items.iter()) {
+        let (category,unit)=db.sef_fiscal_catalog_for(&source_item.id).map_err(err_string)?
+            .ok_or_else(|| "Mungon kategoria/njësia ATK e shërbimit. Plotëso klasifikimin fiskal te detajet e vizitës.".to_string())?;
+        line.category_code=category;
+        line.unit_code=unit;
+        line.tax_code=source_item.vat_code.trim().to_ascii_uppercase();
+    }
     let canonical = serde_json::to_vec(&serde_json::json!({
         "items": &req.items, "payments": &req.payments
     })).map_err(err_string)?;
@@ -3796,8 +3803,17 @@ fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<Str
         }
     }
     let (data,req,hash)=sef_build_sale(db,&sale_id,allow_any)?;
+    // Read POS-authoritative fiscal operator before recording an immutable request.
+    // Do not allow the browser or a clinical user name to impersonate the SEF operator.
+    let status=sef_call_blocking("status",serde_json::json!({}),crate::sef_bridge::DEFAULT_TIMEOUT)
+        .map_err(|e|format!("Operatori fiskal i POS nuk mund të verifikohet ({}).",e.code))?;
+    let operator=status.get("operatorName").and_then(|x|x.as_str()).unwrap_or("").trim();
+    if operator.is_empty() {
+        return Err("POS nuk ka operator fiskal të konfiguruar. Hape konfigurimin SEF.".into());
+    }
     let issued_at=chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,false);
-    let params=crate::sef_bridge::fiscalize_params(&data.sale.id,&issued_at,&req);
+    let params=crate::sef_bridge::fiscalize_params_v2(&data.sale.id,&issued_at,operator,&req)
+        .map_err(err_string)?;
     let payload=serde_json::to_string(&params).map_err(err_string)?;
     let record=db.sef_ledger_prepare(&sale_id,&hash,&payload,allow_any,req.total_cents,context)
         .map_err(err_string)?;
@@ -4249,6 +4265,26 @@ async fn sef_item_fiscal_title_set(
     let _=require_finance(&state).await?;
     let db=state.db.clone();
     tokio::task::spawn_blocking(move || db.sef_item_fiscal_title_set(&item_id,&fiscal_title))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_item_fiscal_catalog_list(
+    state: tauri::State<'_, AppState>, visit_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _=require_login(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_item_fiscal_catalog_list(&visit_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_item_fiscal_catalog_set(
+    state: tauri::State<'_, AppState>, item_id: String, category_code: String, unit_code: String,
+) -> Result<(), String> {
+    let _=require_finance(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_item_fiscal_catalog_set(&item_id,&category_code,&unit_code))
         .await.map_err(err_string)?.map_err(err_string)
 }
 
@@ -5569,6 +5605,8 @@ pub fn run() {
             sef_action_reconcile,
             sef_item_fiscal_titles_list,
             sef_item_fiscal_title_set,
+            sef_item_fiscal_catalog_list,
+            sef_item_fiscal_catalog_set,
             sef_report,
             sef_sale_items,
             sef_sale_coupon,
