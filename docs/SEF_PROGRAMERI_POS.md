@@ -4,6 +4,14 @@ Statusi: kodi është shkruar (Faza 2 dhe 3 të planit); **nuk është ndërtuar
 
 **Përditësim 26.10.2026:** U shtuan regjistri lokal SEF i pandryshueshëm, `sale.lookup` dhe rikuperimi pa ridërgim automatik. Fiskalizimi i ri kërkon pagesa reale që përputhen saktësisht; rregulli i vjetër i pagesës cash automatike nuk zbatohet në rrugën e re strikte. Shih [SEF_ATK_MJEKU_IMPLEMENTATION_2026_10_26.md](SEF_ATK_MJEKU_IMPLEMENTATION_2026_10_26.md).
 
+**Zgjerim i implementuar në kod më 26.10.2026 (ende pa build/test Windows):**
+`coupon.return` dhe `coupon.cancel` tani përdorin UUID të ruajtur para IPC;
+`action.lookup` verifikon pa riemetim; migrimi lokal `sef_mjeku_v2.sql`
+ruan historinë e veprimeve. `unitPriceTenThousandths` bart çmimin me
+katër shifra; `sef_mjeku_v3.sql` mban përshkrimet fiskale të ndara
+nga titujt klinikë, të cilat duhen plotësuar te detajet e vizitës.
+Shih [SEF_ATK_MJEKU_IMPLEMENTATION_2026_10_26.md](SEF_ATK_MJEKU_IMPLEMENTATION_2026_10_26.md).
+
 Kontrata e thirrjeve: `pos-native-windows/docs/MJEKU_SEF_BRIDGE_CONTRACT.md` (v1).
 Plani: `Desktop\Plani 2026\Plani i integrimit te Mjeku brenda PROGRAMERI POS\INTEGRIMI_I_MJEKUT_ME_SEF.md`.
 
