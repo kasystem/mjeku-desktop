@@ -536,6 +536,50 @@ mod orthopedic_lifecycle_tests {
     }
 
     #[test]
+    fn physio_body_map_markers_preserve_normalized_coordinates_and_actor() {
+        let (db,id)=setup_physio();
+        let marker=serde_json::json!({
+            "physiotherapy_episode_id":id,"view":"anterior",
+            "region":"left_knee","laterality":"left",
+            "classification":"pain","x":0.38,"y":0.76,
+            "note":"Patient reports discomfort"
+        });
+        let saved=db.physiotherapy_body_marker_add(&marker,"doctor-a").unwrap();
+        assert_eq!(saved["x"],0.38);
+        assert_eq!(saved["clinician_id"],"doctor-a");
+        let mut invalid=marker.clone();
+        invalid["y"]=serde_json::json!(-0.5);
+        assert!(db.physiotherapy_body_marker_add(&invalid,"doctor-a").is_err());
+        invalid=marker.clone();
+        invalid["laterality"]=serde_json::json!("invalid");
+        assert!(db.physiotherapy_body_marker_add(&invalid,"doctor-a").is_err());
+        let list=db.physiotherapy_body_markers_list(&id).unwrap();
+        assert_eq!(list.len(),1);
+        assert_eq!(list[0]["region"],"left_knee");
+        assert!(db.conn.lock().unwrap().execute(
+            "UPDATE physiotherapy_body_markers SET x=0.0 WHERE id=?1",
+            [saved["id"].as_str().unwrap()]
+        ).is_err());
+    }
+
+    #[test]
+    fn physio_migrations_can_reapply_without_losing_existing_data() {
+        let (db,id)=setup_physio();
+        let conn=db.conn.lock().unwrap();
+        for v in [
+            include_str!("../migrations/physiotherapy_v1.sql"),
+            include_str!("../migrations/physiotherapy_v2.sql"),
+            include_str!("../migrations/physiotherapy_v3.sql"),
+            include_str!("../migrations/physiotherapy_v4.sql"),
+            include_str!("../migrations/physiotherapy_v5.sql")
+        ] {conn.execute_batch(v).expect("idempotent physiotherapy migration");}
+        let present:i64=conn.query_row(
+            "SELECT count(*) FROM physiotherapy_episodes WHERE id=?1",
+            [id.as_str()],|r|r.get(0)).unwrap();
+        assert_eq!(present,1,"Migration must preserve existing rehabilitation episode");
+    }
+
+    #[test]
     fn physio_measurements_and_care_plans_keep_validation_and_versions() {
         let (db,id)=setup_physio();
         let rom=serde_json::json!({
