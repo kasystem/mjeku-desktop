@@ -4228,6 +4228,26 @@ async fn sef_action_reconcile(
     }).await.map_err(err_string)?
 }
 
+#[tauri::command]
+async fn sef_item_fiscal_titles_list(
+    state: tauri::State<'_, AppState>, visit_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _=require_login(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_item_fiscal_titles_list(&visit_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_item_fiscal_title_set(
+    state: tauri::State<'_, AppState>, item_id: String, fiscal_title: String,
+) -> Result<(), String> {
+    let _=require_finance(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_item_fiscal_title_set(&item_id,&fiscal_title))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
 /// Raporti X/Z i plotë (tekst + totale) për faqen "Kuponët".
 #[tauri::command]
 async fn sef_report(
@@ -5543,6 +5563,8 @@ pub fn run() {
             sef_coupon_cancel,
             sef_actions_list,
             sef_action_reconcile,
+            sef_item_fiscal_titles_list,
+            sef_item_fiscal_title_set,
             sef_report,
             sef_sale_items,
             sef_sale_coupon,
