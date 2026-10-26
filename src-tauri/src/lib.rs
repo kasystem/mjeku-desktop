@@ -3956,6 +3956,37 @@ async fn sef_bridge_select_engine(state: tauri::State<'_, AppState>) -> Result<b
 }
 
 #[tauri::command]
+async fn sef_ledger_list(state: tauri::State<'_, AppState>)
+    -> Result<Vec<serde_json::Value>, String> {
+    let _=require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_ledger_list())
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+/// Read-only POS lookup and local state repair. This command never issues a coupon.
+#[tauri::command]
+async fn sef_sale_reconcile(
+    state: tauri::State<'_, AppState>, sale_id: String
+) -> Result<String, String> {
+    let _=require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let sale_id=sale_id.trim().to_string();
+    if sale_id.is_empty(){return Err("Zgjidh faturën për rikuperim.".into());}
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let _guard=sef_fiscal_lock().lock().unwrap_or_else(|p|p.into_inner());
+        let record=db.sef_ledger_get(&sale_id).map_err(err_string)?
+            .ok_or_else(||"Nuk ka një tentativë SEF të regjistruar për këtë faturë.".to_string())?;
+        if record.status=="READY" {
+            return Err("Kjo faturë nuk është dërguar ende në PROGRAMERI POS.".into());
+        }
+        sef_reconcile_blocking(&db,&sale_id,&record)
+    }).await.map_err(err_string)?
+}
+
+#[tauri::command]
 async fn sef_coupons_list(
     state: tauri::State<'_, AppState>,
     from: Option<String>,
@@ -5380,6 +5411,8 @@ pub fn run() {
             sef_bridge_info,
             sef_bridge_status,
             sef_bridge_select_engine,
+            sef_ledger_list,
+            sef_sale_reconcile,
             sef_coupons_list,
             sef_coupon_copy,
             sef_coupon_return,
