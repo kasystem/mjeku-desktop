@@ -132,3 +132,49 @@ TEST si certifikim të ri.
   ndërprerjen e energjisë/internetit, versionet e dy aplikacioneve.
 - Gjurmueshmëri e plotë nen për nen për gjithë PDF-në, audit i sigurisë,
   nënshkrimi i binarëve dhe konfirmim i fushës së certifikimit nga ATK.
+
+
+## Implementim shtesë i 26.10.2026 — kthim/anulim i sigurt dhe çmim i saktë
+
+**Kodi u shkrua në tri degët e zhvillimit; nuk u ekzekutua build/test në Windows dhe nuk është miratim ATK.**
+
+- POS: `coupon.return` / `coupon.cancel` kërkojnë `requestId` UUID të qëndrueshëm.
+  Rezervimi `STARTED` bëhet në transaksion SQLite `IMMEDIATE` përpara motorit
+  fiskal. Çelësi `ACTION|mjeku|requestId` është unik; hash-i i përmbajtjes bllokon
+  përdorimin e UUID-së me kupon/sasi/arsye tjetër. Në rast të përgjigjes së humbur
+  `action.lookup` lexon kuponin ekzistues pa lëshim të ri. Nëse hyrja nuk gjendet,
+  `UNKNOWN` / `ACTION_UNCERTAIN` bllokojnë një veprim tjetër derisa të verifikohet.
+- MJEKU: `sef_mjeku_v2.sql` ruan UUID, payload-in e pandryshueshëm, kontekstin,
+  statuset dhe eventet append-only për çdo kthim/anulim. Kërkesa shkruhet para IPC.
+  `IN_FLIGHT → UNKNOWN` pas timeout-it, pa retry. UI ka historikun dhe
+  butonin vetëm-lexim **Verifiko në POS**.
+- Çmimet: kontrata v1 u zgjerua me `unitPriceTenThousandths` (njësi 0.0001 EUR).
+  POS përdor vlerën precize për ndërtimin e kuponit, kurse `unitPriceCents` ruhet
+  për klientët e vjetër. Rust refuzon çmime me më shumë se katër shifra pas presjes
+  dhe llogarit totalet në cent me aritmetikë të plotë; POS kontrollon përputhjen
+  e rrumbullakimit. Për rastet e vjetra hash-i i shitjes mbetet v1.
+- Privatësia: `sef_mjeku_v3.sql` shton përshkrimin fiskal të veçantë për secilin
+  rresht të vizitës. Në detajet e vizitës shfaqet fusha **Përshkrimi në kupon**.
+  `sef_build_sale` refuzon kuponin nëse përshkrimi mungon dhe nuk përdor
+  automatikisht titullin/shënimet klinike. Përshkrimi ngrin pas fiskalizimit.
+  Përdoruesi duhet të shkruajë vetëm emrin fiskal të shërbimit, pa të dhëna personale.
+
+### Teste shtesë të domosdoshme para çdo instalimi
+
+1. `dotnet test tests/Programeri.Pos.Tests --filter "FullyQualifiedName~MjekuBridgeTests"`
+   — përfshin UUID të njëjtë, payload tjetër, ndërprerje para/pas ruajtjes së
+   kuponit, `action.lookup` dhe çmimin 1.2345 EUR.
+2. `cargo test --manifest-path src-tauri/Cargo.toml sef`
+   — migrimet, append-only, rezervimin e një veprimi të pasigurt, çmimet 4 shifra.
+3. `npm run typecheck && npm run build` në `mjeku-ui`.
+4. Në Windows TEST: kthim/anulim me timeout të simuluar, restart POS, lookup,
+   kontroll i vetëm një kuponi; sasi të pjesshme, konflikt UUID, ndryshim arsyeje,
+   çmime 0.0001/1.2345, TVSH, printim, QR, ë/ç, internet/energji offline.
+5. Provo në POS TEST identitetin fiskal të operatorit dhe pajtueshmërinë e
+   përshkrimeve me ATK; mblidh prova të nënshkrimit dhe të radhës fiskale.
+6. Merr konfirmim zyrtar për fushën e certifikimit dhe për përditësimin e
+   integrimit përpara prodhimit.
+
+**Bllokues që mbeten:** Windows build dhe testet reale ATK TEST/printer/QR;
+audit i plotë nen për nen, operatori fiskal i verifikuar, paketimi i nënshkruar,
+konfirmimi i certifikimit. Nuk janë provuar në këtë sesion.
