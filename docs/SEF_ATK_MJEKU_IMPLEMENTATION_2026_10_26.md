@@ -222,3 +222,10 @@ Raportet X/Z sipas kërkesës së përdoruesit.
 
 **Kujdes:** Këto commit-e janë implementim kodor në branch-e zhvillimi,
 jo provë që u ekzekutuan, jo certifikim ATK dhe jo lëshim PROD.
+
+**Shtesë: eksport administrativ CSV.** `sef_audit_export_csv` pranon vetëm
+`require_owner` (pronar ose mjek administrator), verifikon zinxhirin SHA-256,
+dhe ruan në Desktop një CSV me `kind,source_id,event_type,status,error_code,occurred_at,sha256`.
+Asnjë ID pacienti, diagnozë, notë klinike ose sekret ATK nuk eksportohet.
+Ngjarjet para migrimit kanë kolonë SHA-256 bosh, jo hash të fabrikuar.
+Eksporti PDF mbetet jashtë kësaj faze.
