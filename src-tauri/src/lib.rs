@@ -4147,6 +4147,24 @@ async fn sef_coupons_list(
     .map_err(err_string)
 }
 
+/// POS-authored raster of an existing fiscal copy. Never fiscalizes or prints.
+#[tauri::command]
+async fn sef_coupon_preview(
+    state: tauri::State<'_, AppState>,
+    coupon_id: String,
+) -> Result<serde_json::Value, String> {
+    let _=require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let coupon_id=coupon_id.trim().to_string();
+    if coupon_id.parse::<i64>().ok().filter(|x|*x>0).is_none() {
+        return Err("Zgjidh një kupon fiskal të vlefshëm.".into());
+    }
+    crate::sef_bridge::call("coupon.preview",
+        serde_json::json!({"couponId":coupon_id}),
+        crate::sef_bridge::DEFAULT_TIMEOUT)
+        .await.map_err(err_string)
+}
+
 #[tauri::command]
 async fn sef_coupon_copy(
     state: tauri::State<'_, AppState>,
@@ -5609,6 +5627,7 @@ pub fn run() {
             sef_sale_reconcile,
             sef_coupons_list,
             sef_coupon_copy,
+            sef_coupon_preview,
             sef_coupon_return,
             sef_coupon_cancel,
             sef_actions_list,
