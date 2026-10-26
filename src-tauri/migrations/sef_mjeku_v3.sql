@@ -12,3 +12,17 @@ CREATE TRIGGER IF NOT EXISTS sef_mjeku_item_title_frozen
  BEFORE UPDATE ON sef_mjeku_item_titles
  WHEN EXISTS(SELECT 1 FROM visit_items WHERE id=OLD.visit_item_id AND fiscalized=1)
  BEGIN SELECT RAISE(ABORT,'SEF fiscal service title is frozen after fiscalization'); END;
+CREATE TRIGGER IF NOT EXISTS sef_mjeku_item_title_frozen_after_request
+ BEFORE UPDATE ON sef_mjeku_item_titles
+ WHEN EXISTS(
+   SELECT 1 FROM visit_items i JOIN sef_mjeku_transactions s ON s.sale_id=i.visit_id
+   WHERE i.id=OLD.visit_item_id
+ )
+ BEGIN SELECT RAISE(ABORT,'SEF fiscal service title frozen after request'); END;
+CREATE TRIGGER IF NOT EXISTS sef_mjeku_item_title_no_insert_after_request
+ BEFORE INSERT ON sef_mjeku_item_titles
+ WHEN EXISTS(
+   SELECT 1 FROM visit_items i JOIN sef_mjeku_transactions s ON s.sale_id=i.visit_id
+   WHERE i.id=NEW.visit_item_id
+ )
+ BEGIN SELECT RAISE(ABORT,'SEF fiscal service title frozen after request'); END;
