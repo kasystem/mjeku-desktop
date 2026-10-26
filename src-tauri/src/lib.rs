@@ -3840,6 +3840,89 @@ fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<Str
     Ok(msg)
 }
 
+
+fn sef_action_issue_blocking(
+    db: &Db, kind: &str, coupon_id: &str, params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let session=crate::sef_bridge::Session::from_env().map_err(err_string)?;
+    let context=session.context.as_deref().filter(|s|!s.trim().is_empty())
+        .ok_or_else(||"PROGRAMERI POS nuk dërgoi kontekstin fiskal.".to_string())?;
+    let _guard=sef_fiscal_lock().lock().unwrap_or_else(|p|p.into_inner());
+    let record=db.sef_action_prepare(kind,coupon_id,&params,context)
+        .map_err(|e|format!("Veprimi SEF nuk u rezervua: {e}. Kontrollo historikun dhe verifiko veprimet e pasigurta në POS."))?;
+    db.sef_action_transition(&record.request_id,"IN_FLIGHT","DISPATCH",None,None,None)
+        .map_err(err_string)?;
+    let op=if kind=="RETURN"{"coupon.return"}else{"coupon.cancel"};
+    let saved:serde_json::Value=serde_json::from_str(&record.request_json).map_err(err_string)?;
+    let response=sef_call_blocking(op,saved,crate::sef_bridge::DEFAULT_TIMEOUT);
+    let result=match response {
+        Ok(v)=>v,
+        Err(e)=>{
+            let _=db.sef_action_transition(&record.request_id,"UNKNOWN","BRIDGE_UNCERTAIN",
+                None,None,Some(&e.code));
+            return Err(format!("Rezultati i {kind} është i pasigurt ({}). Kërkesa {} u ruajt. Mos e përsërit; përdor Verifiko në POS.",e.code,record.request_id));
+        }
+    };
+    let coupon=match crate::sef_bridge::parse_coupon_result(result.clone()) {
+        Ok(c) if matches!(c.status.as_str(),"FISCALIZED"|"PENDING_OFFLINE")=>c,
+        _=>{
+            let _=db.sef_action_transition(&record.request_id,"UNKNOWN","INVALID_POS_RESULT",
+                None,None,Some("PROTOCOL"));
+            return Err(format!("Përgjigjja e POS nuk konfirmoi veprimin {}. Verifiko në POS; mos e përsërit.",record.request_id));
+        }
+    };
+    db.sef_action_transition(&record.request_id,&coupon.status,"POS_CONFIRMED",
+        Some(&coupon.coupon_id),coupon.daily_number,None).map_err(err_string)?;
+    Ok(result)
+}
+
+/// Read-only lookup of the same action UUID. Never dispatch return/cancel again.
+fn sef_action_reconcile_blocking(
+    db: &Db, record: &crate::db::SefActionRecord,
+) -> Result<String, String> {
+    let session=crate::sef_bridge::Session::from_env().map_err(err_string)?;
+    if session.context.as_deref()!=Some(record.context_id.as_str()) {
+        return Err("Konteksti fiskal i veprimit nuk përputhet me PROGRAMERI POS.".into());
+    }
+    let lookup=sef_call_blocking("action.lookup",
+        serde_json::json!({"requestId":record.request_id}),crate::sef_bridge::DEFAULT_TIMEOUT)
+        .map_err(|e|format!("PROGRAMERI POS nuk konfirmoi statusin e veprimit ({}). Mos e përsërit.",e.code))?;
+    let found=lookup["found"].as_bool()==Some(true);
+    let status=lookup["status"].as_str().unwrap_or("UNKNOWN");
+    if !found {
+        if record.status=="IN_FLIGHT" {
+            db.sef_action_transition(&record.request_id,"UNKNOWN","LOOKUP_UNCERTAIN",
+                None,None,Some("LOOKUP_UNCERTAIN")).map_err(err_string)?;
+        }
+        return Err("Veprimi nuk u konfirmua në POS. NOT_FOUND/UNKNOWN nuk autorizon përsëritje; kërko kontroll manual.".into());
+    }
+    if lookup["kind"].as_str()!=Some(record.kind.as_str()) ||
+       lookup["originalCouponId"].as_str()!=Some(record.original_coupon_id.as_str()) {
+        return Err("POS ktheu identitet tjetër të veprimit. Fiskalizimi mbetet i bllokuar.".into());
+    }
+    if !matches!(status,"FISCALIZED"|"PENDING_OFFLINE"|"FAILED") {
+        return Err("POS nuk ktheu status përfundimtar të njohur. Mos e përsërit veprimin.".into());
+    }
+    if status=="FAILED" {
+        db.sef_action_transition(&record.request_id,"FAILED","POS_FAILED",None,None,Some("POS_FAILED"))
+            .map_err(err_string)?;
+        return Err("POS raporton refuzim përfundimtar. Kërko kontroll fiskal përpara veprimit tjetër.".into());
+    }
+    let coupon=crate::sef_bridge::parse_coupon_result(lookup["coupon"].clone()).map_err(err_string)?;
+    if coupon.status!=status {
+        return Err("Statusi i kuponit nuk përputhet me përgjigjen e POS.".into());
+    }
+    if let Some(existing)=record.coupon_id.as_deref() {
+        if existing!=coupon.coupon_id.as_str() {
+            return Err("Numri i kuponit të veprimit ndryshoi. Kërko auditim.".into());
+        }
+    }
+    db.sef_action_transition(&record.request_id,status,"POS_RECONCILED",
+        Some(&coupon.coupon_id),coupon.daily_number,None).map_err(err_string)?;
+    Ok(format!("Veprimi {} u verifikua në POS: kuponi {} ({}).",
+        record.request_id,coupon.coupon_id,status))
+}
+
 async fn require_sef_provider(state: &tauri::State<'_, AppState>) -> Result<(), String> {
     let provider = get_fiscal_printer_provider(state).await?;
     if provider != crate::sef_bridge::PROVIDER_VALUE {
@@ -4065,38 +4148,32 @@ async fn sef_coupon_return(
 ) -> Result<serde_json::Value, String> {
     let _ = require_finance(&state).await?;
     require_sef_provider(&state).await?;
-    let coupon_id = coupon_id.trim().to_string();
-    let reason = reason.trim().to_string();
-    if coupon_id.is_empty() {
-        return Err("Zgjidh kuponin.".to_string());
+    let coupon_id=coupon_id.trim().to_string();
+    let reason=reason.trim().to_string();
+    if coupon_id.parse::<i64>().ok().filter(|x|*x>0).is_none() {
+        return Err("Zgjidh kuponin.".into());
     }
-    if reason.is_empty() {
-        return Err("Shkruaj arsyen e kthimit.".to_string());
+    if reason.is_empty() || reason.len()>500 {
+        return Err("Shkruaj arsyen e kthimit (maksimumi 500 karaktere).".into());
     }
-    let mut out = Vec::new();
+    if items.is_empty() || items.len()>500 {
+        return Err("Zgjidh të paktën një artikull.".into());
+    }
+    let mut out=Vec::new();
+    let mut ids=std::collections::HashSet::new();
     for it in items {
-        if !it.qty.is_finite() || it.qty <= 0.0 || it.id.trim().is_empty() {
-            continue;
+        if !it.qty.is_finite() || it.qty<=0.0 || it.qty>9_999_999.999 ||
+           (it.qty*1000.0-(it.qty*1000.0).round()).abs()>0.000001 ||
+           it.id.trim().is_empty() || it.id.len()>128 || !ids.insert(it.id.clone()) {
+            return Err("Sasia ose artikulli i kthimit është i pavlefshëm; nuk rrumbullakohet automatikisht.".into());
         }
-        let milli = crate::sef_bridge::qty_to_milli(it.qty);
-        if milli <= 0 {
-            continue;
-        }
-        out.push(serde_json::json!({
-            "id": it.id.trim(),
-            "qty": crate::sef_bridge::qty_string(milli),
-        }));
+        let milli=crate::sef_bridge::qty_to_milli(it.qty);
+        out.push(serde_json::json!({"id":it.id.trim(),"qty":crate::sef_bridge::qty_string(milli)}));
     }
-    if out.is_empty() {
-        return Err("Zgjidh të paktën një artikull dhe sasinë për kthim.".to_string());
-    }
-    crate::sef_bridge::call(
-        "coupon.return",
-        serde_json::json!({ "couponId": coupon_id, "items": out, "reason": reason }),
-        crate::sef_bridge::DEFAULT_TIMEOUT,
-    )
-    .await
-    .map_err(err_string)
+    let params=serde_json::json!({"couponId":coupon_id,"items":out,"reason":reason});
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || sef_action_issue_blocking(&db,"RETURN",&coupon_id,params))
+        .await.map_err(err_string)?
 }
 
 #[tauri::command]
@@ -4107,21 +4184,43 @@ async fn sef_coupon_cancel(
 ) -> Result<serde_json::Value, String> {
     let _ = require_finance(&state).await?;
     require_sef_provider(&state).await?;
-    let coupon_id = coupon_id.trim().to_string();
-    let reason = reason.trim().to_string();
-    if coupon_id.is_empty() {
-        return Err("Zgjidh kuponin.".to_string());
+    let coupon_id=coupon_id.trim().to_string();
+    let reason=reason.trim().to_string();
+    if coupon_id.parse::<i64>().ok().filter(|x|*x>0).is_none() {
+        return Err("Zgjidh kuponin.".into());
     }
-    if reason.is_empty() {
-        return Err("Shkruaj arsyen e anulimit.".to_string());
+    if reason.is_empty() || reason.len()>500 {
+        return Err("Shkruaj arsyen e anulimit (maksimumi 500 karaktere).".into());
     }
-    crate::sef_bridge::call(
-        "coupon.cancel",
-        serde_json::json!({ "couponId": coupon_id, "reason": reason }),
-        crate::sef_bridge::DEFAULT_TIMEOUT,
-    )
-    .await
-    .map_err(err_string)
+    let params=serde_json::json!({"couponId":coupon_id,"reason":reason});
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || sef_action_issue_blocking(&db,"CANCEL",&coupon_id,params))
+        .await.map_err(err_string)?
+}
+
+#[tauri::command]
+async fn sef_actions_list(state: tauri::State<'_, AppState>)
+    -> Result<Vec<serde_json::Value>, String> {
+    let _=require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_action_list())
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_action_reconcile(
+    state: tauri::State<'_, AppState>, request_id: String,
+) -> Result<String, String> {
+    let _=require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let _guard=sef_fiscal_lock().lock().unwrap_or_else(|p|p.into_inner());
+        let record=db.sef_action_get(request_id.trim()).map_err(err_string)?
+            .ok_or_else(||"Nuk ka veprim SEF me këtë identifikues.".to_string())?;
+        sef_action_reconcile_blocking(&db,&record)
+    }).await.map_err(err_string)?
 }
 
 /// Raporti X/Z i plotë (tekst + totale) për faqen "Kuponët".
