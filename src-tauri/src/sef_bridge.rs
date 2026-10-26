@@ -637,6 +637,48 @@ pub fn build_fiscalize_request(
     Ok(req)
 }
 
+/// ATK-facing path: do not silently fabricate a cash payment, infer VAT from an
+/// unknown code, or replace invalid amounts. Legacy builder is retained only for
+/// compatibility tests/older non-SEF paths; the production bridge uses this guard.
+pub fn build_fiscalize_request_strict(
+    lines: &[SaleLine], payments: &[SalePayment], rates: &VatRates,
+) -> Result<FiscalizeRequest, BridgeError> {
+    if lines.is_empty() || payments.is_empty() {
+        return Err(local_validation("Regjistro pagesën reale dhe shërbimin përpara fiskalizimit SEF."));
+    }
+    for line in lines {
+        if line.id.trim().is_empty() || line.title.trim().is_empty() ||
+           !line.qty.is_finite() || line.qty <= 0.0 ||
+           !line.unit_price.is_finite() || line.unit_price < 0.0 ||
+           !matches!(line.vat_code.trim().to_ascii_uppercase().as_str(),"A"|"C"|"D"|"E") {
+            return Err(local_validation("Artikulli ka sasi, çmim ose kod TVSH të pavlefshëm; korrigjo të dhënat para SEF."));
+        }
+        if (line.qty*1000.0 - (line.qty*1000.0).round()).abs() > 0.000001 {
+            return Err(local_validation("Sasia fiskale lejon maksimumi tri shifra pas presjes."));
+        }
+    }
+    let mut paid=0i64;
+    for payment in payments {
+        if !payment.amount.is_finite() || payment.amount<=0.0 ||
+           !matches!(payment.method.trim().to_ascii_lowercase().as_str(),
+               "cash"|"card"|"bank"|"transfer") {
+            return Err(local_validation("Mënyra ose shuma e pagesës është e pavlefshme për SEF."));
+        }
+        paid=paid.checked_add(money_to_cents(payment.amount)?)
+            .ok_or_else(||local_validation("Shuma e pagesave është shumë e madhe."))?;
+    }
+    let req=build_fiscalize_request(lines,payments,rates)?;
+    if paid!=req.total_cents {
+        return Err(local_validation(
+            "Pagesat reale nuk përputhen me shumën e shërbimeve. SEF nuk do të krijojë pagesë automatike ose të ndryshojë metodën e pagesës."
+        ));
+    }
+    if req.total_cents<=0 {
+        return Err(local_validation("Shuma e faturës SEF duhet të jetë pozitive."));
+    }
+    Ok(req)
+}
+
 /// Kontrolli i kontratës: shuma e artikujve = shuma e pagesave = totali.
 pub fn check_sums(req: &FiscalizeRequest) -> Result<(), BridgeError> {
     let items: i64 = req
@@ -884,6 +926,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.payments[0].method, "cash");
+    }
+
+    #[test]
+    fn strict_sef_refuses_invented_cash_unknown_tax_and_partial_payment() {
+        let lines=[line("v1",1.0,25.0,"D")];
+        let rates=VatRates::default();
+        assert!(build_fiscalize_request_strict(&lines,&[],&rates).is_err());
+        assert!(build_fiscalize_request_strict(&lines,&[pay("cash",10.0)],&rates).is_err());
+        assert!(build_fiscalize_request_strict(&[line("v1",1.0,25.0,"?")],
+            &[pay("cash",25.0)],&rates).is_err());
+        assert!(build_fiscalize_request_strict(&[line("v1",1.0004,25.0,"D")],
+            &[pay("cash",25.0)],&rates).is_err());
+        let accepted=build_fiscalize_request_strict(&lines,&[pay("card",25.0)],&rates).unwrap();
+        assert_eq!(accepted.total_cents,2500);
+        assert_eq!(accepted.payments[0].method,"card");
     }
 
     #[test]
