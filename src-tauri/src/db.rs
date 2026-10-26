@@ -8696,6 +8696,46 @@ impl Db {
         }))
     }
 
+    /// Owner-only export via Tauri command; audit data are commercial references,
+    /// state transitions and hash-chain proofs, never clinical notes or patient data.
+    pub fn sef_audit_csv(&self) -> anyhow::Result<String> {
+        fn cell(s:&str)->String { format!("\\\"{}\\\"",s.replace('"',"\\\"\\\"")) }
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        sef_verify_chain_tx(&tx)?;
+        let mut output=String::from("kind,source_id,event_type,status,error_code,occurred_at,sha256\\n");
+        {
+            let mut stmt=tx.prepare(
+                "SELECT e.sale_id,e.event_type,e.to_status,COALESCE(e.error_code,''),e.occurred_at,
+                 COALESCE(c.event_hash,'') FROM sef_mjeku_events e LEFT JOIN sef_mjeku_event_chain c
+                 ON c.source_kind='SALE' AND c.source_event_id=e.id ORDER BY e.id")?;
+            let mut rows=stmt.query([])?;
+            while let Some(row)=rows.next()? {
+                let values:[String;6]=[row.get(0)?,row.get(1)?,row.get(2)?,
+                    row.get(3)?,row.get(4)?,row.get(5)?];
+                output.push_str("SALE,");
+                output.push_str(&values.iter().map(|x|cell(x)).collect::<Vec<_>>().join(","));
+                output.push('\\n');
+            }
+        }
+        {
+            let mut stmt=tx.prepare(
+                "SELECT e.request_id,e.event_type,e.to_status,COALESCE(e.error_code,''),e.occurred_at,
+                 COALESCE(c.event_hash,'') FROM sef_mjeku_action_events e LEFT JOIN sef_mjeku_event_chain c
+                 ON c.source_kind='ACTION' AND c.source_event_id=e.id ORDER BY e.id")?;
+            let mut rows=stmt.query([])?;
+            while let Some(row)=rows.next()? {
+                let values:[String;6]=[row.get(0)?,row.get(1)?,row.get(2)?,
+                    row.get(3)?,row.get(4)?,row.get(5)?];
+                output.push_str("ACTION,");
+                output.push_str(&values.iter().map(|x|cell(x)).collect::<Vec<_>>().join(","));
+                output.push('\\n');
+            }
+        }
+        tx.commit()?;
+        Ok(output)
+    }
+
     pub fn sef_ledger_get(&self, sale_id: &str) -> anyhow::Result<Option<SefLedgerRecord>> {
         let conn = self.conn()?;
         conn.query_row(
