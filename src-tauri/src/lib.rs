@@ -3730,7 +3730,13 @@ fn sef_reconcile_blocking(
             return Err("Identiteti i kuponit ndryshoi. Fiskalizimi është bllokuar.".into());
         }
     }
-    if db.sef_sale_coupon(sale_id).map_err(err_string)?.is_none() {
+    let local_coupon=db.sef_sale_coupon(sale_id).map_err(err_string)?;
+    if let Some(ref local)=local_coupon {
+        if local.coupon_id!=coupon.coupon_id {
+            return Err("Kuponi lokal nuk përputhet me kuponin e PROGRAMERI POS. Kërko auditim manual.".into());
+        }
+    }
+    if local_coupon.is_none() {
         // The app may have crashed after POS issued the coupon but before local commit.
         // Only apply the result if the current commercial projection still matches
         // the original immutable request. No new fiscalization is performed here.
