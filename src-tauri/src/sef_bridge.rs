@@ -646,15 +646,23 @@ pub fn build_fiscalize_request_strict(
     if lines.is_empty() || payments.is_empty() {
         return Err(local_validation("Regjistro pagesën reale dhe shërbimin përpara fiskalizimit SEF."));
     }
+    let mut checked_total: i128 = 0;
     for line in lines {
         if line.id.trim().is_empty() || line.title.trim().is_empty() ||
            !line.qty.is_finite() || line.qty <= 0.0 ||
            !line.unit_price.is_finite() || line.unit_price < 0.0 ||
+           line.qty > 9_999_999.999 || line.unit_price > 100_000_000.0 ||
            !matches!(line.vat_code.trim().to_ascii_uppercase().as_str(),"A"|"C"|"D"|"E") {
             return Err(local_validation("Artikulli ka sasi, çmim ose kod TVSH të pavlefshëm; korrigjo të dhënat para SEF."));
         }
         if (line.qty*1000.0 - (line.qty*1000.0).round()).abs() > 0.000001 {
             return Err(local_validation("Sasia fiskale lejon maksimumi tri shifra pas presjes."));
+        }
+        let milli=qty_to_milli(line.qty) as i128;
+        let cents=money_to_cents(line.unit_price)? as i128;
+        checked_total+=(milli*cents+500)/1000;
+        if checked_total > i64::MAX as i128 {
+            return Err(local_validation("Shuma e faturës tejkalon kufirin e sigurt SEF."));
         }
     }
     let mut paid=0i64;
@@ -668,7 +676,7 @@ pub fn build_fiscalize_request_strict(
             .ok_or_else(||local_validation("Shuma e pagesave është shumë e madhe."))?;
     }
     let req=build_fiscalize_request(lines,payments,rates)?;
-    if paid!=req.total_cents {
+    if req.total_cents as i128 != checked_total || paid!=req.total_cents {
         return Err(local_validation(
             "Pagesat reale nuk përputhen me shumën e shërbimeve. SEF nuk do të krijojë pagesë automatike ose të ndryshojë metodën e pagesës."
         ));
