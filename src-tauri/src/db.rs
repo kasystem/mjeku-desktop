@@ -8857,6 +8857,12 @@ mod sef_mjeku_ledger_tests {
         assert!(conn.execute("DELETE FROM sef_mjeku_events",[]).is_err());
         let events:i64=conn.query_row("SELECT COUNT(*) FROM sef_mjeku_events WHERE sale_id='test-sale'",[],|r|r.get(0)).unwrap();
         assert_eq!(events,5);
+        let audit=db.sef_audit_verify().unwrap();
+        assert_eq!(audit["valid"],true);
+        assert_eq!(audit["verifiedEvents"],5);
+        assert_eq!(audit["historicalUnchained"],0);
+        assert!(conn.execute("UPDATE sef_mjeku_event_chain SET event_hash=?1",[&"a".repeat(64)]).is_err());
+        assert!(conn.execute("DELETE FROM sef_mjeku_event_chain",[]).is_err());
     }
 }
 
