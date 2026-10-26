@@ -546,6 +546,12 @@ pub struct FiscalItem {
     pub unit_price_cents: i64,
     pub unit_price_ten_thousandths: i64,
     pub vat_rate_percent: u32,
+    #[serde(default)]
+    pub category_code: String,
+    #[serde(default)]
+    pub unit_code: String,
+    #[serde(default)]
+    pub tax_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -610,6 +616,9 @@ pub fn build_fiscalize_request(
             unit_price_cents: unit_cents,
             unit_price_ten_thousandths: unit_cents * 100,
             vat_rate_percent: rates.rate_for_code(&ln.vat_code),
+            category_code: "SM".into(),
+            unit_code: "EA".into(),
+            tax_code: ln.vat_code.trim().to_ascii_uppercase(),
         });
     }
 
@@ -769,6 +778,26 @@ pub fn fiscalize_params(sale_id: &str, issued_at: &str, req: &FiscalizeRequest) 
         "items": req.items,
         "payments": req.payments,
     })
+}
+
+/// Explicit fiscal catalog + trusted operator contract. Older fiscalize_params remains
+/// available for backward compatibility tests only; SEF issue path uses this version.
+pub fn fiscalize_params_v2(sale_id: &str, issued_at: &str, operator_name: &str, req: &FiscalizeRequest) -> Result<Value, BridgeError> {
+    if operator_name.trim().is_empty() ||
+       req.items.iter().any(|i| !matches!(i.category_code.as_str(),"SM"|"BM"|"PM") ||
+           !matches!(i.unit_code.as_str(),"EA"|"HUR"|"DAY") ||
+           !matches!(i.tax_code.as_str(),"A"|"C"|"D"|"E")) {
+        return Err(local_validation("Konfigurimi i operatorit ose klasifikimi fiskal ATK mungon."));
+    }
+    Ok(json!({
+        "payloadSchemaVersion": 2,
+        "operatorName": operator_name.trim(),
+        "source": SOURCE,
+        "saleId": sale_id,
+        "issuedAt": issued_at,
+        "items": req.items,
+        "payments": req.payments,
+    }))
 }
 
 /// Rezultati i `fiscalize`, `coupon.return`, `coupon.cancel`.
