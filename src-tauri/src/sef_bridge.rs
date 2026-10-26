@@ -974,6 +974,19 @@ mod tests {
     }
 
     #[test]
+    fn strict_sef_uses_four_decimal_unit_price_without_inventing_payment() {
+        let rates=VatRates::default();
+        let lines=[line("service",2.0,1.2345,"A")];
+        let result=build_fiscalize_request_strict(&lines,&[pay("cash",2.47)],&rates).unwrap();
+        assert_eq!(result.items[0].unit_price_ten_thousandths,12345);
+        assert_eq!(result.items[0].unit_price_cents,123);
+        assert_eq!(result.total_cents,247);
+        assert_eq!(fiscalize_params("s","2026-10-26T10:00:00Z",&result)["items"][0]["unitPriceTenThousandths"],12345);
+        assert!(build_fiscalize_request_strict(&[line("x",1.0,1.23456,"A")],
+            &[pay("cash",1.23)],&rates).is_err());
+    }
+
+    #[test]
     fn strict_sef_refuses_invented_cash_unknown_tax_and_partial_payment() {
         let lines=[line("v1",1.0,25.0,"D")];
         let rates=VatRates::default();
