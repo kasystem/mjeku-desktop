@@ -3670,75 +3670,153 @@ fn cents_to_text(c: i64) -> String {
     format!("{sign}{}.{:02}", a / 100, a % 100)
 }
 
-/// Fiskalizon shitjen përmes PROGRAMERI POS. Në sukses shënon shitjen dhe rreshtat
-/// si të fiskalizuar dhe ruan kuponin; në gabim nuk shënon asgjë.
-fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<String, String> {
-    let sale_id = sale_id.trim().to_string();
-    if sale_id.is_empty() {
-        return Err("sale_id eshte i detyrueshem".to_string());
-    }
-    // Pa variablat e nisjes nga PROGRAMERI POS nuk fiskalizohet.
-    crate::sef_bridge::Session::from_env().map_err(err_string)?;
-    let _guard = sef_fiscal_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let data = db
-        .sef_collect_sale(&sale_id, allow_any)
-        .map_err(err_string)?;
+/// Snapshot fiscal-only: no patient ID, diagnosis, clinical notes or ATK credentials.
+fn sef_build_sale(
+    db: &Db, sale_id: &str, allow_any: bool
+) -> Result<(crate::db::SefSaleData, crate::sef_bridge::FiscalizeRequest, String), String> {
+    use sha2::Digest;
+    let data = db.sef_collect_sale(sale_id, allow_any).map_err(err_string)?;
     let rates = crate::sef_bridge::VatRates::from_settings(|k| db.setting_get(k).ok().flatten());
-    let lines: Vec<crate::sef_bridge::SaleLine> = data
-        .items
-        .iter()
-        .map(|it| crate::sef_bridge::SaleLine {
-            id: it.id.clone(),
-            title: it.title.clone(),
-            qty: it.qty,
-            unit_price: it.unit_price,
-            vat_code: it.vat_code.clone(),
-        })
-        .collect();
-    let pays: Vec<crate::sef_bridge::SalePayment> = data
-        .payments
-        .iter()
-        .map(|(m, a)| crate::sef_bridge::SalePayment {
-            method: m.clone(),
-            amount: *a,
-        })
-        .collect();
-    let req = crate::sef_bridge::build_fiscalize_request(&lines, &pays, &rates)
+    let lines: Vec<crate::sef_bridge::SaleLine> = data.items.iter().map(|it|
+        crate::sef_bridge::SaleLine {
+            id: it.id.clone(), title: it.title.clone(), qty: it.qty,
+            unit_price: it.unit_price, vat_code: it.vat_code.clone()
+        }).collect();
+    let payments: Vec<crate::sef_bridge::SalePayment> = data.payments.iter().map(|(m,a)|
+        crate::sef_bridge::SalePayment { method:m.clone(), amount:*a }).collect();
+    let req = crate::sef_bridge::build_fiscalize_request(&lines, &payments, &rates)
         .map_err(err_string)?;
-    let issued_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-    let params = crate::sef_bridge::fiscalize_params(&data.sale.id, &issued_at, &req);
-    let res = sef_call_blocking("fiscalize", params, crate::sef_bridge::DEFAULT_TIMEOUT)
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "items": &req.items, "payments": &req.payments
+    })).map_err(err_string)?;
+    let hash = hex::encode(sha2::Sha256::digest(canonical));
+    Ok((data, req, hash))
+}
+
+/// Lookup never fiscalizes; it resolves an uncertain POS outcome by the original sale ID.
+fn sef_reconcile_blocking(
+    db: &Db, sale_id: &str, record: &crate::db::SefLedgerRecord
+) -> Result<String, String> {
+    let session=crate::sef_bridge::Session::from_env().map_err(err_string)?;
+    if session.context.as_deref()!=Some(record.context_id.as_str()) {
+        return Err("Konteksti SEF i biznesit ndryshoi. Kuponi nuk mund të rikuperohet nga ky kontekst.".into());
+    }
+    let lookup=sef_call_blocking("sale.lookup",
+        serde_json::json!({"saleId":sale_id}),crate::sef_bridge::DEFAULT_TIMEOUT)
+        .map_err(|e|format!("Rikuperimi SEF nuk u konfirmua nga PROGRAMERI POS ({}). Mos e fiskalizo përsëri. Përditëso të dy aplikacionet nëse mungon sale.lookup.",e.code))?;
+    let found=lookup["found"].as_bool()==Some(true);
+    let status=lookup["status"].as_str().unwrap_or("UNKNOWN");
+    if !found {
+        if matches!(record.status.as_str(),"IN_FLIGHT"|"FAILED") {
+            db.sef_ledger_transition(sale_id,"UNKNOWN","LOOKUP_UNCERTAIN",None,None,None)
+                .map_err(err_string)?;
+        }
+        return Err("PROGRAMERI POS nuk konfirmoi një kupon për këtë faturë. Gjendja mbetet E PASIGURT; kontrollo historikun fiskal në POS para çdo veprimi.".into());
+    }
+    if status=="FAILED" {
+        db.sef_ledger_transition(sale_id,"FAILED","POS_FAILED",None,None,Some("POS_FAILED"))
+            .map_err(err_string)?;
+        return Err("PROGRAMERI POS e raporton kuponin si të refuzuar përfundimisht. Kërko kontroll fiskal; mos e dërgo përsëri automatikisht.".into());
+    }
+    if !matches!(status,"FISCALIZED"|"PENDING_OFFLINE") {
+        return Err("Statusi fiskal nga PROGRAMERI POS nuk është i konfirmuar.".into());
+    }
+    let coupon=crate::sef_bridge::parse_coupon_result(lookup["coupon"].clone()).map_err(err_string)?;
+    if coupon.total_cents!=Some(record.total_cents) {
+        return Err("Totali i kuponit në PROGRAMERI POS nuk përputhet me kërkesën e ruajtur. Kërko verifikim manual.".into());
+    }
+    if let Some(existing)=record.coupon_id.as_deref() {
+        if existing!=coupon.coupon_id {
+            return Err("Identiteti i kuponit ndryshoi. Fiskalizimi është bllokuar.".into());
+        }
+    }
+    if db.sef_sale_coupon(sale_id).map_err(err_string)?.is_none() {
+        // The app may have crashed after POS issued the coupon but before local commit.
+        // Only apply the result if the current commercial projection still matches
+        // the original immutable request. No new fiscalization is performed here.
+        let (data,_,hash)=sef_build_sale(db,sale_id,record.allow_any)?;
+        if hash!=record.request_sha256 {
+            return Err("Të dhënat e faturës kanë ndryshuar pas kërkesës SEF. Kuponi ekziston në POS; kërko përputhje manuale, pa krijuar kupon tjetër.".into());
+        }
+        let info=crate::db::SefCouponInfo {
+            coupon_id:coupon.coupon_id.clone(),daily_number:coupon.daily_number,
+            status:status.to_string(),verification_url:coupon.verification_url
+        };
+        db.sef_mark_fiscalized(&data,record.total_cents as f64/100.0,&info)
+            .map_err(|e|format!("Kuponi ekziston në POS, por regjistrimi lokal dështoi: {e}"))?;
+    }
+    db.sef_ledger_transition(sale_id,status,"POS_RECONCILED",
+        Some(&coupon.coupon_id),coupon.daily_number,None).map_err(err_string)?;
+    Ok(format!("Kuponi SEF {} u verifikua në PROGRAMERI POS ({}).",coupon.coupon_id,status))
+}
+
+/// Persist the fiscal-only snapshot BEFORE crossing the process boundary.
+/// Any uncertain outcome is reconciled by sale.lookup; it is never blindly resent.
+fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<String, String> {
+    let sale_id=sale_id.trim().to_string();
+    if sale_id.is_empty(){return Err("sale_id eshte i detyrueshem".into());}
+    let session=crate::sef_bridge::Session::from_env().map_err(err_string)?;
+    let context=session.context.as_deref().filter(|s|!s.trim().is_empty())
+        .ok_or_else(||"PROGRAMERI POS nuk dërgoi kontekstin fiskal të biznesit.".to_string())?;
+    let _guard=sef_fiscal_lock().lock().unwrap_or_else(|p|p.into_inner());
+    if let Some(existing)=db.sef_ledger_get(&sale_id).map_err(err_string)? {
+        if existing.context_id!=context {
+            return Err("Kjo faturë ka histori SEF në një kontekst tjetër. Fiskalizimi është bllokuar.".into());
+        }
+        if existing.status=="FISCALIZED" {
+            return Ok("Kuponi SEF për këtë faturë është regjistruar më parë.".into());
+        }
+        if existing.status!="READY" {
+            return sef_reconcile_blocking(db,&sale_id,&existing);
+        }
+    }
+    let (data,req,hash)=sef_build_sale(db,&sale_id,allow_any)?;
+    let issued_at=chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,false);
+    let params=crate::sef_bridge::fiscalize_params(&data.sale.id,&issued_at,&req);
+    let payload=serde_json::to_string(&params).map_err(err_string)?;
+    let record=db.sef_ledger_prepare(&sale_id,&hash,&payload,allow_any,req.total_cents,context)
         .map_err(err_string)?;
-    let coupon = crate::sef_bridge::parse_coupon_result(res).map_err(err_string)?;
-    let info = crate::db::SefCouponInfo {
-        coupon_id: coupon.coupon_id.clone(),
-        daily_number: coupon.daily_number,
-        status: coupon.status.clone(),
-        verification_url: coupon.verification_url.clone(),
+    if record.status!="READY" {
+        return sef_reconcile_blocking(db,&sale_id,&record);
+    }
+    db.sef_ledger_transition(&sale_id,"IN_FLIGHT","DISPATCH",None,None,None)
+        .map_err(err_string)?;
+    let original_params:serde_json::Value=serde_json::from_str(&record.request_json).map_err(err_string)?;
+    let response=sef_call_blocking("fiscalize",original_params,crate::sef_bridge::DEFAULT_TIMEOUT);
+    let res=match response {
+        Ok(res)=>res,
+        Err(e)=>{
+            let _=db.sef_ledger_transition(&sale_id,"UNKNOWN","BRIDGE_UNCERTAIN",
+                None,None,Some(&e.code));
+            return Err(format!("SEF nuk u konfirmua ({}). Gjendja u ruajt për rikuperim; mos e dërgo faturën përsëri pa verifikim.",e.code));
+        }
     };
-    let label = coupon
-        .daily_number
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| coupon.coupon_id.clone());
-    let total = req.total_cents as f64 / 100.0;
-    db.sef_mark_fiscalized(&data, total, &info).map_err(|e| {
-        format!(
-            "Kuponi SEF nr. {label} u lëshua, por shënimi te Mjeku dështoi ({e}). Provoje përsëri: e njëjta faturë nuk krijon kupon të dytë."
-        )
-    })?;
-    let mut msg = format!(
-        "Kuponi SEF nr. {label} u lëshua ({} €).",
-        cents_to_text(req.total_cents)
-    );
-    if coupon.status.eq_ignore_ascii_case("PENDING_OFFLINE") {
-        msg.push_str(" SEF është offline: kuponi u ruajt dhe dërgohet automatikisht në ATK.");
+    let coupon=match crate::sef_bridge::parse_coupon_result(res) {
+        Ok(c) if matches!(c.status.as_str(),"FISCALIZED"|"PENDING_OFFLINE") &&
+            c.total_cents==Some(req.total_cents)=>c,
+        _=>{
+            let _=db.sef_ledger_transition(&sale_id,"UNKNOWN","INVALID_POS_RESULT",
+                None,None,Some("PROTOCOL"));
+            return Err("Përgjigjja e PROGRAMERI POS nuk konfirmon kupon të vlefshëm. Kontrollo POS para çdo tentative tjetër.".into());
+        }
+    };
+    let info=crate::db::SefCouponInfo {
+        coupon_id:coupon.coupon_id.clone(),daily_number:coupon.daily_number,
+        status:coupon.status.clone(),verification_url:coupon.verification_url.clone()
+    };
+    if let Err(e)=db.sef_mark_fiscalized(&data,req.total_cents as f64/100.0,&info) {
+        let _=db.sef_ledger_transition(&sale_id,"UNKNOWN","LOCAL_COMMIT_FAILED",
+            None,None,Some("LOCAL_DB"));
+        return Err(format!("Kuponi SEF {} u lëshua nga POS, por ruajtja lokale dështoi ({e}). Përdor Rikupero, jo fiskalizim të ri.",coupon.coupon_id));
     }
-    if coupon.duplicate == Some(true) {
-        msg.push_str(" (Kuponi ekzistonte tashmë për këtë faturë.)");
+    db.sef_ledger_transition(&sale_id,&coupon.status,"POS_CONFIRMED",
+        Some(&coupon.coupon_id),coupon.daily_number,None).map_err(err_string)?;
+    let label=coupon.daily_number.map(|n|n.to_string()).unwrap_or(coupon.coupon_id);
+    let mut msg=format!("Kuponi SEF nr. {label} u lëshua ({} €).",cents_to_text(req.total_cents));
+    if coupon.status=="PENDING_OFFLINE" {
+        msg.push_str(" Kuponi është ruajtur në POS dhe pret dërgimin në ATK.");
     }
+    if coupon.duplicate==Some(true){msg.push_str(" Kupon ekzistues, pa dublim.");}
     Ok(msg)
 }
 
