@@ -2,6 +2,8 @@
 
 Statusi: kodi është shkruar (Faza 2 dhe 3 të planit); **nuk është ndërtuar si aplikacion i plotë dhe nuk është provuar me PROGRAMERI POS**. Shih "Çfarë është provuar".
 
+**Përditësim 26.10.2026:** U shtuan regjistri lokal SEF i pandryshueshëm, `sale.lookup` dhe rikuperimi pa ridërgim automatik. Fiskalizimi i ri kërkon pagesa reale që përputhen saktësisht; rregulli i vjetër i pagesës cash automatike nuk zbatohet në rrugën e re strikte. Shih [SEF_ATK_MJEKU_IMPLEMENTATION_2026_10_26.md](SEF_ATK_MJEKU_IMPLEMENTATION_2026_10_26.md).
+
 Kontrata e thirrjeve: `pos-native-windows/docs/MJEKU_SEF_BRIDGE_CONTRACT.md` (v1).
 Plani: `Desktop\Plani 2026\Plani i integrimit te Mjeku brenda PROGRAMERI POS\INTEGRIMI_I_MJEKUT_ME_SEF.md`.
 
@@ -60,7 +62,7 @@ Butoni **Hap konfigurimin SEF** e rihap konfigurimin pa e ndryshuar motorin.
 
 Kufizim i njohur (UI ekzistuese, e pandryshuar qëllimisht): pas fiskalizimit të suksesshëm me SEF, Shitjet tregojnë mesazhin e vjetër "Kuponi fiskal u dërgua për printim." dhe mesazhin e plotë me numrin e kuponit e kopjojnë në clipboard (aty ku ENTERNET kopjonte path-in e `.inp`). Pas një gabimi, dritarja e vjetër "Ribëj" përmend printerin. Numri i kuponit shihet te **Kuponët**.
 
-Kujdes: pas një gabimi lidhjeje ose kohe, ekrani ekzistues i fiskalizimit ofron "Ribëj" dhe pastaj "Procedo si jo fiskale". Ribërja është e sigurt (e njëjta faturë kthen të njëjtin kupon). Para se ta shënosh si jo fiskale, shiko te **Kuponët** nëse kuponi është krijuar.
+Kujdes: pas një gabimi lidhjeje ose kohe, ekrani ekzistues i fiskalizimit ofron "Ribëj" dhe pastaj "Procedo si jo fiskale". **Pas një rezultati të pasigurt nuk lejohet ridërgim automatik.** Hap **Kuponët → Historiku lokal i kërkesave SEF → Verifiko në POS**. Fatura me tentativë SEF nuk mund të shënohet manualisht fiskale ose jo-fiskale pa rikuperim/kontroll. Ky kontroll kërkon versionin e ri të të dy aplikacioneve.
 
 ## Për zhvilluesin
 
@@ -126,8 +128,8 @@ Kohëzgjatjet: 30 s për çdo thirrje; `configure` 8 orë. Lidhja hapet për çd
 
 1. Merren pagesat e shitjes (`payments`, jo të fshira, shumë > 0), kthehen në cent dhe grupohen sipas metodës: `cash`→`cash`, `card`→`card`, `bank`→`transfer`, të tjerat→`other`.
 2. Nëse shuma e tyre është **saktësisht** totali i artikujve, dërgohen ashtu.
-3. Përndryshe (pagesë e pjesshme, shitje e përzier fiskale/jo-fiskale, pagesë më e madhe se pjesa fiskale): **një pagesë** me totalin e artikujve, me metodën e pagesës më të madhe të shitjes.
-4. Pa pagesa: një pagesë `cash` me totalin (si pagesa automatike që Mjeku ruan sot pas fiskalizimit).
+3. **Nga 26.10.2026, rruga e re strikte SEF refuzon pagesën e pjesshme ose mospërputhjen.** Nuk fabrikohet pagesë me metodën dominuese.
+4. **Pa pagesë reale të regjistruar, fiskalizimi refuzohet.** Regjistro pagesën përpara SEF. Funksioni historik i konvertimit mbetet në kod për testet e kompatibilitetit, por nuk thirret nga `sef_fiscalize_blocking`.
 5. Para dërgimit kontrollohet që artikujt = pagesat = totali; përndryshe nuk dërgohet.
 
 ### TVSH
@@ -140,7 +142,7 @@ Mjeku ruan kodin e TVSH-së te çdo rresht (`vat_code`). Rruga ENTERNET e kthen 
 | C | 0% – biznes jo në TVSH | 0 | `sef_vat_rate_c` |
 | D | 8% | 8 | `sef_vat_rate_d` |
 | E | 18% | 18 | `sef_vat_rate_e` |
-| tjetër/bosh | trajtohet si C (si te ENTERNET) | 0 | — |
+| tjetër/bosh | **Refuzohet në rrugën e re strikte SEF** (nuk supozohet normë 0%) | — | — |
 
 Cilësimet pranojnë numër të plotë 0–100 (lejohet `%` në fund); bosh ose i pavlefshëm → parazgjedhja. Ndryshohen te Cilësimet → "TVSH për SEF".
 
@@ -235,3 +237,8 @@ Rekomandim: gjej exe-në me `InstallLocation` + `MainBinaryName` nga çelësi i 
 - `coupons.list` nuk kthen artikujt e kuponit; për "Kthe" Mjeku merr rreshtat e fiskalizuar nga databaza e vet (`visit_items` me `saleId`), por nuk di sasinë e mbetur pas kthimeve të mëparshme — PROGRAMERI POS e kontrollon (`NOT_ALLOWED`). Një `coupon.get`/artikujt te lista do ta saktësonte.
 - `vatRatePercent` nuk dallon "0% e përjashtuar" (A) nga "0% jo në TVSH" (C). Nëse kuponi SEF kërkon këtë dallim, duhet fushë shtesë (p.sh. `vatCode`/`exempt`).
 - Rregulli i rrumbullakimit për sasi me decimale (sasia × çmimi për njësi) duhet të jetë i njëjtë në PROGRAMERI POS; Mjeku përdor half away from zero në cent.
+
+
+## Kontrolli i rikuperimit (26.10.2026)
+
+MJEKU ruan kërkesën fiskale dhe hash-in përpara dërgimit te POS. Pas timeout-it, ndërprerjes ose gabimit të protokollit, statusi mbetet `UNKNOWN`. `sale.lookup` kontrollon kuponin origjinal në POS pa emetim të ri. `NOT_FOUND` nuk autorizon ridërgim automatik. Auditimi i ngjarjeve është append-only. Për testet dhe kërkesat e ATK, shih dokumentin e implementimit të 26.10.2026.
