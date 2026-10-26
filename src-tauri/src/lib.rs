@@ -3885,6 +3885,10 @@ fn sef_action_issue_blocking(
 fn sef_action_reconcile_blocking(
     db: &Db, record: &crate::db::SefActionRecord,
 ) -> Result<String, String> {
+    use sha2::Digest;
+    if hex::encode(sha2::Sha256::digest(record.request_json.as_bytes())) != record.request_sha256 {
+        return Err("Integriteti i kërkesës së kthimit/anulimit nuk përputhet. Kërko auditim manual.".into());
+    }
     let session=crate::sef_bridge::Session::from_env().map_err(err_string)?;
     if session.context.as_deref()!=Some(record.context_id.as_str()) {
         return Err("Konteksti fiskal i veprimit nuk përputhet me PROGRAMERI POS.".into());
