@@ -1562,6 +1562,63 @@ impl Db {
         Ok(row)
     }
 
+    pub fn physiotherapy_body_markers_list(&self,ep:&str)
+        ->anyhow::Result<Vec<serde_json::Value>>{
+        let conn=self.conn.lock().unwrap();
+        let mut stmt=conn.prepare(
+            "SELECT id,physiotherapy_episode_id,view,region,laterality,classification,
+             x,y,note,clinician_id,observed_at FROM physiotherapy_body_markers
+             WHERE physiotherapy_episode_id=?1 ORDER BY observed_at DESC")?;
+        let rows=stmt.query_map([ep],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?,
+            "physiotherapy_episode_id":r.get::<_,String>(1)?,
+            "view":r.get::<_,String>(2)?,
+            "region":r.get::<_,String>(3)?,
+            "laterality":r.get::<_,String>(4)?,
+            "classification":r.get::<_,String>(5)?,
+            "x":r.get::<_,f64>(6)?,"y":r.get::<_,f64>(7)?,
+            "note":r.get::<_,String>(8)?,
+            "clinician_id":r.get::<_,String>(9)?,
+            "observed_at":r.get::<_,String>(10)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn physiotherapy_body_marker_add(&self,v:&serde_json::Value,actor:&str)
+        ->anyhow::Result<serde_json::Value>{
+        if actor.trim().is_empty(){bail!("Kërkohet identiteti i profesionistit.");}
+        let ep=v["physiotherapy_episode_id"].as_str().unwrap_or_default();
+        let view=v["view"].as_str().unwrap_or_default();
+        let side=v["laterality"].as_str().unwrap_or_default();
+        let classification=v["classification"].as_str().unwrap_or_default();
+        let region=v["region"].as_str().unwrap_or_default();
+        let note=v["note"].as_str().unwrap_or_default();
+        if !matches!(view,"anterior"|"posterior"|"lateral") ||
+            !matches!(side,"left"|"right"|"bilateral"|"midline") ||
+            !matches!(classification,"pain"|"restriction"|"weakness"|"other") ||
+            region.trim().is_empty() || note.chars().count()>2000{
+            bail!("Shenja anatomike kërkon regjion, anë dhe klasifikim.");
+        }
+        let x=v["x"].as_f64().ok_or_else(||anyhow!("Mungon pozicioni X."))?;
+        let y=v["y"].as_f64().ok_or_else(||anyhow!("Mungon pozicioni Y."))?;
+        if !x.is_finite()||!y.is_finite()||!(0.0..=1.0).contains(&x)
+           ||!(0.0..=1.0).contains(&y){bail!("Koordinata anatomike jashtë intervalit 0..1.");}
+        let conn=self.conn.lock().unwrap();
+        Self::physio_require_active(&conn,ep)?;
+        let id=Uuid::new_v4().to_string();let at=now_iso();
+        conn.execute(
+            "INSERT INTO physiotherapy_body_markers(
+             id,physiotherapy_episode_id,view,region,laterality,classification,
+             x,y,note,clinician_id,observed_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            rusqlite::params![id,ep,view,region,side,classification,x,y,note,actor,at]
+        )?;
+        Ok(serde_json::json!({"id":id,"physiotherapy_episode_id":ep,
+            "view":view,"region":region,"laterality":side,
+            "classification":classification,"x":x,"y":y,
+            "note":note,"clinician_id":actor,"observed_at":at}))
+    }
+
     pub fn orthopedic_episodes_list(&self, client_id: Option<String>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id, client_id, diagnosis, region, laterality, status, notes, created_at, updated_at FROM orthopedic_episodes WHERE (?1 IS NULL OR client_id = ?1) ORDER BY updated_at DESC")?;
@@ -2032,6 +2089,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/physiotherapy_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v3.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v4.sql"))?;
+        conn.execute_batch(include_str!("../migrations/physiotherapy_v5.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -2059,6 +2117,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/physiotherapy_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v3.sql"))?;
         conn.execute_batch(include_str!("../migrations/physiotherapy_v4.sql"))?;
+        conn.execute_batch(include_str!("../migrations/physiotherapy_v5.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
