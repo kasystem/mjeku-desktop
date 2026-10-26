@@ -817,6 +817,11 @@ pub struct CouponResult {
     pub verification_url: Option<String>,
     #[serde(default)]
     pub duplicate: Option<bool>,
+    /// POS physical printer result (independent of ATK delivery).
+    #[serde(default)]
+    pub printed: Option<bool>,
+    #[serde(default)]
+    pub print_error: Option<String>,
 }
 
 pub fn parse_coupon_result(v: Value) -> Result<CouponResult, BridgeError> {
@@ -830,6 +835,28 @@ pub fn parse_coupon_result(v: Value) -> Result<CouponResult, BridgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coupon_result_keeps_print_status_separate_from_sef_delivery() {
+        let fiscalized_but_not_printed = json!({
+            "couponId": "72",
+            "status": "FISCALIZED",
+            "totalCents": 500,
+            "printed": false,
+            "printError": "Printeri nuk u gjet"
+        });
+        let result = parse_coupon_result(fiscalized_but_not_printed).unwrap();
+        assert_eq!(result.status, "FISCALIZED");
+        assert_eq!(result.printed, Some(false));
+        assert_eq!(result.print_error.as_deref(), Some("Printeri nuk u gjet"));
+
+        // Older POS engines may omit printing fields; do not pretend the
+        // receipt printed successfully when its delivery state is unknown.
+        let legacy = parse_coupon_result(json!({
+            "couponId": "73", "status": "PENDING_OFFLINE"
+        })).unwrap();
+        assert_eq!(legacy.printed, None);
+    }
 
     #[test]
     fn frame_roundtrip_little_endian() {
