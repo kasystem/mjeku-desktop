@@ -2137,6 +2137,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql"))?;
+            conn.execute_batch(include_str!("../migrations/sef_mjeku_v4.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -2168,6 +2169,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v1.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v2.sql"))?;
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql"))?;
+            conn.execute_batch(include_str!("../migrations/sef_mjeku_v4.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -8938,6 +8940,52 @@ mod sef_mjeku_action_tests {
 
 
 impl Db {
+    /// Only explicit fiscal classification may cross the POS bridge; no clinical notes.
+    pub fn sef_fiscal_catalog_for(&self, item_id: &str) -> anyhow::Result<Option<(String,String)>> {
+        let conn=self.conn()?;
+        conn.query_row(
+            "SELECT category_code,unit_code FROM sef_mjeku_item_catalog WHERE visit_item_id=?1",
+            [item_id], |r| Ok((r.get(0)?,r.get(1)?))
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn sef_item_fiscal_catalog_set(&self, item_id:&str, category_code:&str, unit_code:&str) -> anyhow::Result<()> {
+        let category=category_code.trim().to_ascii_uppercase();
+        let unit=unit_code.trim().to_ascii_uppercase();
+        if !matches!(category.as_str(),"SM"|"BM"|"PM") ||
+           !matches!(unit.as_str(),"EA"|"HUR"|"DAY") {
+            bail!("Zgjidh kategori (SM/BM/PM) dhe njësi (EA/HUR/DAY) të vlefshme sipas ATK.");
+        }
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let allowed:i64=tx.query_row(
+            "SELECT COUNT(*) FROM visit_items WHERE id=?1 AND deleted=0 AND fiscal=1 AND fiscalized=0",
+            [item_id], |r|r.get(0))?;
+        if allowed!=1 { bail!("Kategoria dhe njësia fiskale nuk mund të ndryshohen për këtë procedurë."); }
+        let now=now_iso();
+        tx.execute("INSERT INTO sef_mjeku_item_catalog(visit_item_id,category_code,unit_code,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?4)
+             ON CONFLICT(visit_item_id) DO UPDATE SET
+               category_code=excluded.category_code,unit_code=excluded.unit_code,updated_at=excluded.updated_at",
+            params![item_id,category,unit,now])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn sef_item_fiscal_catalog_list(&self, visit_id:&str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare(
+            "SELECT c.visit_item_id,c.category_code,c.unit_code FROM sef_mjeku_item_catalog c
+             JOIN visit_items i ON i.id=c.visit_item_id
+             WHERE i.visit_id=?1 AND i.deleted=0 ORDER BY i.created_at")?;
+        let rows=stmt.query_map([visit_id],|r|Ok(serde_json::json!({
+            "itemId":r.get::<_,String>(0)?,
+            "categoryCode":r.get::<_,String>(1)?,
+            "unitCode":r.get::<_,String>(2)?
+        })))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// Only explicit, non-clinical descriptions are sent to the fiscal engine.
     pub fn sef_fiscal_title_for(&self, item_id:&str)->anyhow::Result<Option<String>> {
         let conn=self.conn()?;
