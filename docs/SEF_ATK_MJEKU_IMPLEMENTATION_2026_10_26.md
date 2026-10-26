@@ -122,6 +122,12 @@ TEST si certifikim të ri.
   përpara ndryshimit të protokollit.
 - Përshkrimi fiskal i shërbimit duhet të jetë i ndarë nga teksti klinik.
 - Identiteti fiskal i operatorit duhet të verifikohet me ATK dhe kodin POS.
+- **Rrezik kritik për kthimet:** `FiscalBridgeService.ReturnAsync` në POS
+  përdor `Guid.NewGuid()` për kërkesat e kthimit. Pas humbjes së përgjigjes,
+  një klikim i ri mund të krijojë një kthim tjetër nëse mbetet sasi.
+  Kërkohet idempotencë e qëndrueshme për `coupon.return` dhe
+  `coupon.cancel`, si dhe `action.lookup`, përpara përdorimit real.
+  **Në TEST mos përsërit kthim/anulim pas timeout-it; kontrollo POS.**
 - Teste reale me ATK TEST, printerin, kopjen, kthimin, anulimin, QR,
   ndërprerjen e energjisë/internetit, versionet e dy aplikacioneve.
 - Gjurmueshmëri e plotë nen për nen për gjithë PDF-në, audit i sigurisë,
