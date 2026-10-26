@@ -8935,3 +8935,60 @@ mod sef_mjeku_action_tests {
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v2.sql")).unwrap();
     }
 }
+
+
+impl Db {
+    /// Only explicit, non-clinical descriptions are sent to the fiscal engine.
+    pub fn sef_fiscal_title_for(&self, item_id:&str)->anyhow::Result<Option<String>> {
+        let conn=self.conn()?;
+        conn.query_row("SELECT fiscal_title FROM sef_mjeku_item_titles WHERE visit_item_id=?1",
+            [item_id],|r|r.get(0)).optional().map_err(Into::into)
+    }
+
+    pub fn sef_item_fiscal_title_set(&self, item_id:&str, title:&str)->anyhow::Result<()> {
+        let title=title.trim();
+        if item_id.trim().is_empty() || title.chars().count()<3 || title.chars().count()>120 ||
+           title.chars().any(char::is_control) {
+            bail!("Përshkrimi fiskal duhet të jetë 3–120 karaktere pa rreshta të rinj.");
+        }
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let allowed:i64=tx.query_row(
+            "SELECT COUNT(*) FROM visit_items WHERE id=?1 AND deleted=0 AND fiscal=1 AND fiscalized=0",
+            [item_id],|r|r.get(0))?;
+        if allowed!=1 {bail!("Përshkrimi fiskal nuk mund të ndryshohet për këtë procedurë.");}
+        let now=now_iso();
+        tx.execute("INSERT INTO sef_mjeku_item_titles(visit_item_id,fiscal_title,created_at,updated_at)
+            VALUES(?1,?2,?3,?3)
+            ON CONFLICT(visit_item_id) DO UPDATE SET fiscal_title=excluded.fiscal_title,updated_at=excluded.updated_at",
+            params![item_id,title,now])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn sef_item_fiscal_titles_list(&self, visit_id:&str)->anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare(
+            "SELECT t.visit_item_id,t.fiscal_title FROM sef_mjeku_item_titles t
+             JOIN visit_items i ON i.id=t.visit_item_id
+             WHERE i.visit_id=?1 AND i.deleted=0 ORDER BY i.created_at")?;
+        let rows=stmt.query_map([visit_id],|r|Ok(serde_json::json!({
+            "itemId":r.get::<_,String>(0)?,
+            "fiscalTitle":r.get::<_,String>(1)?
+        })))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod sef_mjeku_fiscal_title_tests {
+    use super::*;
+    #[test]
+    fn fiscal_description_requires_explicit_nonclinical_value() {
+        let db=Db::new_in_memory().unwrap();
+        assert_eq!(db.sef_fiscal_title_for("unknown").unwrap(),None);
+        assert!(db.sef_item_fiscal_title_set("unknown","Vizitë mjekësore").is_err());
+        let conn=db.conn().unwrap();
+        conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql")).unwrap();
+    }
+}
