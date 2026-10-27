@@ -8928,7 +8928,7 @@ fn sef_append_chain_tx(tx:&rusqlite::Transaction<'_>,kind:&str)->anyhow::Result<
 /// Fixed official ATK code sets synchronized from PROGRAMERI POS SefAtkCodes.
 const ATK_CATEGORY_CODES: &[&str] = &["TT","UR","AU","VM","KO","AP","BM","PM","PP","PE","PS","PB","BB","KB","EE","PSE","SM","SJ","ST","SK","SMK","STR","PI","PT","SEA","KS","MN","SHN","SDG","HT","SHB","STI","SHT","PBS","MPM","PPD","PPH","PPP","PPA","PHN","SHH","SUA","SHZ","PJA","PAL2","DUH","SHM","PRO","SFV","BSH","RPK","PTI"];
 const ATK_UNIT_CODES: &[&str] = &["EA","CP","LTR","SEC","MIN","HUR","DAY","MON","ANN","KGB","KGN","TN","GRM","M4","UDH","KMT","LM","MTS","MIV","MSK","KEH","NFJ","NFQ","PRQ","DP","OP","PRD","PAL","XBX","PK","SET"];
-fn atk_catalog_allowed(category:&str,unit:&str)->bool {
+pub(crate) fn atk_catalog_allowed(category:&str,unit:&str)->bool {
     ATK_CATEGORY_CODES.contains(&category) && ATK_UNIT_CODES.contains(&unit)
 }
 
