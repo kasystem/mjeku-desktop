@@ -7689,6 +7689,54 @@ impl Db {
 
     /// Fiscal configuration for ordinary SalesPage lines; clinical titles are
     /// never reused as ATK descriptions. Missing metadata remains visibly empty.
+    /// One-time assignment on the product/service card. Tax percentage is
+    /// never editable; code A/C/D/E resolves to fixed ATK rates in the POS.
+    pub fn sef_catalog_template_get(&self,kind:&str,ref_id:&str)
+        ->anyhow::Result<Option<serde_json::Value>> {
+        let conn=self.conn()?;
+        conn.query_row(
+            "SELECT tax_code,category_code,unit_code
+             FROM sef_mjeku_catalog_templates WHERE item_type=?1 AND ref_id=?2",
+            params![kind,ref_id],|r|Ok(serde_json::json!({
+                "taxCode":r.get::<_,String>(0)?,
+                "categoryCode":r.get::<_,String>(1)?,
+                "unitCode":r.get::<_,String>(2)?
+            }))
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn sef_catalog_template_set(
+        &self,kind:&str,ref_id:&str,tax:&str,category:&str,unit:&str
+    )->anyhow::Result<()> {
+        let tax=tax.trim().to_ascii_uppercase();
+        let category=category.trim().to_ascii_uppercase();
+        let unit=unit.trim().to_ascii_uppercase();
+        if !matches!(kind,"service"|"product") ||
+            (kind=="product" && !matches!(tax.as_str(),"A"|"C"|"D"|"E")) ||
+            (kind=="service" && !tax.is_empty()) ||
+            !atk_catalog_allowed(&category,&unit) {
+            bail!("Përdor vetëm kodet fikse të ATK nga PROGRAMERI POS.");
+        }
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let reference_table=if kind=="service" { "services" } else { "stock_items" };
+        let exists:i64=tx.query_row(
+            &format!("SELECT COUNT(*) FROM {reference_table} WHERE id=?1 AND deleted=0"),
+            [ref_id],|r|r.get(0))?;
+        if exists!=1 { bail!("Shërbimi/produkti nuk ekziston."); }
+        // Immutable copies are stored on saved invoice lines. Catalog edits
+        // affect future sales only, not already created receipts/requests.
+        tx.execute(
+            "INSERT INTO sef_mjeku_catalog_templates(item_type,ref_id,tax_code,category_code,unit_code,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(item_type,ref_id) DO UPDATE SET
+               tax_code=excluded.tax_code,category_code=excluded.category_code,
+               unit_code=excluded.unit_code,updated_at=excluded.updated_at",
+            params![kind,ref_id,tax,category,unit,now_iso()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn sef_sales_fiscal_items(&self, sale_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn=self.conn()?;
         let mut stmt=conn.prepare(
@@ -7716,8 +7764,7 @@ impl Db {
         if title.chars().count()<3 || title.chars().count()>120 ||
             title.chars().any(char::is_control) ||
             !matches!(tax.as_str(),"A"|"C"|"D"|"E") ||
-            !matches!(category.as_str(),"SM"|"BM"|"PM") ||
-            !matches!(unit.as_str(),"EA"|"HUR"|"DAY") {
+            !atk_catalog_allowed(&category,&unit) {
             bail!("Plotëso përshkrimin fiskal (3–120 karaktere), kodin TVSH A/C/D/E, kategorinë SM/BM/PM dhe njësinë EA/HUR/DAY.");
         }
         let mut conn=self.conn()?;
@@ -7801,6 +7848,37 @@ impl Db {
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 rusqlite::params![id, sale_id, item.item_type, item.ref_id, item.title, item.qty, item.unit_price, now],
             )?;
+            // Fiscal snapshot is populated automatically from the item catalog
+            // at save time. No per-coupon ATK editing required.
+            if let Some(ref_id)=item.ref_id.as_deref().filter(|id|!id.trim().is_empty()) {
+                let fiscal:Option<(String,String,String,String)>=tx.query_row(
+                    "SELECT CASE WHEN ?1='service' THEN s.title ELSE p.name END,
+                            CASE WHEN ?1='service' THEN s.vat_code ELSE t.tax_code END,
+                            COALESCE(t.category_code,CASE WHEN ?1='service' THEN 'SM' ELSE '' END),
+                            COALESCE(t.unit_code,CASE WHEN ?1='service' THEN 'EA' ELSE '' END)
+                     FROM (SELECT 1) x
+                     LEFT JOIN services s ON ?1='service' AND s.id=?2 AND s.deleted=0
+                     LEFT JOIN stock_items p ON ?1='product' AND p.id=?2 AND p.deleted=0
+                     LEFT JOIN sef_mjeku_catalog_templates t ON t.item_type=?1 AND t.ref_id=?2",
+                    params![item.item_type,ref_id],|r|Ok((
+                        r.get::<_,Option<String>>(0)?.unwrap_or_default(),
+                        r.get::<_,Option<String>>(1)?.unwrap_or_default(),
+                        r.get::<_,Option<String>>(2)?.unwrap_or_default(),
+                        r.get::<_,Option<String>>(3)?.unwrap_or_default()
+                    ))
+                ).optional()?;
+                if let Some((title,tax,category,unit))=fiscal {
+                    if title.trim().chars().count()>=3 && title.trim().chars().count()<=120 &&
+                       matches!(tax.as_str(),"A"|"C"|"D"|"E") &&
+                       atk_catalog_allowed(&category,&unit) {
+                        tx.execute(
+                            "INSERT INTO sef_mjeku_sale_item_fiscal(
+                                sale_item_id,fiscal_title,tax_code,category_code,unit_code,created_at,updated_at)
+                             VALUES(?1,?2,?3,?4,?5,?6,?6)",
+                            params![id,title.trim(),tax,category,unit,now])?;
+                    }
+                }
+            }
             if item.item_type == "product" {
                 if let Some(ref_id) = &item.ref_id {
                     tx.execute(
@@ -8785,6 +8863,13 @@ fn sef_append_chain_tx(tx:&rusqlite::Transaction<'_>,kind:&str)->anyhow::Result<
     tx.execute("INSERT INTO sef_mjeku_event_chain(source_kind,source_event_id,previous_hash,event_hash,created_at)
                VALUES(?1,?2,?3,?4,?5)",params![kind,event_id,previous,hash,now_iso()])?;
     Ok(())
+}
+
+/// Fixed official ATK code sets synchronized from PROGRAMERI POS SefAtkCodes.
+const ATK_CATEGORY_CODES: &[&str] = &["TT","UR","AU","VM","KO","AP","BM","PM","PP","PE","PS","PB","BB","KB","EE","PSE","SM","SJ","ST","SK","SMK","STR","PI","PT","SEA","KS","MN","SHN","SDG","HT","SHB","STI","SHT","PBS","MPM","PPD","PPH","PPP","PPA","PHN","SHH","SUA","SHZ","PJA","PAL2","DUH","SHM","PRO","SFV","BSH","RPK","PTI"];
+const ATK_UNIT_CODES: &[&str] = &["EA","CP","LTR","SEC","MIN","HUR","DAY","MON","ANN","KGB","KGN","TN","GRM","M4","UDH","KMT","LM","MTS","MIV","MSK","KEH","NFJ","NFQ","PRQ","DP","OP","PRD","PAL","XBX","PK","SET"];
+fn atk_catalog_allowed(category:&str,unit:&str)->bool {
+    ATK_CATEGORY_CODES.contains(&category) && ATK_UNIT_CODES.contains(&unit)
 }
 
 /// Local commercial-only fiscal attempt. Never serialize this struct to the WebView.
