@@ -4364,7 +4364,7 @@ impl Db {
         };
         let cols = "id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted";
         let mut items: Vec<VisitItem> = Vec::new();
-        {
+        if sale_items.is_empty() {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {cols} FROM visit_items
                  WHERE visit_id=?1 AND deleted=0 AND fiscal=1 AND fiscalized=0
@@ -4375,7 +4375,7 @@ impl Db {
             }
         }
         let mut used_non_fiscal_fallback = false;
-        if items.is_empty() && allow_any_items_if_no_fiscal {
+        if items.is_empty() && sale_items.is_empty() && allow_any_items_if_no_fiscal {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {cols} FROM visit_items
                  WHERE visit_id=?1 AND deleted=0 AND fiscalized=0
@@ -4386,8 +4386,8 @@ impl Db {
             }
             used_non_fiscal_fallback = !items.is_empty();
         }
-        if items.is_empty() {
-            bail!("nuk ka rreshta fiskal pa fiskalizuar");
+        if items.is_empty() && sale_items.is_empty() {
+            bail!("Fatura nuk ka artikuj te fiskalizueshem. Shto artikuj te Shitjet para leshimit te kuponit SEF.");
         }
 
         let mut payments: Vec<(String, f64)> = Vec::new();
