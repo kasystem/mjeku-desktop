@@ -9,8 +9,15 @@ CREATE TABLE IF NOT EXISTS sef_mjeku_item_catalog_v7 (
 );
 INSERT OR IGNORE INTO sef_mjeku_item_catalog_v7
  (visit_item_id,category_code,unit_code,created_at,updated_at)
-SELECT visit_item_id,category_code,unit_code,created_at,updated_at
-FROM sef_mjeku_item_catalog;
+SELECT c.visit_item_id,c.category_code,c.unit_code,c.created_at,c.updated_at
+FROM sef_mjeku_item_catalog c
+JOIN visit_items i ON i.id=c.visit_item_id
+WHERE NOT EXISTS(
+  SELECT 1 FROM sef_mjeku_item_catalog_v7 v WHERE v.visit_item_id=c.visit_item_id
+) AND COALESCE(i.fiscalized,0)=0
+AND NOT EXISTS(
+  SELECT 1 FROM sef_mjeku_transactions t WHERE t.sale_id=i.visit_id
+);
 CREATE TRIGGER IF NOT EXISTS sef_mjeku_catalog_v7_no_delete
  BEFORE DELETE ON sef_mjeku_item_catalog_v7
  BEGIN SELECT RAISE(ABORT,'SEF catalog cannot be deleted'); END;
