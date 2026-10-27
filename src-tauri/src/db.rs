@@ -9377,7 +9377,7 @@ impl Db {
     pub fn sef_fiscal_catalog_for(&self, item_id: &str) -> anyhow::Result<Option<(String,String)>> {
         let conn=self.conn()?;
         conn.query_row(
-            "SELECT category_code,unit_code FROM sef_mjeku_item_catalog WHERE visit_item_id=?1",
+            "SELECT category_code,unit_code FROM sef_mjeku_item_catalog_v7 WHERE visit_item_id=?1",
             [item_id], |r| Ok((r.get(0)?,r.get(1)?))
         ).optional().map_err(Into::into)
     }
