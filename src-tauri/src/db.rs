@@ -2154,6 +2154,7 @@ impl Db {
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v4.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v5.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v6.sql"))?;
+            conn.execute_batch(include_str!("../migrations/sef_mjeku_v7.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -2188,6 +2189,7 @@ impl Db {
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v4.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v5.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v6.sql"))?;
+            conn.execute_batch(include_str!("../migrations/sef_mjeku_v7.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -9383,9 +9385,8 @@ impl Db {
     pub fn sef_item_fiscal_catalog_set(&self, item_id:&str, category_code:&str, unit_code:&str) -> anyhow::Result<()> {
         let category=category_code.trim().to_ascii_uppercase();
         let unit=unit_code.trim().to_ascii_uppercase();
-        if !matches!(category.as_str(),"SM"|"BM"|"PM") ||
-           !matches!(unit.as_str(),"EA"|"HUR"|"DAY") {
-            bail!("Zgjidh kategori (SM/BM/PM) dhe njësi (EA/HUR/DAY) të vlefshme sipas ATK.");
+        if !atk_catalog_allowed(&category,&unit) {
+            bail!("Kategoria ose njësia nuk është në katalogun e fiksuar të ATK/PROGRAMERI POS.");
         }
         let mut conn=self.conn()?;
         let tx=conn.transaction()?;
@@ -9394,7 +9395,7 @@ impl Db {
             [item_id], |r|r.get(0))?;
         if allowed!=1 { bail!("Kategoria dhe njësia fiskale nuk mund të ndryshohen për këtë procedurë."); }
         let now=now_iso();
-        tx.execute("INSERT INTO sef_mjeku_item_catalog(visit_item_id,category_code,unit_code,created_at,updated_at)
+        tx.execute("INSERT INTO sef_mjeku_item_catalog_v7(visit_item_id,category_code,unit_code,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?4)
              ON CONFLICT(visit_item_id) DO UPDATE SET
                category_code=excluded.category_code,unit_code=excluded.unit_code,updated_at=excluded.updated_at",
@@ -9406,7 +9407,7 @@ impl Db {
     pub fn sef_item_fiscal_catalog_list(&self, visit_id:&str) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn=self.conn()?;
         let mut stmt=conn.prepare(
-            "SELECT c.visit_item_id,c.category_code,c.unit_code FROM sef_mjeku_item_catalog c
+            "SELECT c.visit_item_id,c.category_code,c.unit_code FROM sef_mjeku_item_catalog_v7 c
              JOIN visit_items i ON i.id=c.visit_item_id
              WHERE i.visit_id=?1 AND i.deleted=0 ORDER BY i.created_at")?;
         let rows=stmt.query_map([visit_id],|r|Ok(serde_json::json!({
