@@ -471,21 +471,11 @@ pub const VAT_RATE_SETTING_KEYS: [&str; 4] = [
 ];
 
 impl VatRates {
-    /// Lexon mbishkrimet nga cilësimet; vlerë bosh/e pavlefshme → parazgjedhja.
-    pub fn from_settings(get: impl Fn(&str) -> Option<String>) -> Self {
-        let d = Self::default();
-        let parse = |key: &str, def: u32| -> u32 {
-            get(key)
-                .and_then(|v| v.trim().trim_end_matches('%').trim().parse::<u32>().ok())
-                .filter(|v| *v <= 100)
-                .unwrap_or(def)
-        };
-        Self {
-            a: parse(VAT_RATE_SETTING_KEYS[0], d.a),
-            c: parse(VAT_RATE_SETTING_KEYS[1], d.c),
-            d: parse(VAT_RATE_SETTING_KEYS[2], d.d),
-            e: parse(VAT_RATE_SETTING_KEYS[3], d.e),
-        }
+    /// Tax rates are fixed by PROGRAMERI POS / ATK: 0%,0%,8%,18%.
+    /// Obsolete local setting overrides are deliberately ignored. The catalog
+    /// assigns the code to the product/service, NEVER an arbitrary percentage.
+    pub fn from_settings(_get: impl Fn(&str) -> Option<String>) -> Self {
+        Self::default()
     }
 
     /// Kodi i panjohur trajtohet si C, njësoj si `fiscal_vat_group_for_code` në db.rs.
@@ -784,9 +774,9 @@ pub fn fiscalize_params(sale_id: &str, issued_at: &str, req: &FiscalizeRequest) 
 /// available for backward compatibility tests only; SEF issue path uses this version.
 pub fn fiscalize_params_v2(sale_id: &str, issued_at: &str, operator_name: &str, req: &FiscalizeRequest) -> Result<Value, BridgeError> {
     if operator_name.trim().is_empty() ||
-       req.items.iter().any(|i| !matches!(i.category_code.as_str(),"SM"|"BM"|"PM") ||
-           !matches!(i.unit_code.as_str(),"EA"|"HUR"|"DAY") ||
-           !matches!(i.tax_code.as_str(),"A"|"C"|"D"|"E")) {
+       req.items.iter().any(|i| !crate::db::atk_catalog_allowed(
+            i.category_code.as_str(), i.unit_code.as_str()
+       ) || !matches!(i.tax_code.as_str(),"A"|"C"|"D"|"E")) {
         return Err(local_validation("Konfigurimi i operatorit ose klasifikimi fiskal ATK mungon."));
     }
     Ok(json!({
@@ -965,7 +955,7 @@ mod tests {
             "sef_vat_rate_a" => Some("101".to_string()),
             _ => None,
         });
-        assert_eq!(o.e, 17);
+        assert_eq!(o.e, 18); // Overrides are no longer honored.
         assert_eq!(o.d, 8);
         assert_eq!(o.a, 0);
     }
