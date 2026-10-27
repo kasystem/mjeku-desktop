@@ -7678,6 +7678,65 @@ impl Db {
         Ok(())
     }
 
+    /// Fiscal configuration for ordinary SalesPage lines; clinical titles are
+    /// never reused as ATK descriptions. Missing metadata remains visibly empty.
+    pub fn sef_sales_fiscal_items(&self, sale_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn=self.conn()?;
+        let mut stmt=conn.prepare(
+            "SELECT i.id,i.title,i.qty,i.unit_price,
+                    COALESCE(m.fiscal_title,''),COALESCE(m.tax_code,''),
+                    COALESCE(m.category_code,''),COALESCE(m.unit_code,'')
+             FROM sale_items i LEFT JOIN sef_mjeku_sale_item_fiscal m ON m.sale_item_id=i.id
+             WHERE i.sale_id=?1 ORDER BY i.created_at,i.id")?;
+        let result=stmt.query_map([sale_id],|r|Ok(serde_json::json!({
+            "id":r.get::<_,String>(0)?, "saleTitle":r.get::<_,String>(1)?,
+            "qty":r.get::<_,f64>(2)?, "unitPrice":r.get::<_,f64>(3)?,
+            "fiscalTitle":r.get::<_,String>(4)?, "taxCode":r.get::<_,String>(5)?,
+            "categoryCode":r.get::<_,String>(6)?, "unitCode":r.get::<_,String>(7)?
+        })))?;
+        Ok(result.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn sef_sales_fiscal_item_set(
+        &self,sale_id:&str,item_id:&str,title:&str,tax:&str,category:&str,unit:&str
+    ) -> anyhow::Result<()> {
+        let title=title.trim();
+        let tax=tax.trim().to_ascii_uppercase();
+        let category=category.trim().to_ascii_uppercase();
+        let unit=unit.trim().to_ascii_uppercase();
+        if title.chars().count()<3 || title.chars().count()>120 ||
+            title.chars().any(char::is_control) ||
+            !matches!(tax.as_str(),"A"|"C"|"D"|"E") ||
+            !matches!(category.as_str(),"SM"|"BM"|"PM") ||
+            !matches!(unit.as_str(),"EA"|"HUR"|"DAY") {
+            bail!("Plotëso përshkrimin fiskal (3–120 karaktere), kodin TVSH A/C/D/E, kategorinë SM/BM/PM dhe njësinë EA/HUR/DAY.");
+        }
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let valid:i64=tx.query_row(
+            "SELECT COUNT(*) FROM sale_items i JOIN sales s ON s.id=i.sale_id
+             WHERE i.id=?1 AND i.sale_id=?2 AND s.deleted=0 AND s.fiscalized=0",
+            params![item_id,sale_id],|r|r.get(0))?;
+        let reserved:i64=tx.query_row(
+            "SELECT COUNT(*) FROM sef_mjeku_transactions WHERE sale_id=?1",
+            [sale_id],|r|r.get(0))?;
+        if valid!=1 || reserved!=0 {
+            bail!("Kërkesa fiskale është mbyllur ose ka histori SEF; nuk lejohet ndryshimi i artikujve.");
+        }
+        let now=now_iso();
+        tx.execute(
+            "INSERT INTO sef_mjeku_sale_item_fiscal(
+                sale_item_id,fiscal_title,tax_code,category_code,unit_code,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?6)
+             ON CONFLICT(sale_item_id) DO UPDATE SET
+                fiscal_title=excluded.fiscal_title,tax_code=excluded.tax_code,
+                category_code=excluded.category_code,unit_code=excluded.unit_code,
+                updated_at=excluded.updated_at",
+            params![item_id,title,tax,category,unit,now])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn sale_items_list(&self, sale_id: &str) -> anyhow::Result<Vec<crate::models::SaleItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
