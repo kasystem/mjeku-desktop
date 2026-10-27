@@ -3691,26 +3691,42 @@ fn sef_build_sale(
     use sha2::Digest;
     let data = db.sef_collect_sale(sale_id, allow_any).map_err(err_string)?;
     let rates = crate::sef_bridge::VatRates::from_settings(|k| db.setting_get(k).ok().flatten());
-    let lines: Vec<crate::sef_bridge::SaleLine> = data.items.iter().map(|it| {
-        // The clinical procedure title/diagnosis must NEVER enter the POS fiscal ledger.
-        // The user explicitly maintains a separate fiscal-only description.
-        let title=db.sef_fiscal_title_for(&it.id).map_err(err_string)?
-            .ok_or_else(||format!("Mungon përshkrimi fiskal për një procedurë. Plotëso përshkrimin e kuponit te detajet e vizitës (pa të dhëna klinike)."))?;
-        Ok(crate::sef_bridge::SaleLine {
-            id: it.id.clone(), title, qty: it.qty,
-            unit_price: it.unit_price, vat_code: it.vat_code.clone()
-        })
-    }).collect::<Result<Vec<_>,String>>()?;
+    let lines: Vec<crate::sef_bridge::SaleLine> = if !data.sale_items.is_empty() {
+        // Ordinary SalesPage invoices store lines in sale_items, NOT visit_items.
+        // Descriptions/taxes are explicit from sef_mjeku_sale_item_fiscal,
+        // never the patient-facing item title or medical notes.
+        data.sale_items.iter().map(|it| crate::sef_bridge::SaleLine {
+            id:it.id.clone(),title:it.fiscal_title.clone(),qty:it.qty,
+            unit_price:it.unit_price,vat_code:it.vat_code.clone()
+        }).collect()
+    } else {
+        data.items.iter().map(|it| {
+            let title=db.sef_fiscal_title_for(&it.id).map_err(err_string)?
+                .ok_or_else(||"Mungon përshkrimi fiskal i procedurës te Vizitat (pa të dhëna klinike).".to_string())?;
+            Ok(crate::sef_bridge::SaleLine {
+                id:it.id.clone(),title,qty:it.qty,unit_price:it.unit_price,
+                vat_code:it.vat_code.clone()
+            })
+        }).collect::<Result<Vec<_>,String>>()?
+    };
     let payments: Vec<crate::sef_bridge::SalePayment> = data.payments.iter().map(|(m,a)|
         crate::sef_bridge::SalePayment { method:m.clone(), amount:*a }).collect();
     let mut req = crate::sef_bridge::build_fiscalize_request_strict(&lines, &payments, &rates)
         .map_err(err_string)?;
-    for (line, source_item) in req.items.iter_mut().zip(data.items.iter()) {
-        let (category,unit)=db.sef_fiscal_catalog_for(&source_item.id).map_err(err_string)?
-            .ok_or_else(|| "Mungon kategoria/njësia ATK e shërbimit. Plotëso klasifikimin fiskal te detajet e vizitës.".to_string())?;
-        line.category_code=category;
-        line.unit_code=unit;
-        line.tax_code=source_item.vat_code.trim().to_ascii_uppercase();
+    if !data.sale_items.is_empty() {
+        for (line, source) in req.items.iter_mut().zip(data.sale_items.iter()) {
+            line.category_code=source.category_code.clone();
+            line.unit_code=source.unit_code.clone();
+            line.tax_code=source.vat_code.trim().to_ascii_uppercase();
+        }
+    } else {
+        for (line, source_item) in req.items.iter_mut().zip(data.items.iter()) {
+            let (category,unit)=db.sef_fiscal_catalog_for(&source_item.id).map_err(err_string)?
+                .ok_or_else(|| "Mungon kategoria/njësia ATK e shërbimit. Plotëso klasifikimin fiskal te detajet e vizitës.".to_string())?;
+            line.category_code=category;
+            line.unit_code=unit;
+            line.tax_code=source_item.vat_code.trim().to_ascii_uppercase();
+        }
     }
     let canonical = serde_json::to_vec(&serde_json::json!({
         "items": &req.items, "payments": &req.payments
@@ -4301,6 +4317,28 @@ async fn sef_action_reconcile(
             .ok_or_else(||"Nuk ka veprim SEF me këtë identifikues.".to_string())?;
         sef_action_reconcile_blocking(&db,&record)
     }).await.map_err(err_string)?
+}
+
+#[tauri::command]
+async fn sef_sales_fiscal_items(
+    state: tauri::State<'_, AppState>,sale_id:String
+)->Result<Vec<serde_json::Value>,String>{
+    let _=require_finance(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_sales_fiscal_items(&sale_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_sales_fiscal_item_set(
+    state: tauri::State<'_, AppState>,sale_id:String,item_id:String,
+    fiscal_title:String,tax_code:String,category_code:String,unit_code:String
+)->Result<(),String>{
+    let _=require_finance(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_sales_fiscal_item_set(
+        &sale_id,&item_id,&fiscal_title,&tax_code,&category_code,&unit_code))
+        .await.map_err(err_string)?.map_err(err_string)
 }
 
 #[tauri::command]
@@ -5661,6 +5699,8 @@ pub fn run() {
             sef_coupon_cancel,
             sef_actions_list,
             sef_action_reconcile,
+            sef_sales_fiscal_items,
+            sef_sales_fiscal_item_set,
             sef_item_fiscal_titles_list,
             sef_item_fiscal_title_set,
             sef_item_fiscal_catalog_list,
