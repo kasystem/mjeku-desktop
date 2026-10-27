@@ -3766,7 +3766,7 @@ impl Db {
                 items.push(r?);
             }
 
-            if items.is_empty() && sale_items.is_empty() && allow_any_items_if_no_fiscal {
+            if items.is_empty() && allow_any_items_if_no_fiscal {
                 let mut stmt_any = conn.prepare(
           "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
            FROM visit_items
@@ -3800,8 +3800,8 @@ impl Db {
                 }
             }
         }
-        if items.is_empty() && sale_items.is_empty() {
-            bail!("Fatura nuk ka artikuj te fiskalizueshem. Shto artikuj te Shitjet para leshimit te kuponit SEF.");
+        if items.is_empty() {
+            bail!("nuk ka rreshta fiskal pa fiskalizuar");
         }
 
         // Required by fiscal flow: clear article list once before printing receipt.
