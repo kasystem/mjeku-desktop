@@ -26,3 +26,13 @@ CREATE TRIGGER IF NOT EXISTS sef_mjeku_catalog_v7_no_insert_after_request
    JOIN sef_mjeku_transactions s ON s.sale_id=i.visit_id
    WHERE i.id=NEW.visit_item_id)
  BEGIN SELECT RAISE(ABORT,'SEF catalog frozen after fiscal request'); END;
+CREATE TRIGGER IF NOT EXISTS sef_mjeku_catalog_v7_no_update_after_fiscalization
+ BEFORE UPDATE ON sef_mjeku_item_catalog_v7
+ WHEN EXISTS(SELECT 1 FROM visit_items
+   WHERE id=OLD.visit_item_id AND fiscalized=1)
+ BEGIN SELECT RAISE(ABORT,'SEF item frozen after fiscalization'); END;
+CREATE TRIGGER IF NOT EXISTS sef_mjeku_catalog_v7_no_insert_after_fiscalization
+ BEFORE INSERT ON sef_mjeku_item_catalog_v7
+ WHEN EXISTS(SELECT 1 FROM visit_items
+   WHERE id=NEW.visit_item_id AND fiscalized=1)
+ BEGIN SELECT RAISE(ABORT,'SEF item frozen after fiscalization'); END;
