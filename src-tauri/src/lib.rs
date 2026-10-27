@@ -4320,6 +4320,28 @@ async fn sef_action_reconcile(
 }
 
 #[tauri::command]
+async fn sef_catalog_template_get(
+    state: tauri::State<'_, AppState>,item_type:String,ref_id:String
+)->Result<Option<serde_json::Value>,String> {
+    let _=require_finance(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_catalog_template_get(&item_type,&ref_id))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_catalog_template_set(
+    state: tauri::State<'_, AppState>,item_type:String,ref_id:String,
+    tax_code:String,category_code:String,unit_code:String
+)->Result<(),String> {
+    let _=require_finance(&state).await?;
+    let db=state.db.clone();
+    tokio::task::spawn_blocking(move || db.sef_catalog_template_set(
+        &item_type,&ref_id,&tax_code,&category_code,&unit_code))
+        .await.map_err(err_string)?.map_err(err_string)
+}
+
+#[tauri::command]
 async fn sef_sales_fiscal_items(
     state: tauri::State<'_, AppState>,sale_id:String
 )->Result<Vec<serde_json::Value>,String>{
@@ -5699,6 +5721,8 @@ pub fn run() {
             sef_coupon_cancel,
             sef_actions_list,
             sef_action_reconcile,
+            sef_catalog_template_get,
+            sef_catalog_template_set,
             sef_sales_fiscal_items,
             sef_sales_fiscal_item_set,
             sef_item_fiscal_titles_list,
