@@ -4314,6 +4314,7 @@ impl Db {
         if sale_id.is_empty() {
             bail!("sale_id eshte i detyrueshem");
         }
+        self.sef_sales_snapshot_catalog(sale_id)?;
         let conn = self.conn()?;
         let sale = conn
             .query_row(
@@ -7687,6 +7688,64 @@ impl Db {
         Ok(())
     }
 
+    /// Backfill only missing fiscal snapshots from the service/product catalog.
+    /// Allows a one-click receipt on sales saved by earlier MJEKU versions,
+    /// without exposing editable VAT/category/unit fields on every invoice.
+    /// Never touches a fiscal request that already has a ledger record.
+    pub fn sef_sales_snapshot_catalog(&self,sale_id:&str)->anyhow::Result<()> {
+        let mut conn=self.conn()?;
+        let tx=conn.transaction()?;
+        let locked:i64=tx.query_row(
+            "SELECT COUNT(*) FROM sef_mjeku_transactions WHERE sale_id=?1",
+            [sale_id],|r|r.get(0))?;
+        let finalized:i64=tx.query_row(
+            "SELECT COALESCE(fiscalized,0) FROM sales WHERE id=?1",
+            [sale_id],|r|r.get(0)).optional()?.unwrap_or(0);
+        if locked>0 || finalized!=0 {tx.commit()?;return Ok(());}
+        let rows={
+            let mut stmt=tx.prepare(
+                "SELECT i.id,i.item_type,i.ref_id
+                 FROM sale_items i
+                 LEFT JOIN sef_mjeku_sale_item_fiscal m ON m.sale_item_id=i.id
+                 WHERE i.sale_id=?1 AND m.sale_item_id IS NULL AND i.ref_id IS NOT NULL")?;
+            stmt.query_map([sale_id],|r|Ok((
+                r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?
+            )))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (item_id,kind,ref_id) in rows {
+            let fiscal:Option<(String,String,String,String)>=tx.query_row(
+                "SELECT CASE WHEN ?1='service' THEN s.title ELSE p.name END,
+                        CASE WHEN ?1='service' THEN s.vat_code ELSE t.tax_code END,
+                        COALESCE(t.category_code,CASE WHEN ?1='service' THEN 'SM' ELSE '' END),
+                        COALESCE(t.unit_code,CASE WHEN ?1='service' THEN 'EA' ELSE '' END)
+                 FROM (SELECT 1) x
+                 LEFT JOIN services s ON ?1='service' AND s.id=?2 AND s.deleted=0
+                 LEFT JOIN stock_items p ON ?1='product' AND p.id=?2 AND p.deleted=0
+                 LEFT JOIN sef_mjeku_catalog_templates t ON t.item_type=?1 AND t.ref_id=?2",
+                params![kind,ref_id],|r|Ok((
+                    r.get::<_,Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_,Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_,Option<String>>(2)?.unwrap_or_default(),
+                    r.get::<_,Option<String>>(3)?.unwrap_or_default()
+                ))
+            ).optional()?;
+            if let Some((title,tax,category,unit))=fiscal {
+                if title.trim().chars().count()>=3 && title.trim().chars().count()<=120 &&
+                   matches!(tax.as_str(),"A"|"C"|"D"|"E") &&
+                   atk_catalog_allowed(&category,&unit) {
+                    let now=now_iso();
+                    tx.execute(
+                        "INSERT OR IGNORE INTO sef_mjeku_sale_item_fiscal(
+                            sale_item_id,fiscal_title,tax_code,category_code,unit_code,created_at,updated_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?6)",
+                        params![item_id,title.trim(),tax,category,unit,now])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Fiscal configuration for ordinary SalesPage lines; clinical titles are
     /// never reused as ATK descriptions. Missing metadata remains visibly empty.
     /// One-time assignment on the product/service card. Tax percentage is
@@ -7738,6 +7797,7 @@ impl Db {
     }
 
     pub fn sef_sales_fiscal_items(&self, sale_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.sef_sales_snapshot_catalog(sale_id)?;
         let conn=self.conn()?;
         let mut stmt=conn.prepare(
             "SELECT i.id,i.title,i.qty,i.unit_price,
