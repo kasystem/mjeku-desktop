@@ -3365,6 +3365,15 @@ impl Db {
 
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        let locked:i64=tx.query_row(
+            "SELECT COUNT(*) FROM sef_mjeku_transactions WHERE sale_id=?1",
+            [&id],|r|r.get(0))?;
+        let finalized:i64=tx.query_row(
+            "SELECT COALESCE(fiscalized,0) FROM sales WHERE id=?1",
+            [&id],|r|r.get(0)).optional()?.unwrap_or(0);
+        if locked>0 || finalized!=0 {
+            bail!("Fatura ka kërkesë ose kupon SEF; ndryshimi i saj është bllokuar.");
+        }
         let existing: Option<(String, i64, Option<String>)> = tx
             .query_row(
                 "SELECT created_at, fiscalized, fiscalized_at FROM sales WHERE id=?1",
@@ -8982,6 +8991,40 @@ impl Db {
 #[cfg(test)]
 mod sef_mjeku_ledger_tests {
     use super::*;
+
+    #[test]
+    fn sales_page_lines_require_explicit_atk_metadata_without_a_fiscal_request() {
+        let db=Db::new_in_memory().unwrap();
+        {
+            let conn=db.conn().unwrap();
+            conn.execute("INSERT INTO clients(id,name) VALUES('client-sef','Shembull')",[]).unwrap();
+            conn.execute("INSERT INTO sales(id,client_id,total) VALUES('sale-sef','client-sef',25.0)",[]).unwrap();
+            conn.execute("INSERT INTO sale_items(id,sale_id,item_type,title,qty,unit_price,created_at)
+                VALUES('item-sef','sale-sef','service','Titull klinik privat',1,25.0,'2026-10-27')",[]).unwrap();
+        }
+        let failure=db.sef_collect_sale("sale-sef",true).unwrap_err().to_string();
+        assert!(failure.contains("Fiskal ATK"));
+        assert!(db.sef_ledger_list().unwrap().is_empty());
+        let lines=db.sef_sales_fiscal_items("sale-sef").unwrap();
+        assert_eq!(lines.len(),1);
+        assert_eq!(lines[0]["taxCode"],"");
+
+        db.sef_sales_fiscal_item_set(
+            "sale-sef","item-sef","Shërbim stomatologjik","D","SM","EA").unwrap();
+        let ready=db.sef_collect_sale("sale-sef",true).unwrap();
+        assert!(ready.items.is_empty());
+        assert_eq!(ready.sale_items.len(),1);
+        assert_eq!(ready.sale_items[0].fiscal_title,"Shërbim stomatologjik");
+        assert_eq!(ready.sale_items[0].vat_code,"D");
+        assert!(!ready.sale_items[0].fiscal_title.contains("klinik privat"));
+
+        let payload=r#"{"source":"mjeku","saleId":"sale-sef","items":[]}"#;
+        let hash="a".repeat(64);
+        db.sef_ledger_prepare("sale-sef",&hash,payload,true,2500,"ctx-test").unwrap();
+        assert!(db.sef_sales_fiscal_item_set("sale-sef","item-sef","Ndryshim","E","SM","EA").is_err());
+        assert!(db.sale_items_replace("sale-sef",&[]).is_err());
+        assert!(db.sef_ledger_list().unwrap().iter().any(|e|e["saleId"]=="sale-sef"));
+    }
 
     #[test]
     fn sef_ledger_is_immutable_idempotent_and_append_only() {
