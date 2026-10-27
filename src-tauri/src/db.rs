@@ -357,9 +357,23 @@ CREATE TABLE IF NOT EXISTS lab_inbox (
 pub struct SefSaleData {
     pub sale: Sale,
     pub items: Vec<VisitItem>,
+    /// Ordinary SalesPage lines: explicit nonclinical fiscal data, independent
+    /// from visit_items and from the arbitrary patient-facing sale item title.
+    pub sale_items: Vec<SefSaleItem>,
     pub used_non_fiscal_fallback: bool,
     /// (metoda, shuma) e pagesave jo të fshira të shitjes.
     pub payments: Vec<(String, f64)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SefSaleItem {
+    pub id: String,
+    pub fiscal_title: String,
+    pub qty: f64,
+    pub unit_price: f64,
+    pub vat_code: String,
+    pub category_code: String,
+    pub unit_code: String,
 }
 
 /// Të dhënat e kuponit SEF që Mjeku ruan te shitja (burimi i së vërtetës: PROGRAMERI POS).
@@ -2139,6 +2153,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v4.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v5.sql"))?;
+            conn.execute_batch(include_str!("../migrations/sef_mjeku_v6.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -2172,6 +2187,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/sef_mjeku_v3.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v4.sql"))?;
             conn.execute_batch(include_str!("../migrations/sef_mjeku_v5.sql"))?;
+            conn.execute_batch(include_str!("../migrations/sef_mjeku_v6.sql"))?;
         Self::run_migrations(&conn)?;
         conn.execute_batch(include_str!("../migrations/dental_findings_v1.sql"))?;
 
@@ -3750,7 +3766,7 @@ impl Db {
                 items.push(r?);
             }
 
-            if items.is_empty() && allow_any_items_if_no_fiscal {
+            if items.is_empty() && sale_items.is_empty() && allow_any_items_if_no_fiscal {
                 let mut stmt_any = conn.prepare(
           "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
            FROM visit_items
@@ -3784,8 +3800,8 @@ impl Db {
                 }
             }
         }
-        if items.is_empty() {
-            bail!("nuk ka rreshta fiskal pa fiskalizuar");
+        if items.is_empty() && sale_items.is_empty() {
+            bail!("Fatura nuk ka artikuj te fiskalizueshem. Shto artikuj te Shitjet para leshimit te kuponit SEF.");
         }
 
         // Required by fiscal flow: clear article list once before printing receipt.
@@ -4319,6 +4335,33 @@ impl Db {
             bail!("fatura eshte fiskalizuar tashme");
         }
 
+        // SalesPage persists in sale_items, NOT visit_items. Require explicit
+        // fiscal-only titles/classification; never send a clinical title to POS.
+        let sale_items = {
+            let mut stmt = conn.prepare(
+                "SELECT i.id, i.qty, i.unit_price, m.fiscal_title, m.tax_code,
+                        m.category_code, m.unit_code
+                 FROM sale_items i
+                 LEFT JOIN sef_mjeku_sale_item_fiscal m ON m.sale_item_id=i.id
+                 WHERE i.sale_id=?1 ORDER BY i.created_at,i.id"
+            )?;
+            let raw=stmt.query_map([sale_id],|r|Ok((
+                r.get::<_,String>(0)?,r.get::<_,f64>(1)?,r.get::<_,f64>(2)?,
+                r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,
+                r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?
+            )))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut result=Vec::new();
+            for (id,qty,price,title,tax,category,unit) in raw {
+                let (Some(title),Some(tax),Some(category),Some(unit))=(title,tax,category,unit) else {
+                    bail!("Mungon klasifikimi SEF i artikujve te Shitjet. Hap Shitjet → Fiskal ATK, ploteso pershkrimin fiskal, TVSH, kategorine dhe njesine per cdo artikull. Nuk eshte leshuar kupon.");
+                };
+                result.push(SefSaleItem {
+                    id,fiscal_title:title,qty,unit_price:price,vat_code:tax,
+                    category_code:category,unit_code:unit
+                });
+            }
+            result
+        };
         let cols = "id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted";
         let mut items: Vec<VisitItem> = Vec::new();
         {
@@ -4364,6 +4407,7 @@ impl Db {
         Ok(SefSaleData {
             sale,
             items,
+            sale_items,
             used_non_fiscal_fallback,
             payments,
         })
@@ -4409,6 +4453,8 @@ impl Db {
             return Ok(());
         }
 
+        // Ordinary SalesPage items have no fiscalized column; their parent sale
+        // is the authoritative issued state. Never write fake visit_items rows.
         for it in &data.items {
             let mut it = it.clone();
             let updated_fiscal_flag = if data.used_non_fiscal_fallback {
@@ -7650,6 +7696,15 @@ impl Db {
     pub fn sale_items_replace(&self, sale_id: &str, items: &[crate::models::SaleItemInput]) -> anyhow::Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let locked:i64=tx.query_row(
+            "SELECT COUNT(*) FROM sef_mjeku_transactions WHERE sale_id=?1",
+            [sale_id],|r|r.get(0))?;
+        let fiscalized:i64=tx.query_row(
+            "SELECT COALESCE(fiscalized,0) FROM sales WHERE id=?1",
+            [sale_id],|r|r.get(0))?;
+        if locked>0 || fiscalized!=0 {
+            bail!("Artikujt nuk mund te ndryshohen pas regjistrimit fiskal/kerkeses SEF.");
+        }
         // Return stock for old product line-items being replaced.
         {
             let mut stmt = tx.prepare(
