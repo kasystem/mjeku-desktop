@@ -1,4 +1,5 @@
 mod auth;
+mod atk_catalog;
 mod db;
 mod desktop_updates;
 mod error_logs;
@@ -2486,6 +2487,11 @@ async fn services_list(
 }
 
 #[tauri::command]
+fn atk_catalog_get() -> crate::atk_catalog::AtkCatalog {
+    crate::atk_catalog::get()
+}
+
+#[tauri::command]
 async fn services_upsert(
     state: tauri::State<'_, AppState>,
     service: ServiceUpsertInput,
@@ -3696,6 +3702,15 @@ fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<Str
             qty: it.qty,
             unit_price: it.unit_price,
             vat_code: it.vat_code.clone(),
+            product_id: it.catalog_item_id.clone(),
+            item_type: it.catalog_item_type.clone(),
+            stock_kind: it.catalog_item_id.as_ref().map(|_| "service".to_string()),
+            atk_category_code: it.catalog_item_id.as_ref().and_then(|_| {
+                let value = it.atk_category_code.trim(); (!value.is_empty()).then(|| value.to_string())
+            }),
+            atk_unit_code: it.catalog_item_id.as_ref().and_then(|_| {
+                let value = it.atk_unit_code.trim(); (!value.is_empty()).then(|| value.to_string())
+            }),
         })
         .collect();
     let pays: Vec<crate::sef_bridge::SalePayment> = data
@@ -4491,7 +4506,7 @@ async fn stock_items_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate
 }
 
 #[tauri::command]
-async fn stock_item_upsert(state: tauri::State<'_, AppState>, item: crate::models::StockItem) -> Result<(), String> {
+async fn stock_item_upsert(state: tauri::State<'_, AppState>, item: crate::models::StockItemUpsertInput) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_item_upsert(&item))
@@ -5034,6 +5049,12 @@ pub fn run() {
                     title: "Vizitë".to_string(),
                     default_price: 0.0,
                     vat_code: Some(if vat_registered { "A" } else { "C" }.to_string()),
+                    atk_category_code: Some("SM".to_string()),
+                    atk_unit_code: Some("CP".to_string()),
+                    sku: None,
+                    barcode: None,
+                    category: Some("Shërbime".to_string()),
+                    subcategory: None,
                     notes: Some("Shërbim bazë i vizitës".to_string()),
                 })?;
             }
@@ -5246,6 +5267,7 @@ pub fn run() {
             doctors_upsert,
             doctors_delete,
             services_list,
+            atk_catalog_get,
             services_upsert,
             services_delete,
             appointments_list,

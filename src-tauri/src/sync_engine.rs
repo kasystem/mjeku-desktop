@@ -760,6 +760,20 @@ fn normalize_sync_row_for_table(table: &str, row: &mut Value) {
             }
             "services" => {
                 normalize_string_key(obj, "vat_code", "C", true);
+                normalize_string_key(obj, "atk_category_code", "SM", true);
+                normalize_string_key(obj, "atk_unit_code", "CP", true);
+            }
+            "stock_items" => {
+                normalize_string_key(obj, "stock_kind", "unknown", false);
+                normalize_string_key(obj, "atk_tax_code", "C", true);
+                // Current quantity and supplier name are local projections, never synced as master data.
+                obj.remove("current_quantity");
+                obj.remove("supplier_name");
+            }
+            "stock_movements" => {
+                if !obj.contains_key("updated_at") || obj.get("updated_at").map(Value::is_null).unwrap_or(true) {
+                    if let Some(created) = obj.get("created_at").cloned() { obj.insert("updated_at".into(), created); }
+                }
             }
             "sales" => {
                 normalize_i64_key(obj, "fiscalized", 0);

@@ -512,6 +512,11 @@ pub struct SaleLine {
     pub qty: f64,
     pub unit_price: f64,
     pub vat_code: String,
+    pub product_id: Option<String>,
+    pub item_type: Option<String>,
+    pub stock_kind: Option<String>,
+    pub atk_category_code: Option<String>,
+    pub atk_unit_code: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +533,18 @@ pub struct FiscalItem {
     pub qty: String,
     pub unit_price_cents: i64,
     pub vat_rate_percent: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stock_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vat_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atk_category_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atk_unit_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -591,6 +608,12 @@ pub fn build_fiscalize_request(
             qty: qty_string(qty_milli),
             unit_price_cents: unit_cents,
             vat_rate_percent: rates.rate_for_code(&ln.vat_code),
+            product_id: ln.product_id.clone(),
+            item_type: ln.item_type.clone(),
+            stock_kind: ln.stock_kind.clone(),
+            vat_code: if ln.product_id.is_some() { Some(ln.vat_code.trim().to_ascii_uppercase()) } else { None },
+            atk_category_code: ln.atk_category_code.clone(),
+            atk_unit_code: ln.atk_unit_code.clone(),
         });
     }
 
@@ -834,6 +857,11 @@ mod tests {
             qty,
             unit_price: price,
             vat_code: vat.into(),
+            product_id: None,
+            item_type: None,
+            stock_kind: None,
+            atk_category_code: None,
+            atk_unit_code: None,
         }
     }
 

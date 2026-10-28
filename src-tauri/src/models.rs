@@ -4,6 +4,18 @@ fn default_vat_code() -> String {
     "C".to_string()
 }
 
+fn default_service_atk_category() -> String {
+    "SM".to_string()
+}
+
+fn default_atk_unit() -> String {
+    "CP".to_string()
+}
+
+fn default_stock_kind() -> String {
+    "unknown".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppInfo {
     pub version: String,
@@ -210,6 +222,18 @@ pub struct Service {
     pub default_price: f64,
     #[serde(default = "default_vat_code")]
     pub vat_code: String, // A | C | D | E
+    #[serde(default = "default_service_atk_category")]
+    pub atk_category_code: String,
+    #[serde(default = "default_atk_unit")]
+    pub atk_unit_code: String,
+    #[serde(default)]
+    pub sku: Option<String>,
+    #[serde(default)]
+    pub barcode: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub subcategory: Option<String>,
     pub notes: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -222,6 +246,18 @@ pub struct ServiceUpsertInput {
     pub title: String,
     pub default_price: f64,
     pub vat_code: Option<String>,
+    #[serde(default)]
+    pub atk_category_code: Option<String>,
+    #[serde(default)]
+    pub atk_unit_code: Option<String>,
+    #[serde(default)]
+    pub sku: Option<String>,
+    #[serde(default)]
+    pub barcode: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub subcategory: Option<String>,
     pub notes: Option<String>,
 }
 
@@ -373,6 +409,14 @@ pub struct VisitItem {
     pub created_at: String,
     pub updated_at: String,
     pub deleted: i64,
+    #[serde(default)]
+    pub catalog_item_id: Option<String>,
+    #[serde(default)]
+    pub catalog_item_type: Option<String>, // service | product
+    #[serde(default)]
+    pub atk_category_code: String,
+    #[serde(default)]
+    pub atk_unit_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -394,6 +438,14 @@ pub struct VisitItemUpsertInput {
     pub fiscal: Option<bool>,
     pub vat_code: Option<String>,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub catalog_item_id: Option<String>,
+    #[serde(default)]
+    pub catalog_item_type: Option<String>,
+    #[serde(default)]
+    pub atk_category_code: Option<String>,
+    #[serde(default)]
+    pub atk_unit_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,6 +549,26 @@ pub struct StockItem {
     pub min_quantity: f64,
     #[serde(default)]
     pub sale_price: f64,
+    #[serde(default)]
+    pub purchase_price: f64,
+    #[serde(default = "default_stock_kind")]
+    pub stock_kind: String,
+    #[serde(default)]
+    pub atk_tax_code: String,
+    #[serde(default)]
+    pub atk_category_code: String,
+    #[serde(default)]
+    pub atk_unit_code: String,
+    #[serde(default)]
+    pub sku: Option<String>,
+    #[serde(default)]
+    pub barcode: Option<String>,
+    #[serde(default)]
+    pub subcategory: Option<String>,
+    #[serde(default)]
+    pub purchase_unit: Option<String>,
+    #[serde(default = "default_purchase_multiplier")]
+    pub purchase_unit_multiplier: f64,
     pub notes: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -504,6 +576,42 @@ pub struct StockItem {
     pub supplier_name: Option<String>,
     #[serde(default)]
     pub current_quantity: f64,
+}
+
+fn default_purchase_multiplier() -> f64 { 1.0 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StockItemUpsertInput {
+    pub id: String,
+    pub name: String,
+    pub unit: Option<String>,
+    pub category: Option<String>,
+    pub supplier_id: Option<String>,
+    pub min_quantity: f64,
+    pub sale_price: f64,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub purchase_price: Option<f64>,
+    #[serde(default)]
+    pub stock_kind: Option<String>,
+    #[serde(default)]
+    pub atk_tax_code: Option<String>,
+    #[serde(default)]
+    pub atk_category_code: Option<String>,
+    #[serde(default)]
+    pub atk_unit_code: Option<String>,
+    #[serde(default)]
+    pub sku: Option<String>,
+    #[serde(default)]
+    pub barcode: Option<String>,
+    #[serde(default)]
+    pub subcategory: Option<String>,
+    #[serde(default)]
+    pub purchase_unit: Option<String>,
+    #[serde(default)]
+    pub purchase_unit_multiplier: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,6 +647,8 @@ pub struct StockMovement {
     pub notes: Option<String>,
     pub date: String,
     pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

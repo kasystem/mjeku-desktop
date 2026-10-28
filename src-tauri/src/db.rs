@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
 use crate::models::{
@@ -18,6 +18,16 @@ use crate::models::{
     VisitItemsListFilters, VisitUpsertInput, VisitsListFilters,
 };
 use crate::util::now_iso;
+
+fn merge_optional_text(input: Option<String>, existing: Option<&str>) -> Option<String> {
+    match input {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        }
+        None => existing.map(str::to_string),
+    }
+}
 
 const MIGRATION_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -251,7 +261,8 @@ CREATE TABLE IF NOT EXISTS stock_movements (
   price_per_unit REAL,
   notes TEXT,
   date TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sale_items (
@@ -383,7 +394,8 @@ mod vat_service_tests {
     fn visit(vat_code: Option<&str>) -> ServiceUpsertInput {
         ServiceUpsertInput {
             id: None, title: "Vizitë".to_string(), default_price: 0.0,
-            vat_code: vat_code.map(str::to_string), notes: None,
+            vat_code: vat_code.map(str::to_string), atk_category_code: None, atk_unit_code: None,
+            sku: None, barcode: None, category: None, subcategory: None, notes: None,
         }
     }
 
@@ -2235,6 +2247,16 @@ impl Db {
 
         // services
         Self::add_column_if_missing(conn, "services", "vat_code", "TEXT NOT NULL DEFAULT 'C'")?;
+        for (col, ddl) in [
+            ("atk_category_code", "TEXT NOT NULL DEFAULT 'SM'"),
+            ("atk_unit_code", "TEXT NOT NULL DEFAULT 'CP'"),
+            ("sku", "TEXT"),
+            ("barcode", "TEXT"),
+            ("category", "TEXT"),
+            ("subcategory", "TEXT"),
+        ] {
+            Self::add_column_if_missing(conn, "services", col, ddl)?;
+        }
         conn.execute(
             "UPDATE services SET vat_code='C' WHERE vat_code IS NULL OR TRIM(vat_code)=''",
             [],
@@ -2290,8 +2312,25 @@ impl Db {
             Self::add_column_if_missing(conn, "visits", col, ddl)?;
         }
 
-        // stock_items
-        Self::add_column_if_missing(conn, "stock_items", "sale_price", "REAL NOT NULL DEFAULT 0")?;
+        // Product metadata is additive; legacy products keep their existing behavior and receive
+        // `unknown` stock kind. ATK category/unit remain blank until explicitly classified.
+        for (col, ddl) in [
+            ("sale_price", "REAL NOT NULL DEFAULT 0"),
+            ("purchase_price", "REAL NOT NULL DEFAULT 0"),
+            ("stock_kind", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("atk_tax_code", "TEXT NOT NULL DEFAULT 'C'"),
+            ("atk_category_code", "TEXT NOT NULL DEFAULT ''"),
+            ("atk_unit_code", "TEXT NOT NULL DEFAULT ''"),
+            ("sku", "TEXT"),
+            ("barcode", "TEXT"),
+            ("subcategory", "TEXT"),
+            ("purchase_unit", "TEXT"),
+            ("purchase_unit_multiplier", "REAL NOT NULL DEFAULT 1"),
+        ] {
+            Self::add_column_if_missing(conn, "stock_items", col, ddl)?;
+        }
+        Self::add_column_if_missing(conn, "stock_movements", "updated_at", "TEXT")?;
+        conn.execute("UPDATE stock_movements SET updated_at=created_at WHERE updated_at IS NULL OR TRIM(updated_at)=''", [])?;
 
         // visit_items
         Self::add_column_if_missing(conn, "visit_items", "vat_code", "TEXT NOT NULL DEFAULT 'C'")?;
@@ -2302,6 +2341,10 @@ impl Db {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         Self::add_column_if_missing(conn, "visit_items", "fiscalized_at", "TEXT")?;
+        Self::add_column_if_missing(conn, "visit_items", "catalog_item_id", "TEXT")?;
+        Self::add_column_if_missing(conn, "visit_items", "catalog_item_type", "TEXT")?;
+        Self::add_column_if_missing(conn, "visit_items", "atk_category_code", "TEXT NOT NULL DEFAULT ''")?;
+        Self::add_column_if_missing(conn, "visit_items", "atk_unit_code", "TEXT NOT NULL DEFAULT ''")?;
         conn.execute(
             "UPDATE visit_items SET vat_code='C' WHERE vat_code IS NULL OR TRIM(vat_code)=''",
             [],
@@ -2311,6 +2354,15 @@ impl Db {
             [],
         )?;
         conn.execute("UPDATE visit_items SET fiscal=1 WHERE fiscal IS NULL", [])?;
+
+        // Replace early draft unique SKU/barcode indexes without touching rows;
+        // legacy catalogs may legitimately contain duplicates that need review.
+        conn.execute_batch(r#"
+          DROP INDEX IF EXISTS idx_services_sku_unique;
+          DROP INDEX IF EXISTS idx_services_barcode_unique;
+          DROP INDEX IF EXISTS idx_stock_items_sku_unique;
+          DROP INDEX IF EXISTS idx_stock_items_barcode_unique;
+        "#)?;
 
         // Ensure new indexes exist.
         // Note: indexes are safe to re-run with IF NOT EXISTS.
@@ -2342,6 +2394,10 @@ impl Db {
 
       CREATE INDEX IF NOT EXISTS idx_services_updated_at ON services(updated_at);
       CREATE INDEX IF NOT EXISTS idx_services_vat_code ON services(vat_code);
+      CREATE INDEX IF NOT EXISTS idx_services_sku ON services(LOWER(TRIM(sku))) WHERE sku IS NOT NULL AND TRIM(sku) <> '';
+      CREATE INDEX IF NOT EXISTS idx_services_barcode ON services(TRIM(barcode)) WHERE barcode IS NOT NULL AND TRIM(barcode) <> '';
+      CREATE INDEX IF NOT EXISTS idx_stock_items_sku ON stock_items(LOWER(TRIM(sku))) WHERE sku IS NOT NULL AND TRIM(sku) <> '';
+      CREATE INDEX IF NOT EXISTS idx_stock_items_barcode ON stock_items(TRIM(barcode)) WHERE barcode IS NOT NULL AND TRIM(barcode) <> '';
 
       CREATE INDEX IF NOT EXISTS idx_appointments_client_id ON appointments(client_id);
       CREATE INDEX IF NOT EXISTS idx_appointments_doctor_id ON appointments(doctor_id);
@@ -2359,6 +2415,7 @@ impl Db {
       CREATE INDEX IF NOT EXISTS idx_visit_items_client_id ON visit_items(client_id);
       CREATE INDEX IF NOT EXISTS idx_visit_items_updated_at ON visit_items(updated_at);
       CREATE INDEX IF NOT EXISTS idx_visit_items_fiscalized ON visit_items(fiscalized);
+      CREATE INDEX IF NOT EXISTS idx_visit_items_catalog_item ON visit_items(catalog_item_type, catalog_item_id);
 
       CREATE INDEX IF NOT EXISTS idx_cash_ledger_type ON cash_ledger(type);
       CREATE INDEX IF NOT EXISTS idx_cash_ledger_date ON cash_ledger(date);
@@ -3338,20 +3395,33 @@ impl Db {
         let now = now_iso();
 
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
-        let existing: Option<(String, i64, Option<String>)> = tx
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, i64, Option<String>, String, Option<String>, f64, Option<String>, i64, String)> = tx
             .query_row(
-                "SELECT created_at, fiscalized, fiscalized_at FROM sales WHERE id=?1",
+                "SELECT created_at, fiscalized, fiscalized_at, client_id, date, total, notes, deleted, updated_at FROM sales WHERE id=?1",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
             )
             .optional()?;
+        if let Some(current) = existing.as_ref().filter(|x| x.1 == 1) {
+            if current.7 != 0 { bail!("Shitja e fiskalizuar është fshirë dhe nuk mund të rikthehet."); }
+            if current.3 != client_id || current.4 != date || (current.5 - total).abs() > 0.000_000_1 || current.6 != notes {
+                bail!("Shitja është fiskalizuar; ndryshimet duhet të regjistrohen me procedurën zyrtare të kthimit/anulimit.");
+            }
+            let row = Sale {
+                id, client_id, date, total, notes, fiscalized: current.1,
+                fiscalized_at: current.2.clone(), created_at: current.0.clone(),
+                updated_at: current.8.clone(), deleted: current.7,
+            };
+            tx.commit()?;
+            return Ok(row);
+        }
         let created_at = existing
             .as_ref()
             .map(|x| x.0.clone())
             .unwrap_or_else(|| now.clone());
         let fiscalized = existing.as_ref().map(|x| x.1).unwrap_or(0);
-        let fiscalized_at: Option<String> = existing.and_then(|x| x.2);
+        let fiscalized_at: Option<String> = existing.as_ref().and_then(|x| x.2.clone());
 
         tx.execute(
       "INSERT INTO sales (id, client_id, date, total, notes, fiscalized, fiscalized_at, created_at, updated_at, deleted)
@@ -3391,7 +3461,15 @@ impl Db {
         }
         let now = now_iso();
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(i64, i64)> = tx.query_row(
+            "SELECT fiscalized, deleted FROM sales WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let (fiscalized, deleted) = current.ok_or_else(|| anyhow!("sale not found"))?;
+        if fiscalized == 1 { bail!("Shitja është fiskalizuar; fshirja lejohet vetëm përmes procedurës zyrtare të anulimit."); }
+        if deleted != 0 { tx.commit()?; return Ok(()); }
         tx.execute(
             "UPDATE sales SET deleted=1, updated_at=?2 WHERE id=?1",
             params![id, now],
@@ -3712,7 +3790,7 @@ impl Db {
             }
 
             let mut stmt = conn.prepare(
-        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code
          FROM visit_items
          WHERE visit_id=?1 AND deleted=0 AND fiscal=1 AND fiscalized=0
          ORDER BY created_at ASC",
@@ -3734,6 +3812,10 @@ impl Db {
                     created_at: row.get(12)?,
                     updated_at: row.get(13)?,
                     deleted: row.get(14)?,
+                    catalog_item_id: row.get(15)?,
+                    catalog_item_type: row.get(16)?,
+                    atk_category_code: row.get(17)?,
+                    atk_unit_code: row.get(18)?,
                 })
             })?;
             for r in rows {
@@ -3742,7 +3824,7 @@ impl Db {
 
             if items.is_empty() && allow_any_items_if_no_fiscal {
                 let mut stmt_any = conn.prepare(
-          "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+          "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code
            FROM visit_items
            WHERE visit_id=?1 AND deleted=0 AND fiscalized=0
            ORDER BY created_at ASC",
@@ -3764,6 +3846,10 @@ impl Db {
                         created_at: row.get(12)?,
                         updated_at: row.get(13)?,
                         deleted: row.get(14)?,
+                    catalog_item_id: row.get(15)?,
+                    catalog_item_type: row.get(16)?,
+                    atk_category_code: row.get(17)?,
+                    atk_unit_code: row.get(18)?,
                     })
                 })?;
                 for r in rows_any {
@@ -4111,7 +4197,7 @@ impl Db {
         let mut items: Vec<VisitItem> = Vec::new();
         {
             let mut stmt = tx.prepare(
-        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code
          FROM visit_items
          WHERE visit_id=?1 AND deleted=0 AND fiscalized=0
          ORDER BY created_at ASC",
@@ -4133,6 +4219,10 @@ impl Db {
                     created_at: row.get(12)?,
                     updated_at: row.get(13)?,
                     deleted: row.get(14)?,
+                    catalog_item_id: row.get(15)?,
+                    catalog_item_type: row.get(16)?,
+                    atk_category_code: row.get(17)?,
+                    atk_unit_code: row.get(18)?,
                 })
             })?;
             for r in rows {
@@ -4264,6 +4354,10 @@ impl Db {
             created_at: row.get(12)?,
             updated_at: row.get(13)?,
             deleted: row.get(14)?,
+                    catalog_item_id: row.get(15)?,
+                    catalog_item_type: row.get(16)?,
+                    atk_category_code: row.get(17)?,
+                    atk_unit_code: row.get(18)?,
         })
     }
 
@@ -4309,7 +4403,7 @@ impl Db {
             bail!("fatura eshte fiskalizuar tashme");
         }
 
-        let cols = "id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted";
+        let cols = "id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code";
         let mut items: Vec<VisitItem> = Vec::new();
         {
             let mut stmt = conn.prepare(&format!(
@@ -4573,7 +4667,7 @@ impl Db {
         let mut items: Vec<VisitItem> = Vec::new();
         {
             let mut stmt = tx.prepare(
-        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code
          FROM visit_items
          WHERE visit_id=?1 AND deleted=0 AND fiscalized=0
          ORDER BY created_at ASC",
@@ -4595,6 +4689,10 @@ impl Db {
                     created_at: row.get(12)?,
                     updated_at: row.get(13)?,
                     deleted: row.get(14)?,
+                    catalog_item_id: row.get(15)?,
+                    catalog_item_type: row.get(16)?,
+                    atk_category_code: row.get(17)?,
+                    atk_unit_code: row.get(18)?,
                 })
             })?;
             for r in rows {
@@ -5259,26 +5357,20 @@ impl Db {
     pub fn services_list(&self, search: Option<String>) -> anyhow::Result<Vec<Service>> {
         let conn = self.conn()?;
         let mut out = Vec::new();
+        let select = "SELECT id, title, default_price, vat_code, atk_category_code, atk_unit_code, sku, barcode, category, subcategory, notes, created_at, updated_at, deleted FROM services";
 
         if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
             let like = format!("%{}%", s.trim());
-            let mut stmt = conn.prepare(
-                "SELECT id, title, default_price, vat_code, notes, created_at, updated_at, deleted
-         FROM services
-         WHERE deleted = 0 AND (title LIKE ?1 OR notes LIKE ?1)
-         ORDER BY updated_at DESC
-         LIMIT 2000",
-            )?;
+            let mut stmt = conn.prepare(&format!("{select} WHERE deleted = 0 AND (title LIKE ?1 OR notes LIKE ?1 OR sku LIKE ?1 OR barcode LIKE ?1 OR category LIKE ?1 OR subcategory LIKE ?1) ORDER BY updated_at DESC LIMIT 2000"))?;
             let rows = stmt.query_map(params![like], |row| {
                 Ok(Service {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     default_price: row.get(2)?,
                     vat_code: row.get(3)?,
-                    notes: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                    deleted: row.get(7)?,
+                    atk_category_code: row.get(4)?, atk_unit_code: row.get(5)?,
+                    sku: row.get(6)?, barcode: row.get(7)?, category: row.get(8)?, subcategory: row.get(9)?,
+                    notes: row.get(10)?, created_at: row.get(11)?, updated_at: row.get(12)?, deleted: row.get(13)?,
                 })
             })?;
             for r in rows {
@@ -5287,23 +5379,16 @@ impl Db {
             return Ok(out);
         }
 
-        let mut stmt = conn.prepare(
-            "SELECT id, title, default_price, vat_code, notes, created_at, updated_at, deleted
-       FROM services
-       WHERE deleted = 0
-       ORDER BY updated_at DESC
-       LIMIT 2000",
-        )?;
+        let mut stmt = conn.prepare(&format!("{select} WHERE deleted = 0 ORDER BY updated_at DESC LIMIT 2000"))?;
         let rows = stmt.query_map([], |row| {
             Ok(Service {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 default_price: row.get(2)?,
                 vat_code: row.get(3)?,
-                notes: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-                deleted: row.get(7)?,
+                atk_category_code: row.get(4)?, atk_unit_code: row.get(5)?,
+                sku: row.get(6)?, barcode: row.get(7)?, category: row.get(8)?, subcategory: row.get(9)?,
+                notes: row.get(10)?, created_at: row.get(11)?, updated_at: row.get(12)?, deleted: row.get(13)?,
             })
         })?;
         for r in rows {
@@ -5351,33 +5436,67 @@ impl Db {
         let now = now_iso();
 
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
-        let existing_created_at: Option<String> = tx
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = tx
             .query_row(
-                "SELECT created_at FROM services WHERE id=?1",
+                "SELECT created_at, atk_category_code, atk_unit_code, sku, barcode, category, subcategory FROM services WHERE id=?1",
                 params![id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
             )
             .optional()?;
-        let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+        let created_at = existing.as_ref().map(|x| x.0.clone()).unwrap_or_else(|| now.clone());
+        let atk_category_code = input.atk_category_code.unwrap_or_else(|| existing.as_ref().map(|x| x.1.clone()).unwrap_or_else(|| "SM".to_string())).trim().to_uppercase();
+        let atk_unit_code = input.atk_unit_code.unwrap_or_else(|| existing.as_ref().map(|x| x.2.clone()).unwrap_or_else(|| "CP".to_string())).trim().to_uppercase();
+        if !crate::atk_catalog::valid_category_code(&atk_category_code) { bail!("atk_category_code nuk njihet nga katalogu ATK"); }
+        if !crate::atk_catalog::valid_unit_code(&atk_unit_code) { bail!("atk_unit_code nuk njihet nga katalogu ATK"); }
+        let sku = merge_optional_text(input.sku, existing.as_ref().and_then(|x| x.3.as_deref()));
+        let barcode = merge_optional_text(input.barcode, existing.as_ref().and_then(|x| x.4.as_deref()));
+        let category = merge_optional_text(input.category, existing.as_ref().and_then(|x| x.5.as_deref()));
+        let subcategory = merge_optional_text(input.subcategory, existing.as_ref().and_then(|x| x.6.as_deref()));
+        if let Some(value) = sku.as_deref() {
+            let duplicate: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM services WHERE id<>?1 AND deleted=0 AND LOWER(TRIM(sku))=LOWER(TRIM(?2)))",
+                params![id, value], |r| r.get(0),
+            )?;
+            if duplicate { bail!("SKU already exists on another service"); }
+        }
+        if let Some(value) = barcode.as_deref() {
+            let duplicate: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM services WHERE id<>?1 AND deleted=0 AND TRIM(barcode)=TRIM(?2))",
+                params![id, value], |r| r.get(0),
+            )?;
+            if duplicate { bail!("Barcode already exists on another service"); }
+        }
 
         tx.execute(
-      "INSERT INTO services (id, title, default_price, vat_code, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+      "INSERT INTO services (id, title, default_price, vat_code, atk_category_code, atk_unit_code, sku, barcode, category, subcategory, notes, created_at, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)
        ON CONFLICT(id) DO UPDATE SET
          title=excluded.title,
          default_price=excluded.default_price,
          vat_code=excluded.vat_code,
+         atk_category_code=excluded.atk_category_code,
+         atk_unit_code=excluded.atk_unit_code,
+         sku=excluded.sku,
+         barcode=excluded.barcode,
+         category=excluded.category,
+         subcategory=excluded.subcategory,
          notes=excluded.notes,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
-      params![id, title, default_price, &vat_code, &notes, &created_at, &now],
+      params![id, title, default_price, &vat_code, &atk_category_code, &atk_unit_code, &sku, &barcode, &category, &subcategory, &notes, &created_at, &now],
     )?;
         let row = Service {
             id: id.clone(),
             title: title.to_string(),
             default_price,
             vat_code,
+            atk_category_code,
+            atk_unit_code,
+            sku,
+            barcode,
+            category,
+            subcategory,
             notes,
             created_at: created_at.clone(),
             updated_at: now.clone(),
@@ -5402,7 +5521,7 @@ impl Db {
         )?;
         let row = tx
       .query_row(
-        "SELECT id, title, default_price, vat_code, notes, created_at, updated_at, deleted FROM services WHERE id=?1",
+        "SELECT id, title, default_price, vat_code, atk_category_code, atk_unit_code, sku, barcode, category, subcategory, notes, created_at, updated_at, deleted FROM services WHERE id=?1",
         params![id],
         |r| {
           Ok(Service {
@@ -5410,10 +5529,9 @@ impl Db {
             title: r.get(1)?,
             default_price: r.get(2)?,
             vat_code: r.get(3)?,
-            notes: r.get(4)?,
-            created_at: r.get(5)?,
-            updated_at: r.get(6)?,
-            deleted: r.get(7)?,
+            atk_category_code: r.get(4)?, atk_unit_code: r.get(5)?,
+            sku: r.get(6)?, barcode: r.get(7)?, category: r.get(8)?, subcategory: r.get(9)?,
+            notes: r.get(10)?, created_at: r.get(11)?, updated_at: r.get(12)?, deleted: r.get(13)?,
           })
         },
       )
@@ -6098,7 +6216,7 @@ impl Db {
         let mut linked_items: Vec<VisitItem> = Vec::new();
         {
             let mut stmt = tx.prepare(
-        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code
          FROM visit_items
          WHERE visit_id = ?1 AND deleted = 0",
       )?;
@@ -6119,6 +6237,10 @@ impl Db {
                     created_at: r.get(12)?,
                     updated_at: r.get(13)?,
                     deleted: r.get(14)?,
+                    catalog_item_id: r.get(15)?,
+                    catalog_item_type: r.get(16)?,
+                    atk_category_code: r.get(17)?,
+                    atk_unit_code: r.get(18)?,
                 })
             })?;
             for r in rows {
@@ -6304,7 +6426,7 @@ impl Db {
         let include_deleted = f.include_deleted.unwrap_or(false);
 
         let mut sql = String::from(
-      "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+      "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code
        FROM visit_items WHERE 1=1",
     );
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
@@ -6343,6 +6465,10 @@ impl Db {
                 created_at: row.get(12)?,
                 updated_at: row.get(13)?,
                 deleted: row.get(14)?,
+                    catalog_item_id: row.get(15)?,
+                    catalog_item_type: row.get(16)?,
+                    atk_category_code: row.get(17)?,
+                    atk_unit_code: row.get(18)?,
             })
         })?;
         for r in rows {
@@ -6356,7 +6482,7 @@ impl Db {
         Ok(
       conn
         .query_row(
-          "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+          "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code
            FROM visit_items WHERE id=?1",
           params![id],
           |row| {
@@ -6376,6 +6502,10 @@ impl Db {
               created_at: row.get(12)?,
               updated_at: row.get(13)?,
               deleted: row.get(14)?,
+                    catalog_item_id: row.get(15)?,
+                    catalog_item_type: row.get(16)?,
+                    atk_category_code: row.get(17)?,
+                    atk_unit_code: row.get(18)?,
             })
           },
         )
@@ -6436,11 +6566,11 @@ impl Db {
 
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
-        let existing: Option<(String, i64, Option<String>, String, f64, f64, String)> = tx
+        let existing: Option<(String, i64, Option<String>, String, f64, f64, String, Option<String>, Option<String>, String, String)> = tx
       .query_row(
-        "SELECT created_at, fiscalized, fiscalized_at, title, qty, unit_price, vat_code FROM visit_items WHERE id=?1",
+        "SELECT created_at, fiscalized, fiscalized_at, title, qty, unit_price, vat_code, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code FROM visit_items WHERE id=?1",
         params![id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?)),
       )
       .optional()?;
         let created_at = existing
@@ -6448,15 +6578,70 @@ impl Db {
             .map(|x| x.0.clone())
             .unwrap_or_else(|| now.clone());
 
+        let catalog_item_id = input.catalog_item_id
+            .map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
+            .or_else(|| existing.as_ref().and_then(|x| x.7.clone()));
+        let catalog_item_type = input.catalog_item_type
+            .map(|x| x.trim().to_ascii_lowercase()).filter(|x| !x.is_empty())
+            .or_else(|| existing.as_ref().and_then(|x| x.8.clone()))
+            .or_else(|| catalog_item_id.as_ref().map(|_| "service".to_string()));
+        if catalog_item_type.as_deref().map(|x| !matches!(x, "service" | "product")).unwrap_or(false) {
+            bail!("catalog_item_type duhet të jetë service ose product");
+        }
+        let mut atk_category_code = input.atk_category_code
+            .map(|x| x.trim().to_uppercase()).filter(|x| !x.is_empty())
+            .or_else(|| existing.as_ref().map(|x| x.9.clone()).filter(|x| !x.trim().is_empty()))
+            .unwrap_or_default();
+        let mut atk_unit_code = input.atk_unit_code
+            .map(|x| x.trim().to_uppercase()).filter(|x| !x.is_empty())
+            .or_else(|| existing.as_ref().map(|x| x.10.clone()).filter(|x| !x.trim().is_empty()))
+            .unwrap_or_default();
+        if !atk_category_code.is_empty() && !crate::atk_catalog::valid_category_code(&atk_category_code) { bail!("atk_category_code nuk njihet nga katalogu ATK"); }
+        if !atk_unit_code.is_empty() && !crate::atk_catalog::valid_unit_code(&atk_unit_code) { bail!("atk_unit_code nuk njihet nga katalogu ATK"); }
+        if catalog_item_type.is_some() && catalog_item_id.is_none() {
+            bail!("catalog_item_type requires catalog_item_id");
+        }
+        if let (Some(item_id), Some(item_type)) = (catalog_item_id.as_ref(), catalog_item_type.as_deref()) {
+            if item_type == "service" {
+                let service: Option<(String, String, String)> = tx.query_row(
+                    "SELECT vat_code, atk_category_code, atk_unit_code FROM services WHERE id=?1 AND deleted=0",
+                    [item_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                ).optional()?;
+                let (service_vat, service_category, service_unit) = service
+                    .ok_or_else(|| anyhow!("linked service does not exist or is inactive"))?;
+                vat_code = if vat_registered { service_vat.trim().to_uppercase() } else { "C".to_string() };
+                atk_category_code = service_category.trim().to_uppercase();
+                atk_unit_code = service_unit.trim().to_uppercase();
+            }
+        }
+        if let Some(ref item_id) = catalog_item_id {
+            match catalog_item_type.as_deref().unwrap_or("service") {
+                "service" => {
+                    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM services WHERE id=?1 AND deleted=0)", [item_id], |r| r.get(0))?;
+                    if !exists { bail!("Shërbimi i lidhur nuk ekziston ose është çaktivizuar"); }
+                }
+                "product" => {
+                    bail!("Lidhja e produktit me një rresht vizite nuk mbështetet ende. Përdor rrjedhën e shitjes së stokut.");
+                }
+                _ => unreachable!(),
+            }
+        }
+
         // Preserve fiscalization only when the fiscal line hasn't changed.
+        if !atk_category_code.is_empty() && !crate::atk_catalog::valid_category_code(&atk_category_code) { bail!("atk_category_code nuk njihet nga katalogu ATK"); }
+        if !atk_unit_code.is_empty() && !crate::atk_catalog::valid_unit_code(&atk_unit_code) { bail!("atk_unit_code nuk njihet nga katalogu ATK"); }
         let (fiscalized, fiscalized_at) = if fiscal == 1 {
-            if let Some((_, ex_fisc, ex_at, ex_title, ex_qty, ex_price, ex_vat)) = existing.as_ref()
+            if let Some((_, ex_fisc, ex_at, ex_title, ex_qty, ex_price, ex_vat, ex_item_id, ex_item_type, ex_category, ex_unit)) = existing.as_ref()
             {
                 if *ex_fisc == 1
                     && ex_title.trim() == title
                     && (*ex_qty - qty).abs() < 0.000_000_1
                     && (*ex_price - unit_price).abs() < 0.000_000_1
                     && ex_vat.trim().eq_ignore_ascii_case(&vat_code)
+                    && ex_item_id == &catalog_item_id
+                    && ex_item_type == &catalog_item_type
+                    && ex_category.trim().eq_ignore_ascii_case(&atk_category_code)
+                    && ex_unit.trim().eq_ignore_ascii_case(&atk_unit_code)
                 {
                     (*ex_fisc, ex_at.clone())
                 } else {
@@ -6470,8 +6655,8 @@ impl Db {
         };
 
         tx.execute(
-      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)
+      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0, ?15, ?16, ?17, ?18)
        ON CONFLICT(id) DO UPDATE SET
          visit_id=excluded.visit_id,
          client_id=excluded.client_id,
@@ -6484,6 +6669,10 @@ impl Db {
          fiscalized=excluded.fiscalized,
          fiscalized_at=excluded.fiscalized_at,
          notes=excluded.notes,
+         catalog_item_id=excluded.catalog_item_id,
+         catalog_item_type=excluded.catalog_item_type,
+         atk_category_code=excluded.atk_category_code,
+         atk_unit_code=excluded.atk_unit_code,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
       params![
@@ -6500,7 +6689,11 @@ impl Db {
         &fiscalized_at,
         &notes,
         &created_at,
-        &now
+        &now,
+        &catalog_item_id,
+        &catalog_item_type,
+        &atk_category_code,
+        &atk_unit_code
       ],
     )?;
         let row = VisitItem {
@@ -6519,6 +6712,10 @@ impl Db {
             created_at: created_at.clone(),
             updated_at: now.clone(),
             deleted: 0,
+            catalog_item_id,
+            catalog_item_type,
+            atk_category_code,
+            atk_unit_code,
         };
         let payload = serde_json::to_string(&row)?;
         Self::queue_replace_pending_tx(&tx, "visit_items", &row.id, "upsert", &payload, &now)?;
@@ -6539,7 +6736,7 @@ impl Db {
         )?;
         let row = tx
       .query_row(
-        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted
+        "SELECT id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code
          FROM visit_items WHERE id=?1",
         params![id],
         |r| {
@@ -6559,6 +6756,10 @@ impl Db {
             created_at: r.get(12)?,
             updated_at: r.get(13)?,
             deleted: r.get(14)?,
+                    catalog_item_id: r.get(15)?,
+                    catalog_item_type: r.get(16)?,
+                    atk_category_code: r.get(17)?,
+                    atk_unit_code: r.get(18)?,
           })
         },
       )
@@ -7021,12 +7222,18 @@ impl Db {
     pub fn apply_remote_service(&self, row: &Service) -> anyhow::Result<()> {
         let conn = self.conn()?;
         conn.execute(
-      "INSERT INTO services (id, title, default_price, vat_code, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      "INSERT INTO services (id,title,default_price,vat_code,atk_category_code,atk_unit_code,sku,barcode,category,subcategory,notes,created_at,updated_at,deleted)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
        ON CONFLICT(id) DO UPDATE SET
          title=excluded.title,
          default_price=excluded.default_price,
          vat_code=excluded.vat_code,
+         atk_category_code=excluded.atk_category_code,
+         atk_unit_code=excluded.atk_unit_code,
+         sku=excluded.sku,
+         barcode=excluded.barcode,
+         category=excluded.category,
+         subcategory=excluded.subcategory,
          notes=excluded.notes,
          created_at=excluded.created_at,
          updated_at=excluded.updated_at,
@@ -7036,6 +7243,12 @@ impl Db {
         row.title,
         row.default_price,
         row.vat_code,
+        row.atk_category_code,
+        row.atk_unit_code,
+        row.sku,
+        row.barcode,
+        row.category,
+        row.subcategory,
         row.notes,
         row.created_at,
         row.updated_at,
@@ -7190,8 +7403,8 @@ impl Db {
     pub fn apply_remote_visit_item(&self, row: &VisitItem) -> anyhow::Result<()> {
         let conn = self.conn()?;
         conn.execute(
-      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+      "INSERT INTO visit_items (id, visit_id, client_id, tooth, title, qty, unit_price, fiscal, vat_code, fiscalized, fiscalized_at, notes, created_at, updated_at, deleted, catalog_item_id, catalog_item_type, atk_category_code, atk_unit_code)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
        ON CONFLICT(id) DO UPDATE SET
          visit_id=excluded.visit_id,
          client_id=excluded.client_id,
@@ -7204,6 +7417,10 @@ impl Db {
          fiscalized=excluded.fiscalized,
          fiscalized_at=excluded.fiscalized_at,
          notes=excluded.notes,
+         catalog_item_id=excluded.catalog_item_id,
+         catalog_item_type=excluded.catalog_item_type,
+         atk_category_code=excluded.atk_category_code,
+         atk_unit_code=excluded.atk_unit_code,
          created_at=excluded.created_at,
          updated_at=excluded.updated_at,
          deleted=excluded.deleted",
@@ -7222,7 +7439,11 @@ impl Db {
         row.notes,
         row.created_at,
         row.updated_at,
-        row.deleted
+        row.deleted,
+        row.catalog_item_id,
+        row.catalog_item_type,
+        row.atk_category_code,
+        row.atk_unit_code
       ],
     )?;
         Ok(())
@@ -7382,7 +7603,10 @@ impl Db {
     pub fn stock_items_list(&self) -> anyhow::Result<Vec<crate::models::StockItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT i.id, i.name, i.unit, i.category, i.supplier_id, i.min_quantity, COALESCE(i.sale_price, 0), i.notes, i.created_at, i.updated_at,
+            "SELECT i.id, i.name, i.unit, i.category, i.supplier_id, i.min_quantity, COALESCE(i.sale_price, 0),
+                    COALESCE(i.purchase_price, 0), COALESCE(i.stock_kind, 'unknown'), COALESCE(i.atk_tax_code, 'C'),
+                    COALESCE(i.atk_category_code, ''), COALESCE(i.atk_unit_code, ''), i.sku, i.barcode, i.subcategory,
+                    i.purchase_unit, COALESCE(i.purchase_unit_multiplier, 1), i.notes, i.created_at, i.updated_at,
                     s.name as supplier_name,
                     COALESCE((SELECT SUM(CASE WHEN m.movement_type='in' THEN m.quantity WHEN m.movement_type='out' THEN -m.quantity ELSE m.quantity END)
                               FROM stock_movements m WHERE m.item_id = i.id), 0) as current_quantity
@@ -7395,25 +7619,97 @@ impl Db {
                 deleted: 0,
                 id: row.get(0)?, name: row.get(1)?, unit: row.get(2)?, category: row.get(3)?,
                 supplier_id: row.get(4)?, min_quantity: row.get(5)?, sale_price: row.get(6)?,
-                notes: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
-                supplier_name: row.get(10)?, current_quantity: row.get(11)?,
+                purchase_price: row.get(7)?, stock_kind: row.get(8)?, atk_tax_code: row.get(9)?,
+                atk_category_code: row.get(10)?, atk_unit_code: row.get(11)?, sku: row.get(12)?,
+                barcode: row.get(13)?, subcategory: row.get(14)?, purchase_unit: row.get(15)?,
+                purchase_unit_multiplier: row.get(16)?, notes: row.get(17)?, created_at: row.get(18)?, updated_at: row.get(19)?,
+                supplier_name: row.get(20)?, current_quantity: row.get(21)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    pub fn stock_item_upsert(&self, item: &crate::models::StockItem) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO stock_items (id, name, unit, category, supplier_id, min_quantity, sale_price, notes, created_at, updated_at, deleted)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name, unit=excluded.unit, category=excluded.category,
-               supplier_id=excluded.supplier_id, min_quantity=excluded.min_quantity,
-               sale_price=excluded.sale_price, notes=excluded.notes, updated_at=excluded.updated_at",
-            rusqlite::params![item.id, item.name, item.unit, item.category, item.supplier_id, item.min_quantity, item.sale_price, item.notes, item.created_at, item.updated_at],
+    pub fn stock_item_upsert(&self, input: &crate::models::StockItemUpsertInput) -> anyhow::Result<()> {
+        let name = input.name.trim();
+        if input.id.trim().is_empty() || name.is_empty() { bail!("product id and name are required"); }
+        for (label, value) in [("min_quantity", input.min_quantity), ("sale_price", input.sale_price)] {
+            if !value.is_finite() || value < 0.0 { bail!("{label} must be a finite number >= 0"); }
+        }
+        if input.purchase_price.map(|x| !x.is_finite() || x < 0.0).unwrap_or(false) { bail!("purchase_price must be a finite number >= 0"); }
+        if input.purchase_unit_multiplier.map(|x| !x.is_finite() || x <= 0.0).unwrap_or(false) { bail!("purchase_unit_multiplier must be a finite number > 0"); }
+
+        let vat_registered = self.setting_get("clinic_vat_registered")?.unwrap_or_default().trim() == "1";
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old: Option<crate::models::StockItem> = tx.query_row(
+            "SELECT id, name, unit, category, supplier_id, min_quantity, sale_price, purchase_price, stock_kind, atk_tax_code, atk_category_code, atk_unit_code, sku, barcode, subcategory, purchase_unit, purchase_unit_multiplier, notes, created_at, updated_at, deleted, NULL, 0 FROM stock_items WHERE id=?1",
+            [&input.id], |row| Ok(crate::models::StockItem {
+                id: row.get(0)?, name: row.get(1)?, unit: row.get(2)?, category: row.get(3)?, supplier_id: row.get(4)?,
+                min_quantity: row.get(5)?, sale_price: row.get(6)?, purchase_price: row.get(7)?, stock_kind: row.get(8)?,
+                atk_tax_code: row.get(9)?, atk_category_code: row.get(10)?, atk_unit_code: row.get(11)?, sku: row.get(12)?,
+                barcode: row.get(13)?, subcategory: row.get(14)?, purchase_unit: row.get(15)?, purchase_unit_multiplier: row.get(16)?,
+                notes: row.get(17)?, created_at: row.get(18)?, updated_at: row.get(19)?, deleted: row.get(20)?, supplier_name: row.get(21)?, current_quantity: row.get(22)?,
+            }),
+        ).optional()?;
+        let stock_kind = input.stock_kind.as_deref().filter(|x| !x.trim().is_empty()).map(str::trim).map(str::to_ascii_lowercase)
+            .or_else(|| old.as_ref().map(|x| x.stock_kind.clone())).unwrap_or_else(|| "unknown".to_string());
+        if !crate::atk_catalog::valid_stock_kind(&stock_kind) { bail!("stock_kind nuk njihet nga modeli i PROGRAMERI POS"); }
+        let requested_tax = input.atk_tax_code.as_deref().filter(|x| !x.trim().is_empty()).map(|x| x.trim().to_uppercase())
+            .or_else(|| old.as_ref().map(|x| x.atk_tax_code.clone()))
+            .unwrap_or_else(|| if vat_registered { "A".to_string() } else { "C".to_string() });
+        if !crate::atk_catalog::valid_tax_code(&requested_tax) { bail!("atk_tax_code duhet te jete A, C, D ose E"); }
+        let atk_tax_code = if vat_registered { requested_tax } else { "C".to_string() };
+        if !vat_registered && input.atk_tax_code.as_deref().map(str::trim).map(|x| !x.is_empty() && x != "C").unwrap_or(false) {
+            bail!("Biznesi nuk eshte i regjistruar ne TVSH; produktet duhet te perdorin kodin C");
+        }
+        let atk_category_code = input.atk_category_code.as_deref().unwrap_or_else(|| old.as_ref().map(|x| x.atk_category_code.as_str()).unwrap_or("")).trim().to_uppercase();
+        let atk_unit_code = input.atk_unit_code.as_deref().unwrap_or_else(|| old.as_ref().map(|x| x.atk_unit_code.as_str()).unwrap_or("")).trim().to_uppercase();
+        if !atk_category_code.is_empty() && !crate::atk_catalog::valid_category_code(&atk_category_code) { bail!("atk_category_code nuk njihet nga katalogu ATK"); }
+        if !atk_unit_code.is_empty() && !crate::atk_catalog::valid_unit_code(&atk_unit_code) { bail!("atk_unit_code nuk njihet nga katalogu ATK"); }
+        if stock_kind != "unknown" && (atk_category_code.is_empty() || atk_unit_code.is_empty()) {
+            bail!("Cakto kategorinë dhe njësinë ATK para aktivizimit të llojit të stokut.");
+        }
+        let sku = merge_optional_text(input.sku.clone(), old.as_ref().and_then(|x| x.sku.as_deref()));
+        let barcode = merge_optional_text(input.barcode.clone(), old.as_ref().and_then(|x| x.barcode.as_deref()));
+        if let Some(value) = sku.as_deref().filter(|x| !x.trim().is_empty()) {
+            let duplicate: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id<>?1 AND deleted=0 AND LOWER(TRIM(sku))=LOWER(TRIM(?2)))",
+                rusqlite::params![input.id, value], |r| r.get(0),
+            )?;
+            if duplicate { bail!("SKU ekziston te një produkt tjetër"); }
+        }
+        if let Some(value) = barcode.as_deref().filter(|x| !x.trim().is_empty()) {
+            let duplicate: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id<>?1 AND deleted=0 AND TRIM(barcode)=TRIM(?2))",
+                rusqlite::params![input.id, value], |r| r.get(0),
+            )?;
+            if duplicate { bail!("Barkodi ekziston te një produkt tjetër"); }
+        }
+        let subcategory = merge_optional_text(input.subcategory.clone(), old.as_ref().and_then(|x| x.subcategory.as_deref()));
+        let purchase_unit = merge_optional_text(input.purchase_unit.clone(), old.as_ref().and_then(|x| x.purchase_unit.as_deref()));
+        let purchase_price = input.purchase_price.or_else(|| old.as_ref().map(|x| x.purchase_price)).unwrap_or(0.0);
+        let purchase_unit_multiplier = input.purchase_unit_multiplier.or_else(|| old.as_ref().map(|x| x.purchase_unit_multiplier)).unwrap_or(1.0);
+        let created_at = old.as_ref().map(|x| x.created_at.clone()).unwrap_or_else(|| input.created_at.clone());
+        let item = crate::models::StockItem {
+            id: input.id.clone(), name: name.to_string(), unit: input.unit.clone(), category: input.category.clone(), supplier_id: input.supplier_id.clone(),
+            min_quantity: input.min_quantity, sale_price: input.sale_price, purchase_price, stock_kind, atk_tax_code,
+            atk_category_code, atk_unit_code, sku, barcode, subcategory, purchase_unit, purchase_unit_multiplier,
+            notes: input.notes.clone(), created_at, updated_at: input.updated_at.clone(), deleted: 0,
+            supplier_name: old.as_ref().and_then(|x| x.supplier_name.clone()), current_quantity: old.as_ref().map(|x| x.current_quantity).unwrap_or(0.0),
+        };
+        tx.execute(
+            "INSERT INTO stock_items (id,name,unit,category,supplier_id,min_quantity,sale_price,purchase_price,stock_kind,atk_tax_code,atk_category_code,atk_unit_code,sku,barcode,subcategory,purchase_unit,purchase_unit_multiplier,notes,created_at,updated_at,deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,0)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,unit=excluded.unit,category=excluded.category,supplier_id=excluded.supplier_id,
+             min_quantity=excluded.min_quantity,sale_price=excluded.sale_price,purchase_price=excluded.purchase_price,stock_kind=excluded.stock_kind,
+             atk_tax_code=excluded.atk_tax_code,atk_category_code=excluded.atk_category_code,atk_unit_code=excluded.atk_unit_code,sku=excluded.sku,
+             barcode=excluded.barcode,subcategory=excluded.subcategory,purchase_unit=excluded.purchase_unit,purchase_unit_multiplier=excluded.purchase_unit_multiplier,
+             notes=excluded.notes,updated_at=excluded.updated_at,deleted=0",
+            rusqlite::params![item.id,item.name,item.unit,item.category,item.supplier_id,item.min_quantity,item.sale_price,item.purchase_price,item.stock_kind,item.atk_tax_code,item.atk_category_code,item.atk_unit_code,item.sku,item.barcode,item.subcategory,item.purchase_unit,item.purchase_unit_multiplier,item.notes,item.created_at,item.updated_at],
         )?;
-        let payload = serde_json::to_string(item)?;
-        Self::queue_replace_pending_conn(&conn, "stock_items", &item.id, "upsert", &payload, &now_iso())?;
+        let payload = serde_json::to_string(&item)?;
+        Self::queue_replace_pending_tx(&tx, "stock_items", &item.id, "upsert", &payload, &now_iso())?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -7429,7 +7725,7 @@ impl Db {
     pub fn stock_movements_list(&self, item_id: &str) -> anyhow::Result<Vec<crate::models::StockMovement>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at
+            "SELECT id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at, COALESCE(updated_at, created_at)
              FROM stock_movements WHERE item_id = ?1 ORDER BY date DESC, created_at DESC LIMIT 200"
         )?;
         let rows = stmt.query_map([item_id], |row| {
@@ -7437,21 +7733,58 @@ impl Db {
                 deleted: 0,
                 id: row.get(0)?, item_id: row.get(1)?, movement_type: row.get(2)?,
                 quantity: row.get(3)?, price_per_unit: row.get(4)?, notes: row.get(5)?,
-                date: row.get(6)?, created_at: row.get(7)?,
+                date: row.get(6)?, created_at: row.get(7)?, updated_at: row.get(8)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     pub fn stock_movement_add(&self, m: &crate::models::StockMovement) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            rusqlite::params![m.id, m.item_id, m.movement_type, m.quantity, m.price_per_unit, m.notes, m.date, m.created_at],
+        if m.id.trim().is_empty() || m.item_id.trim().is_empty() { bail!("movement id and item_id are required"); }
+        if !matches!(m.movement_type.as_str(), "in" | "out" | "adjustment") { bail!("movement_type must be in, out or adjustment"); }
+        if !m.quantity.is_finite() || m.quantity <= 0.0 { bail!("movement quantity must be a finite number > 0"); }
+        if m.price_per_unit.map(|x| !x.is_finite() || x < 0.0).unwrap_or(false) { bail!("price_per_unit must be a finite number >= 0"); }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stock_kind: Option<String> = tx.query_row("SELECT stock_kind FROM stock_items WHERE id=?1 AND deleted=0", [&m.item_id], |r| r.get(0)).optional()?;
+        let stock_kind = stock_kind.ok_or_else(|| anyhow!("product not found"))?;
+        if stock_kind == "service" { bail!("Shërbimi është pa stok dhe nuk pranon lëvizje inventari."); }
+        let updated_at = if m.updated_at.trim().is_empty() { m.created_at.as_str() } else { m.updated_at.as_str() };
+        let existing: Option<(String, String, f64, Option<f64>, Option<String>, String)> = tx.query_row(
+            "SELECT item_id, movement_type, quantity, price_per_unit, notes, date FROM stock_movements WHERE id=?1",
+            [&m.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).optional()?;
+        if let Some((item_id, movement_type, quantity, price_per_unit, notes, date)) = existing {
+            let same_price = match (price_per_unit, m.price_per_unit) {
+                (None, None) => true,
+                (Some(a), Some(b)) => (a - b).abs() < 0.000_000_1,
+                _ => false,
+            };
+            if item_id == m.item_id && movement_type == m.movement_type && (quantity - m.quantity).abs() < 0.000_000_1 && same_price && notes == m.notes && date == m.date {
+                tx.commit()?;
+                return Ok(());
+            }
+            bail!("movement id already exists with different content");
+        }
+        if m.movement_type == "out" {
+            let available: f64 = tx.query_row(
+                "SELECT COALESCE(SUM(CASE WHEN movement_type='in' THEN quantity WHEN movement_type='out' THEN -quantity ELSE quantity END), 0) FROM stock_movements WHERE item_id=?1",
+                [&m.item_id], |r| r.get(0),
+            )?;
+            if available + 0.000_000_1 < m.quantity {
+                bail!("Stoku i disponueshëm ({available}) nuk mjafton për këtë dalje ({})", m.quantity);
+            }
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO stock_movements (id,item_id,movement_type,quantity,price_per_unit,notes,date,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            rusqlite::params![m.id,m.item_id,m.movement_type,m.quantity,m.price_per_unit,m.notes,m.date,m.created_at,updated_at],
         )?;
-        let payload = serde_json::to_string(m)?;
-        Self::queue_replace_pending_conn(&conn, "stock_movements", &m.id, "upsert", &payload, &now_iso())?;
+        if inserted == 0 { bail!("movement could not be inserted; verify the event id and product"); }
+        let mut payload = serde_json::to_value(m)?;
+        if let Some(obj) = payload.as_object_mut() { obj.insert("updated_at".into(), serde_json::Value::String(updated_at.to_string())); }
+        Self::queue_replace_pending_tx(&tx, "stock_movements", &m.id, "upsert", &serde_json::to_string(&payload)?, updated_at)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -7601,12 +7934,16 @@ impl Db {
     pub fn apply_remote_stock_item(&self, r: &crate::models::StockItem) -> anyhow::Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO stock_items (id, name, unit, category, supplier_id, min_quantity, sale_price, notes, created_at, updated_at, deleted)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+            "INSERT INTO stock_items (id,name,unit,category,supplier_id,min_quantity,sale_price,purchase_price,stock_kind,atk_tax_code,atk_category_code,atk_unit_code,sku,barcode,subcategory,purchase_unit,purchase_unit_multiplier,notes,created_at,updated_at,deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name, unit=excluded.unit, category=excluded.category,
                supplier_id=excluded.supplier_id, min_quantity=excluded.min_quantity, sale_price=excluded.sale_price,
-               notes=excluded.notes, created_at=excluded.created_at, updated_at=excluded.updated_at, deleted=excluded.deleted",
-            params![r.id, r.name, r.unit, r.category, r.supplier_id, r.min_quantity, r.sale_price, r.notes, r.created_at, r.updated_at, r.deleted],
+               purchase_price=excluded.purchase_price, stock_kind=excluded.stock_kind, atk_tax_code=excluded.atk_tax_code,
+               atk_category_code=excluded.atk_category_code, atk_unit_code=excluded.atk_unit_code, sku=excluded.sku,
+               barcode=excluded.barcode, subcategory=excluded.subcategory, purchase_unit=excluded.purchase_unit,
+               purchase_unit_multiplier=excluded.purchase_unit_multiplier, notes=excluded.notes, created_at=excluded.created_at,
+               updated_at=excluded.updated_at, deleted=excluded.deleted",
+            params![r.id,r.name,r.unit,r.category,r.supplier_id,r.min_quantity,r.sale_price,r.purchase_price,r.stock_kind,r.atk_tax_code,r.atk_category_code,r.atk_unit_code,r.sku,r.barcode,r.subcategory,r.purchase_unit,r.purchase_unit_multiplier,r.notes,r.created_at,r.updated_at,r.deleted],
         )?;
         Ok(())
     }
@@ -7614,10 +7951,10 @@ impl Db {
     pub fn apply_remote_stock_movement(&self, r: &crate::models::StockMovement) -> anyhow::Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+            "INSERT INTO stock_movements (id,item_id,movement_type,quantity,price_per_unit,notes,date,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(id) DO NOTHING",
-            params![r.id, r.item_id, r.movement_type, r.quantity, r.price_per_unit, r.notes, r.date, r.created_at],
+            params![r.id,r.item_id,r.movement_type,r.quantity,r.price_per_unit,r.notes,r.date,r.created_at,if r.updated_at.trim().is_empty() { &r.created_at } else { &r.updated_at }],
         )?;
         Ok(())
     }
@@ -7638,24 +7975,58 @@ impl Db {
     }
 
     pub fn sale_items_replace(&self, sale_id: &str, items: &[crate::models::SaleItemInput]) -> anyhow::Result<()> {
+        if sale_id.trim().is_empty() { bail!("sale_id is required"); }
+        for (index, item) in items.iter().enumerate() {
+            if !matches!(item.item_type.as_str(), "service" | "product") { bail!("items[{index}].item_type must be service or product"); }
+            if item.title.trim().is_empty() { bail!("items[{index}].title is required"); }
+            if !item.qty.is_finite() || item.qty <= 0.0 { bail!("items[{index}].qty must be finite and > 0"); }
+            if !item.unit_price.is_finite() || item.unit_price < 0.0 { bail!("items[{index}].unit_price must be finite and >= 0"); }
+            if item.item_type == "product" && item.ref_id.as_deref().map(str::trim).filter(|id| !id.is_empty()).is_none() { bail!("items[{index}].ref_id is required for products"); }
+        }
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        // Return stock for old product line-items being replaced.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sale_state: Option<(i64, i64)> = tx.query_row(
+            "SELECT fiscalized, deleted FROM sales WHERE id=?1",
+            [sale_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let (fiscalized, deleted) = sale_state.ok_or_else(|| anyhow!("sale not found"))?;
+        if deleted != 0 { bail!("Shitja është fshirë dhe nuk mund të ndryshohet."); }
+        if fiscalized == 1 { bail!("Shitja është fiskalizuar; rreshtat e saj nuk mund të ndryshohen."); }
+        let current_items: Vec<(String, Option<String>, String, f64, f64)> = {
+            let mut stmt = tx.prepare("SELECT item_type, ref_id, title, qty, unit_price FROM sale_items WHERE sale_id=?1 ORDER BY created_at, id")?;
+            let rows = stmt.query_map([sale_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let identical = current_items.len() == items.len() && current_items.iter().zip(items).all(|(a, b)| {
+            a.0 == b.item_type && a.1 == b.ref_id && a.2 == b.title &&
+                (a.3 - b.qty).abs() < 0.000_000_1 && (a.4 - b.unit_price).abs() < 0.000_000_1
+        });
+        if identical { tx.commit()?; return Ok(()); }
+        // Return old product quantities. The movement and its sync event are committed atomically.
         {
             let mut stmt = tx.prepare(
-                "SELECT ref_id, qty FROM sale_items WHERE sale_id = ?1 AND item_type = 'product' AND ref_id IS NOT NULL"
+                "SELECT si.ref_id, si.qty, COALESCE(i.stock_kind, 'unknown') FROM sale_items si LEFT JOIN stock_items i ON i.id=si.ref_id WHERE si.sale_id = ?1 AND si.item_type = 'product' AND si.ref_id IS NOT NULL"
             )?;
-            let old_products: Vec<(String, f64)> = stmt
-                .query_map([sale_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?
+            let old_products: Vec<(String, f64, String)> = stmt
+                .query_map([sale_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, String>(2)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
-            for (ref_id, qty) in old_products {
+            for (ref_id, qty, stock_kind) in old_products {
+                if stock_kind == "service" { bail!("Rreshti produkt i lidhur me shërbim pa stok është i pavlefshëm."); }
                 let now = chrono::Utc::now().to_rfc3339();
                 let date = now.split('T').next().unwrap_or(&now).to_string();
+                let movement_id = Uuid::new_v4().to_string();
                 tx.execute(
-                    "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
-                     VALUES (?1,?2,'in',?3,NULL,?4,?5,?6)",
-                    rusqlite::params![Uuid::new_v4().to_string(), ref_id, qty, "Rikthim - ndryshim shitje", date, now],
+                    "INSERT INTO stock_movements (id,item_id,movement_type,quantity,price_per_unit,notes,date,created_at,updated_at)
+                     VALUES (?1,?2,'in',?3,NULL,?4,?5,?6,?6)",
+                    rusqlite::params![movement_id,ref_id,qty,"Rikthim - ndryshim shitje",date,now],
                 )?;
+                let movement = crate::models::StockMovement {
+                    id: movement_id, item_id: ref_id, movement_type: "in".to_string(), quantity: qty,
+                    price_per_unit: None, notes: Some("Rikthim - ndryshim shitje".to_string()),
+                    date, created_at: now.clone(), updated_at: now, deleted: 0,
+                };
+                Self::queue_replace_pending_tx(&tx, "stock_movements", &movement.id, "upsert", &serde_json::to_string(&movement)?, &movement.updated_at)?;
             }
         }
         tx.execute("DELETE FROM sale_items WHERE sale_id = ?1", [sale_id])?;
@@ -7670,11 +8041,33 @@ impl Db {
             )?;
             if item.item_type == "product" {
                 if let Some(ref_id) = &item.ref_id {
-                    tx.execute(
-                        "INSERT INTO stock_movements (id, item_id, movement_type, quantity, price_per_unit, notes, date, created_at)
-                         VALUES (?1,?2,'out',?3,?4,?5,?6,?7)",
-                        rusqlite::params![Uuid::new_v4().to_string(), ref_id, item.qty, item.unit_price, "Shitje", date, now],
+                    let stock_kind: String = tx.query_row("SELECT stock_kind FROM stock_items WHERE id=?1 AND deleted=0", [ref_id], |r| r.get(0))?;
+                    if stock_kind == "raw" || stock_kind == "sale" {
+                        bail!("Produkti '{0}' kërkon normativë prodhimi dhe nuk mund të shitet drejtpërdrejt nga shitjet e Mjekut.", item.title);
+                    }
+                    if stock_kind == "service" { bail!("Shërbimi pa stok duhet të ruhet si rresht shërbimi, jo si produkt."); }
+                    if stock_kind == "unknown" {
+                        bail!("Produkti '{0}' nuk ka lloj stoku të caktuar; caktoje si mall për rishitje ose lëndë të parë përpara shitjes.", item.title);
+                    }
+                    let available: f64 = tx.query_row(
+                        "SELECT COALESCE(SUM(CASE WHEN movement_type='in' THEN quantity WHEN movement_type='out' THEN -quantity ELSE quantity END), 0) FROM stock_movements WHERE item_id=?1",
+                        [ref_id], |r| r.get(0),
                     )?;
+                    if available + 0.000_000_1 < item.qty {
+                        bail!("Stoku i produktit nuk mjafton për këtë shitje ({available} të disponueshme, {} të kërkuara).", item.qty);
+                    }
+                    let movement_id = Uuid::new_v4().to_string();
+                    tx.execute(
+                        "INSERT INTO stock_movements (id,item_id,movement_type,quantity,price_per_unit,notes,date,created_at,updated_at)
+                         VALUES (?1,?2,'out',?3,?4,?5,?6,?7,?7)",
+                        rusqlite::params![movement_id,ref_id,item.qty,item.unit_price,"Shitje",date,now],
+                    )?;
+                    let movement = crate::models::StockMovement {
+                        id: movement_id, item_id: ref_id.clone(), movement_type: "out".to_string(), quantity: item.qty,
+                        price_per_unit: Some(item.unit_price), notes: Some("Shitje".to_string()),
+                        date, created_at: now.clone(), updated_at: now, deleted: 0,
+                    };
+                    Self::queue_replace_pending_tx(&tx, "stock_movements", &movement.id, "upsert", &serde_json::to_string(&movement)?, &movement.updated_at)?;
                 }
             }
         }
@@ -8305,6 +8698,177 @@ mod dental_findings_tests {
             "fracture_id":"missing-fracture", "assessment_date":"2026-10-25"
         });
         assert!(db.orthopedic_fracture_followup_add(&followup,"doctor-1").is_err());
+    }
+}
+
+#[cfg(test)]
+mod product_stock_integration_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn product(id: &str, kind: &str) -> crate::models::StockItemUpsertInput {
+        crate::models::StockItemUpsertInput {
+            id: id.to_string(), name: format!("Produkt {id}"), unit: Some("CP".to_string()),
+            category: Some("Test".to_string()), supplier_id: None, min_quantity: 0.0,
+            sale_price: 10.0, notes: None, created_at: now_iso(), updated_at: now_iso(),
+            purchase_price: Some(5.0), stock_kind: Some(kind.to_string()), atk_tax_code: Some("C".to_string()),
+            atk_category_code: Some("SM".to_string()), atk_unit_code: Some("CP".to_string()),
+            sku: None, barcode: None, subcategory: None, purchase_unit: Some("Pako".to_string()),
+            purchase_unit_multiplier: Some(10.0),
+        }
+    }
+
+    fn movement(id: &str, item_id: &str, kind: &str, qty: f64, notes: &str) -> crate::models::StockMovement {
+        let now = now_iso();
+        crate::models::StockMovement {
+            id: id.to_string(), item_id: item_id.to_string(), movement_type: kind.to_string(), quantity: qty,
+            price_per_unit: Some(5.0), notes: Some(notes.to_string()), date: now[..10].to_string(),
+            created_at: now.clone(), updated_at: now, deleted: 0,
+        }
+    }
+
+    fn balance(db: &Db, item_id: &str) -> f64 {
+        db.stock_items_list().unwrap().into_iter().find(|x| x.id == item_id).unwrap().current_quantity
+    }
+
+    #[test]
+    fn additive_catalog_migration_preserves_legacy_rows_and_is_idempotent() {
+        let path = std::env::temp_dir().join(format!("mjeku-catalog-migration-{}.sqlite", Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(r#"
+                CREATE TABLE services (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, default_price REAL NOT NULL,
+                    vat_code TEXT NOT NULL DEFAULT 'C', notes TEXT, created_at TEXT,
+                    updated_at TEXT, deleted INTEGER DEFAULT 0
+                );
+                CREATE TABLE stock_suppliers (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT, email TEXT,
+                    address TEXT, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    deleted INTEGER DEFAULT 0
+                );
+                CREATE TABLE stock_items (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, unit TEXT, category TEXT,
+                    supplier_id TEXT, min_quantity REAL NOT NULL DEFAULT 0, notes TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted INTEGER DEFAULT 0
+                );
+                CREATE TABLE stock_movements (
+                    id TEXT PRIMARY KEY, item_id TEXT NOT NULL, movement_type TEXT NOT NULL,
+                    quantity REAL NOT NULL, price_per_unit REAL, notes TEXT,
+                    date TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                INSERT INTO services VALUES ('legacy-service','Kontrollë',25,'C','keep-service','2025-01-01','2025-01-02',0);
+                INSERT INTO stock_items VALUES ('legacy-product','Material','CP','Dental',NULL,1,'keep-product','2025-01-01','2025-01-02',0);
+                INSERT INTO stock_movements VALUES ('legacy-intake','legacy-product','in',7,3,'keep-movement','2025-01-02','2025-01-02T10:00:00Z');
+            "#).unwrap();
+        }
+
+        {
+            let db = Db::new(path.clone()).unwrap();
+            let service = db.services_list(None).unwrap().into_iter().find(|x| x.id == "legacy-service").unwrap();
+            assert_eq!(service.title, "Kontrollë");
+            assert_eq!(service.notes.as_deref(), Some("keep-service"));
+            assert_eq!(service.atk_category_code, "SM");
+            let item = db.stock_items_list().unwrap().into_iter().find(|x| x.id == "legacy-product").unwrap();
+            assert_eq!(item.name, "Material");
+            assert_eq!(item.notes.as_deref(), Some("keep-product"));
+            assert_eq!(item.stock_kind, "unknown");
+            assert_eq!(item.current_quantity, 7.0);
+            let conn = db.conn().unwrap();
+            let updated: String = conn.query_row("SELECT updated_at FROM stock_movements WHERE id='legacy-intake'", [], |r| r.get(0)).unwrap();
+            assert_eq!(updated, "2025-01-02T10:00:00Z");
+        }
+
+        // Re-open to verify that the additive migration can safely run again.
+        let db = Db::new(path.clone()).unwrap();
+        assert_eq!(db.stock_items_list().unwrap().into_iter().find(|x| x.id == "legacy-product").unwrap().current_quantity, 7.0);
+        drop(db);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tracked_stock_moves_are_validated_idempotent_and_synced() {
+        let db = Db::new_in_memory().unwrap();
+        db.stock_item_upsert(&product("tracked", "resale")).unwrap();
+        let intake = movement("intake-1", "tracked", "in", 5.0, "Pranim");
+        db.stock_movement_add(&intake).unwrap();
+        db.stock_movement_add(&intake).unwrap();
+        assert_eq!(balance(&db, "tracked"), 5.0);
+
+        let mut out = movement("out-1", "tracked", "out", 3.0, "Dalje");
+        db.stock_movement_add(&out).unwrap();
+        db.stock_movement_add(&out).unwrap();
+        assert_eq!(balance(&db, "tracked"), 2.0);
+        out.notes = Some("Ndryshim i eventit ekzistues".to_string());
+        assert!(db.stock_movement_add(&out).is_err());
+        assert!(db.stock_movement_add(&movement("out-2", "tracked", "out", 3.0, "Pa stok")).is_err());
+
+        let conn = db.conn().unwrap();
+        let queued: i64 = conn.query_row("SELECT COUNT(*) FROM sync_queue WHERE table_name='stock_movements' AND status='pending'", [], |r| r.get(0)).unwrap();
+        assert_eq!(queued, 2, "retry i së njëjtës lëvizje nuk duhet të krijojë event të dytë");
+    }
+
+    #[test]
+    fn medical_service_never_creates_stock_and_tracked_product_requires_atk_catalog() {
+        let db = Db::new_in_memory().unwrap();
+        let mut service = product("service", "service");
+        service.atk_category_code = Some("SM".to_string());
+        db.stock_item_upsert(&service).unwrap();
+        assert!(db.stock_movement_add(&movement("service-in", "service", "in", 1.0, "Invalid" )).is_err());
+
+        let mut missing = product("missing-atk", "resale");
+        missing.atk_category_code = None;
+        assert!(db.stock_item_upsert(&missing).is_err());
+        let mut invalid = product("invalid-atk", "resale");
+        invalid.atk_unit_code = Some("INVALID".to_string());
+        assert!(db.stock_item_upsert(&invalid).is_err());
+    }
+
+    #[test]
+    fn product_sales_are_atomic_retry_safe_and_immutable_after_fiscalization() {
+        let db = Db::new_in_memory().unwrap();
+        db.stock_item_upsert(&product("sale-product", "resale")).unwrap();
+        db.stock_movement_add(&movement("sale-intake", "sale-product", "in", 5.0, "Pranim")).unwrap();
+        db.sales_upsert(SaleUpsertInput { id: Some("sale-1".to_string()), client_id: "client-1".to_string(), date: Some("2026-10-28".to_string()), total: 20.0, notes: None }).unwrap();
+        let line = crate::models::SaleItemInput { item_type: "product".to_string(), ref_id: Some("sale-product".to_string()), title: "Produkt sale-product".to_string(), qty: 2.0, unit_price: 10.0 };
+        db.sale_items_replace("sale-1", &[line.clone()]).unwrap();
+        db.sale_items_replace("sale-1", &[line]).unwrap();
+        assert_eq!(balance(&db, "sale-product"), 3.0);
+
+        let revised = crate::models::SaleItemInput { item_type: "product".to_string(), ref_id: Some("sale-product".to_string()), title: "Produkt sale-product".to_string(), qty: 4.0, unit_price: 10.0 };
+        db.sale_items_replace("sale-1", &[revised.clone()]).unwrap();
+        assert_eq!(balance(&db, "sale-product"), 1.0, "editimi kthen sasinë e vjetër dhe zbrit vetëm sasinë e re");
+        db.conn().unwrap().execute("UPDATE sales SET fiscalized=1, fiscalized_at='2026-10-28T10:00:00Z' WHERE id='sale-1'", []).unwrap();
+        assert!(db.sale_items_replace("sale-1", &[revised]).is_err());
+        assert!(db.sales_upsert(SaleUpsertInput { id: Some("sale-1".to_string()), client_id: "client-1".to_string(), date: Some("2026-10-28".to_string()), total: 30.0, notes: None }).is_err());
+        assert!(db.sales_delete("sale-1").is_err());
+        assert_eq!(balance(&db, "sale-product"), 1.0);
+    }
+
+    #[test]
+    fn simultaneous_stock_outs_cannot_consume_the_same_quantity_twice() {
+        let path = std::env::temp_dir().join(format!("mjeku-stock-race-{}.sqlite", Uuid::new_v4()));
+        let db = Db::new(path.clone()).unwrap();
+        db.stock_item_upsert(&product("race-item", "resale")).unwrap();
+        db.stock_movement_add(&movement("race-intake", "race-item", "in", 5.0, "Pranim")).unwrap();
+        drop(db);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2).map(|index| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = Db::new(path).unwrap();
+                barrier.wait();
+                db.stock_movement_add(&movement(&format!("race-out-{index}"), "race-item", "out", 4.0, "Shitje"))
+            })
+        }).collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        let db = Db::new(path.clone()).unwrap();
+        assert_eq!(balance(&db, "race-item"), 1.0);
+        drop(db);
+        let _ = fs::remove_file(path);
     }
 }
 
