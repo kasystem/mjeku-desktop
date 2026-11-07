@@ -58,6 +58,8 @@ pub struct SyncEngine {
     client: reqwest::Client,
     lock: tokio::sync::Mutex<()>,
     status: tokio::sync::RwLock<SyncPublicStatus>,
+    /// Device JWT when syncing with the PROGRAMERI POS project (schema `mjeku`); None = old project.
+    pos_bearer: std::sync::RwLock<Option<String>>,
 }
 
 impl SyncEngine {
@@ -74,7 +76,22 @@ impl SyncEngine {
                 sync_status: "pending".to_string(),
                 last_sync_error: None,
             }),
+            pos_bearer: std::sync::RwLock::new(None),
         })
+    }
+
+    /// Old project: apikey (+ bearer when JWT). POS project: anon key as apikey, the device
+    /// JWT as bearer and the `mjeku` schema profile (RLS isolates the clinic).
+    fn auth(&self, req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        let bearer = self.pos_bearer.read().ok().and_then(|g| g.clone());
+        match bearer {
+            Some(token) => req
+                .header("apikey", api_key)
+                .bearer_auth(token)
+                .header("Accept-Profile", crate::pos_cloud::SCHEMA)
+                .header("Content-Profile", crate::pos_cloud::SCHEMA),
+            None => with_supabase_auth(req, api_key),
+        }
     }
 
     pub async fn get_status(&self) -> SyncPublicStatus {
@@ -97,11 +114,24 @@ impl SyncEngine {
     pub async fn sync_now(&self) -> anyhow::Result<()> {
         let _guard = self.lock.lock().await;
 
-        let supabase_url = self.db.setting_get(KEY_SUPABASE_URL)?;
-        let api_key = self
-            .db
-            .setting_get(KEY_SUPABASE_API_KEY)?
-            .or_else(|| self.db.setting_get(KEY_SUPABASE_ANON_KEY).ok().flatten());
+        // 0.6.1: identity from PROGRAMERI POS; switch to its project once the clinic was copied there.
+        crate::pos_cloud::provision_if_due(&self.db).await;
+        let pos = crate::pos_cloud::remote(&self.db, &self.client).await.ok().flatten();
+        if let Ok(mut g) = self.pos_bearer.write() {
+            *g = pos.as_ref().map(|p| p.bearer.clone());
+        }
+        let first_pos_sync = pos.is_some()
+            && self.db.setting_get(crate::pos_cloud::KEY_SWITCHED)?.unwrap_or_default().is_empty();
+
+        let (supabase_url, api_key) = match &pos {
+            Some(p) => (Some(p.base.clone()), Some(p.anon_key.clone())),
+            None => (
+                self.db.setting_get(KEY_SUPABASE_URL)?,
+                self.db
+                    .setting_get(KEY_SUPABASE_API_KEY)?
+                    .or_else(|| self.db.setting_get(KEY_SUPABASE_ANON_KEY).ok().flatten()),
+            ),
+        };
         let clinic_id = self.db.setting_get("clinic_id")?.unwrap_or_default();
 
         if supabase_url.as_deref().unwrap_or("").trim().is_empty()
@@ -115,10 +145,14 @@ impl SyncEngine {
         let supabase_url = supabase_url.unwrap();
         let api_key = api_key.unwrap();
 
-        let last_sync_time = self
-            .db
-            .get_last_sync_time()?
-            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        // First sync with the POS project pulls everything (newer local rows still win).
+        let last_sync_time = if first_pos_sync {
+            "1970-01-01T00:00:00Z".to_string()
+        } else {
+            self.db
+                .get_last_sync_time()?
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+        };
         let sync_started_at = now_iso();
 
         // Pull first (to avoid overwriting newer remote updates).
@@ -150,13 +184,19 @@ impl SyncEngine {
             return Err(e);
         }
 
-        // Sync clinic-level settings (bank account) — non-fatal.
-        let _ = self
-            .sync_clinic_settings(&supabase_url, &api_key, &clinic_id)
-            .await;
+        // Sync clinic-level settings (bank account) — non-fatal. clinic_registry is server-only in
+        // the POS project (AdminPanel), so this runs only against the old project.
+        if pos.is_none() {
+            let _ = self
+                .sync_clinic_settings(&supabase_url, &api_key, &clinic_id)
+                .await;
+        }
 
         // Mark successful sync time.
         self.db.set_last_sync_time(&sync_started_at)?;
+        if first_pos_sync {
+            self.db.setting_set(crate::pos_cloud::KEY_SWITCHED, &sync_started_at)?;
+        }
 
         let pending = self.db.sync_queue_count_pending()?;
         if pending == 0 {
@@ -519,7 +559,7 @@ impl SyncEngine {
         clinic_id: &str,
     ) -> anyhow::Result<Vec<T>> {
         let url = format!("{base}/rest/v1/{table}");
-        let resp = with_supabase_auth(self.client.get(&url), api_key)
+        let resp = self.auth(self.client.get(&url), api_key)
             .header("clinic_id", clinic_id)
             .query(&[
                 ("select", "*"),
@@ -626,7 +666,7 @@ impl SyncEngine {
                 };
                 let url = format!("{base}/rest/v1/{table}?on_conflict={conflict_col}");
 
-                let resp = with_supabase_auth(self.client.post(&url), api_key)
+                let resp = self.auth(self.client.post(&url), api_key)
                     .header("Prefer", "resolution=merge-duplicates,return=minimal")
                     .header("clinic_id", clinic_id)
                     .json(&payload)
@@ -695,7 +735,7 @@ impl SyncEngine {
                 urlencoding::encode(&id)
             );
             let body = serde_json::json!({ "deleted": 1, "updated_at": updated_at });
-            let resp = with_supabase_auth(self.client.patch(&url), api_key)
+            let resp = self.auth(self.client.patch(&url), api_key)
                 .header("Prefer", "return=minimal")
                 .header("clinic_id", clinic_id)
                 .json(&body)
@@ -729,7 +769,7 @@ impl SyncEngine {
             let url = format!("{base}/rest/v1/clinic_registry?on_conflict=clinic_id");
             let body =
                 serde_json::json!([{ "clinic_id": clinic_id, "bank_account": local_bank.trim() }]);
-            let _ = with_supabase_auth(self.client.post(&url), api_key)
+            let _ = self.auth(self.client.post(&url), api_key)
                 .header("Prefer", "resolution=merge-duplicates,return=minimal")
                 .header("clinic_id", clinic_id)
                 .json(&body)
@@ -740,7 +780,7 @@ impl SyncEngine {
         // Pull remote value; update local if remote differs and local is empty.
         let url =
             format!("{base}/rest/v1/clinic_registry?clinic_id=eq.{clinic_id}&select=bank_account");
-        if let Ok(resp) = with_supabase_auth(self.client.get(&url), api_key)
+        if let Ok(resp) = self.auth(self.client.get(&url), api_key)
             .header("clinic_id", clinic_id)
             .send()
             .await

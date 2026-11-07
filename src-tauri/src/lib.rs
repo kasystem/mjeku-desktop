@@ -9,6 +9,7 @@ mod license_engine;
 mod models;
 mod orthopedics_pdf;
 mod physiotherapy_pdf;
+mod pos_cloud;
 mod sef_bridge;
 mod sync_engine;
 mod ui_protocol;
