@@ -4341,7 +4341,7 @@ fn sef_fiscalize_blocking(
     let req =
         crate::sef_bridge::build_fiscalize_request(&lines, &pays, &rates).map_err(err_string)?;
     let issued_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-    let clinic_logo = db.clinic_logo_png_bytes().map_err(err_string)?;
+    let clinic_logo = db.clinic_logo_png_bytes().unwrap_or(None);
     let logo_base64 = clinic_logo
         .as_ref()
         .map(|bytes| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes));

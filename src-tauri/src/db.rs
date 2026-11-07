@@ -3684,13 +3684,18 @@ impl Db {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        // The logo is optional display metadata: an empty, oversized, unreadable or non-PNG
+        // file must never block fiscalization — the coupon is issued and printed without it.
         if metadata.len() == 0 || metadata.len() > MAX_BYTES {
-            bail!("Logoja e klinikës duhet të jetë midis 1 bajt dhe 1 MiB për kuponin SEF.");
+            return Ok(None);
         }
-        let bytes = fs::read(path)?;
+        let bytes = match fs::read(path) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
         const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
-        if !bytes.starts_with(&PNG_SIGNATURE) {
-            bail!("Logoja e klinikës nuk është skedar PNG i vlefshëm.");
+        if bytes.is_empty() || bytes.len() as u64 > MAX_BYTES || !bytes.starts_with(&PNG_SIGNATURE) {
+            return Ok(None);
         }
         Ok(Some(bytes))
     }
