@@ -578,7 +578,9 @@ pub struct StockItem {
     pub current_quantity: f64,
 }
 
-fn default_purchase_multiplier() -> f64 { 1.0 }
+fn default_purchase_multiplier() -> f64 {
+    1.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StockItemUpsertInput {
@@ -657,7 +659,7 @@ pub struct Offer {
     pub clinic_id: String,
     pub client_id: String,
     pub offer_number: String,
-    pub status: String, // draft|sent|accepted|rejected|invoiced
+    pub status: String,              // draft|sent|accepted|rejected|invoiced
     pub valid_until: Option<String>, // YYYY-MM-DD
     pub notes: Option<String>,
     pub vat_pct: f64,

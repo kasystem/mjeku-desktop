@@ -6,7 +6,7 @@
 //!
 //! Kontrata: `pos-native-windows/docs/MJEKU_SEF_BRIDGE_CONTRACT.md` (v1).
 //! - Windows: named pipe `\\.\pipe\<PROGRAMERI_FISCAL_PIPE>`, çdo mesazh =
-//!   4 bajt gjatësi little-endian + JSON UTF-8 (maks. 1 MiB).
+//!   4 bajt gjatësi little-endian + JSON UTF-8 (maks. 4 MiB).
 //! - Android: shërbim i lidhur (bound service) — ende i paimplementuar (TODO).
 //! - macOS/iOS: nuk mbështetet; zgjedhja SEF (PROGRAMERI POS) nuk shfaqet.
 //!
@@ -29,7 +29,7 @@ pub const ENV_TOKEN: &str = "PROGRAMERI_FISCAL_TOKEN";
 pub const ENV_CONTEXT: &str = "PROGRAMERI_FISCAL_CONTEXT";
 
 pub const PROTOCOL_VERSION: u64 = 1;
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const SOURCE: &str = "mjeku";
 
 /// Kohëzgjatja për thirrjet e zakonshme.
@@ -55,14 +55,30 @@ pub const fn platform_supported() -> bool {
 /// shfaq zgjedhjen SEF (PROGRAMERI POS), "Kuponët" dhe banerin SEF VETËM kur kjo
 /// aftësi ekziston — kështu një UI e re mbi një binar të vjetër duket si sot.
 pub const CAPABILITY_BRIDGE_V1: &str = "sef_programeri_bridge_v1";
+pub const CAPABILITY_BUSINESS_SETTINGS: &str = "sef_business_settings_v1";
+pub const CAPABILITY_WINDOWS_PRINTER_LIST: &str = "windows_printer_list";
+pub const CAPABILITY_COUPON_PREVIEW: &str = "coupon_preview_v1";
+pub const CAPABILITY_COUPON_PREVIEW_DELIVERY: &str = "coupon_preview_delivery_v1";
+pub const CAPABILITY_COUPON_EMAIL: &str = "coupon_email_v1";
+pub const CAPABILITY_RECEIPT_LOGO_OVERRIDE: &str = "receipt_logo_override_v1";
+pub const CAPABILITY_ATK_ACCESS_WINDOW: &str = "atk_access_window_v1";
 
 /// Lista e aftësive të binarit. Në macOS/iOS bosh (SEF nuk shfaqet fare).
 pub fn capabilities() -> Vec<String> {
+    let mut values = Vec::new();
     if platform_supported() {
-        vec![CAPABILITY_BRIDGE_V1.to_string()]
-    } else {
-        Vec::new()
+        values.push(CAPABILITY_BRIDGE_V1.to_string());
     }
+    #[cfg(target_os = "windows")]
+    {
+        values.push(CAPABILITY_BUSINESS_SETTINGS.to_string());
+        values.push(CAPABILITY_WINDOWS_PRINTER_LIST.to_string());
+        values.push(CAPABILITY_COUPON_PREVIEW.to_string());
+        values.push(CAPABILITY_COUPON_PREVIEW_DELIVERY.to_string());
+        values.push(CAPABILITY_COUPON_EMAIL.to_string());
+        values.push(CAPABILITY_ATK_ACCESS_WINDOW.to_string());
+    }
+    values
 }
 
 // ---------------------------------------------------------------------------
@@ -424,9 +440,7 @@ pub fn line_total_cents(qty_milli: i64, unit_cents: i64) -> i64 {
     q as i64
 }
 
-/// Përqindjet e TVSH-së për kodet e Mjekut. Parazgjedhjet ndjekin etiketat e
-/// Mjekut (Shërbimet/Cilësimet): A = 0% e përjashtuar, C = 0% (jo në TVSH),
-/// D = 8%, E = 18%. Mund të ndryshohen me cilësimet `sef_vat_rate_a/c/d/e`.
+/// Normat fikse të TVSH-së për kodet e ATK/Mjekut: A = 0%, C = 0%, D = 8%, E = 18%.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VatRates {
     pub a: u32,
@@ -454,21 +468,10 @@ pub const VAT_RATE_SETTING_KEYS: [&str; 4] = [
 ];
 
 impl VatRates {
-    /// Lexon mbishkrimet nga cilësimet; vlerë bosh/e pavlefshme → parazgjedhja.
-    pub fn from_settings(get: impl Fn(&str) -> Option<String>) -> Self {
-        let d = Self::default();
-        let parse = |key: &str, def: u32| -> u32 {
-            get(key)
-                .and_then(|v| v.trim().trim_end_matches('%').trim().parse::<u32>().ok())
-                .filter(|v| *v <= 100)
-                .unwrap_or(def)
-        };
-        Self {
-            a: parse(VAT_RATE_SETTING_KEYS[0], d.a),
-            c: parse(VAT_RATE_SETTING_KEYS[1], d.c),
-            d: parse(VAT_RATE_SETTING_KEYS[2], d.d),
-            e: parse(VAT_RATE_SETTING_KEYS[3], d.e),
-        }
+    /// Ruhet për përputhshmëri të thirrësve të vjetra; vlerat e ruajtura nuk
+    /// ndikojnë më në llogaritjen fiskale.
+    pub fn from_settings(_get: impl Fn(&str) -> Option<String>) -> Self {
+        Self::default()
     }
 
     /// Kodi i panjohur trajtohet si C, njësoj si `fiscal_vat_group_for_code` në db.rs.
@@ -482,23 +485,34 @@ impl VatRates {
     }
 }
 
-/// Metoda e pagesës së Mjekut → metoda e kontratës.
-pub fn map_payment_method(m: &str) -> &'static str {
+/// Metoda e pagesës së Mjekut → metoda e kontratës. Vlera bosh refuzohet që
+/// pagesa të mos paraqitet si cash pa të dhëna të shprehura.
+pub fn map_payment_method(m: &str) -> Result<&'static str, BridgeError> {
     match m.trim().to_ascii_lowercase().as_str() {
-        "cash" | "" => "cash",
-        "card" => "card",
-        "bank" | "transfer" => "transfer",
-        _ => "other",
+        "cash" => Ok("cash"),
+        "card" => Ok("card"),
+        "bank" | "transfer" => Ok("transfer"),
+        "other" | "cheque" | "coupon" | "cryptocurrency" => Ok("other"),
+        _ => Err(local_validation(
+            "Mënyra e regjistruar e pagesës nuk njihet.",
+        )),
     }
 }
 
-fn sanitize_title(v: &str) -> String {
+fn sanitize_title(v: &str) -> Result<String, BridgeError> {
     let s = v.replace(['\r', '\n'], " ");
     let s = s.trim();
     if s.is_empty() {
-        return "Sherbim".to_string();
+        return Err(local_validation(
+            "Artikulli fiskal duhet të ketë përshkrim.",
+        ));
     }
-    s.chars().take(120).collect()
+    if s.chars().count() > 200 {
+        return Err(local_validation(
+            "Përshkrimi i artikullit fiskal nuk mund të kalojë 200 karaktere.",
+        ));
+    }
+    Ok(s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -561,20 +575,10 @@ pub struct FiscalizeRequest {
     pub total_cents: i64,
 }
 
-/// Ndërton artikujt dhe pagesat.
-///
-/// Rreshtat: sasia e pavlefshme (≤0, NaN) → 1 dhe çmimi i pavlefshëm (<0, NaN)
-/// → 0, njësoj si rruga ENTERNET (`fiscal_receipt_generate_inp`). Çmimi për njësi
-/// → cent (half away from zero); totali i rreshtit = `line_total_cents`.
-///
-/// Pagesat (shuma e tyre DUHET të jetë = shuma e artikujve):
-/// 1. Pagesat e shitjes (jo të fshira, shumë > 0) grupohen sipas metodës. Nëse
-///    shuma e tyre në cent është saktësisht totali i artikujve → përdoren ashtu.
-/// 2. Përndryshe (pagesë e pjesshme, shitje e përzier fiskale/jo-fiskale, pagesë
-///    më e madhe): një pagesë e vetme me totalin e artikujve, me metodën e
-///    pagesës më të madhe të shitjes.
-/// 3. Pa pagesa: një pagesë e vetme `cash` me totalin (si pagesa automatike
-///    "[AUTO-FISCAL]" që Mjeku ruan sot pas fiskalizimit).
+/// Ndërton artikujt dhe pagesat për SEF pa i ndryshuar vlerat e regjistruara.
+/// Sasitë, çmimet, TVSH-ja dhe pagesat e pavlefshme refuzohen para thirrjes së POS-it.
+/// Pagesat grupohen sipas metodës dhe shuma e tyre në cent duhet të jetë saktësisht
+/// e barabartë me totalin e artikujve; nuk krijohet pagesë cash e hamendësuar.
 pub fn build_fiscalize_request(
     lines: &[SaleLine],
     payments: &[SalePayment],
@@ -586,54 +590,83 @@ pub fn build_fiscalize_request(
     let mut items = Vec::with_capacity(lines.len());
     let mut total: i64 = 0;
     for ln in lines {
-        let qty = if ln.qty.is_finite() && ln.qty > 0.0 {
-            ln.qty
-        } else {
-            1.0
-        };
-        let unit_price = if ln.unit_price.is_finite() && ln.unit_price >= 0.0 {
-            ln.unit_price
-        } else {
-            0.0
-        };
-        let mut qty_milli = qty_to_milli(qty);
-        if qty_milli <= 0 {
-            qty_milli = 1000;
+        if !ln.qty.is_finite() || ln.qty <= 0.0 || ln.qty > 9_999_999.999 {
+            return Err(local_validation(
+                "Sasia e artikullit fiskal duhet të jetë pozitive dhe brenda kufirit të lejuar.",
+            ));
         }
-        let unit_cents = money_to_cents(unit_price)?;
-        total += line_total_cents(qty_milli, unit_cents);
+        if !ln.unit_price.is_finite() || ln.unit_price < 0.0 {
+            return Err(local_validation(
+                "Çmimi i artikullit fiskal nuk është i vlefshëm.",
+            ));
+        }
+        let scaled_qty = ln.qty * 1000.0;
+        if (scaled_qty - scaled_qty.round()).abs() > 1.0e-7 {
+            return Err(local_validation(
+                "Sasia nuk mund të ketë më shumë se 3 shifra pas presjes.",
+            ));
+        }
+        let qty_milli = qty_to_milli(ln.qty);
+        if qty_milli <= 0 {
+            return Err(local_validation(
+                "Sasia është më e vogël se precizioni i lejuar prej 0.001.",
+            ));
+        }
+        let unit_cents = money_to_cents(ln.unit_price)?;
+        if unit_cents > 10_000_000_000 {
+            return Err(local_validation(
+                "Çmimi i artikullit tejkalon kufirin e lejuar nga SEF.",
+            ));
+        }
+        let vat_code = ln.vat_code.trim().to_ascii_uppercase();
+        if !matches!(vat_code.as_str(), "A" | "C" | "D" | "E") {
+            return Err(local_validation(
+                "Kodi i TVSH-së duhet të jetë A, C, D ose E.",
+            ));
+        }
+        total = total
+            .checked_add(line_total_cents(qty_milli, unit_cents))
+            .ok_or_else(|| {
+                local_validation("Totali i artikujve fiskal tejkalon kufirin e lejuar.")
+            })?;
         items.push(FiscalItem {
             id: ln.id.clone(),
-            title: sanitize_title(&ln.title),
+            title: sanitize_title(&ln.title)?,
             qty: qty_string(qty_milli),
             unit_price_cents: unit_cents,
-            vat_rate_percent: rates.rate_for_code(&ln.vat_code),
+            vat_rate_percent: rates.rate_for_code(&vat_code),
             product_id: ln.product_id.clone(),
             item_type: ln.item_type.clone(),
             stock_kind: ln.stock_kind.clone(),
-            vat_code: if ln.product_id.is_some() { Some(ln.vat_code.trim().to_ascii_uppercase()) } else { None },
+            vat_code: if ln.product_id.is_some() {
+                Some(vat_code)
+            } else {
+                None
+            },
             atk_category_code: ln.atk_category_code.clone(),
             atk_unit_code: ln.atk_unit_code.clone(),
         });
     }
 
     let mut grouped: Vec<FiscalPayment> = Vec::new();
-    let mut largest: Option<(i64, &'static str)> = None;
     for p in payments {
         if !p.amount.is_finite() || p.amount <= 0.0 {
-            continue;
+            return Err(local_validation(
+                "Çdo pagesë duhet të ketë shumë pozitive dhe të vlefshme.",
+            ));
         }
         let cents = money_to_cents(p.amount)?;
         if cents <= 0 {
-            continue;
+            return Err(local_validation(
+                "Shuma e pagesës është më e vogël se 0.01 €.",
+            ));
         }
-        let method = map_payment_method(&p.method);
-        match largest {
-            Some((c, _)) if cents <= c => {}
-            _ => largest = Some((cents, method)),
-        }
+        let method = map_payment_method(&p.method)?;
         if let Some(g) = grouped.iter_mut().find(|g| g.method == method) {
-            g.amount_cents += cents;
+            g.amount_cents = g
+                .amount_cents
+                .checked_add(cents)
+                .ok_or_else(|| local_validation("Totali i pagesave tejkalon kufirin e lejuar."))?;
         } else {
             grouped.push(FiscalPayment {
                 method: method.to_string(),
@@ -641,19 +674,29 @@ pub fn build_fiscalize_request(
             });
         }
     }
-    let paid: i64 = grouped.iter().map(|g| g.amount_cents).sum();
-    let out_payments = if !grouped.is_empty() && paid == total {
-        grouped
-    } else {
-        let method = largest.map(|(_, m)| m).unwrap_or("cash");
-        vec![FiscalPayment {
-            method: method.to_string(),
-            amount_cents: total,
-        }]
-    };
+    if grouped.is_empty() {
+        return Err(local_validation(
+            "Regjistro pagesën reale para fiskalizimit.",
+        ));
+    }
+    let paid = grouped.iter().try_fold(0i64, |sum, payment| {
+        sum.checked_add(payment.amount_cents)
+            .ok_or_else(|| local_validation("Totali i pagesave tejkalon kufirin e lejuar."))
+    })?;
+    if paid != total {
+        return Err(local_validation(format!(
+            "Shuma e pagesave ({}) nuk përputhet me totalin e artikujve ({} €). Fatura nuk u fiskalizua.",
+            cents_text(paid), cents_text(total)
+        )));
+    }
+    if total <= 0 {
+        return Err(local_validation(
+            "Totali i shitjes duhet të jetë më i madh se 0 €.",
+        ));
+    }
     let req = FiscalizeRequest {
         items,
-        payments: out_payments,
+        payments: grouped,
         total_cents: total,
     };
     check_sums(&req)?;
@@ -662,21 +705,28 @@ pub fn build_fiscalize_request(
 
 /// Kontrolli i kontratës: shuma e artikujve = shuma e pagesave = totali.
 pub fn check_sums(req: &FiscalizeRequest) -> Result<(), BridgeError> {
-    let items: i64 = req
-        .items
-        .iter()
-        .map(|i| {
+    let items = req.items.iter().try_fold(0i64, |sum, i| {
+        let line = {
             let milli = parse_qty_milli(&i.qty).unwrap_or(0);
             line_total_cents(milli, i.unit_price_cents)
-        })
-        .sum();
-    let pays: i64 = req.payments.iter().map(|p| p.amount_cents).sum();
+        };
+        sum.checked_add(line)
+            .ok_or_else(|| local_validation("Totali i artikujve fiskal tejkalon kufirin e lejuar."))
+    })?;
+    let pays = req.payments.iter().try_fold(0i64, |sum, p| {
+        sum.checked_add(p.amount_cents)
+            .ok_or_else(|| local_validation("Totali i pagesave tejkalon kufirin e lejuar."))
+    })?;
     if items != pays || items != req.total_cents {
         return Err(local_validation(
             "Shuma e artikujve nuk përputhet me pagesat. Fatura nuk u fiskalizua.",
         ));
     }
     Ok(())
+}
+
+fn cents_text(cents: i64) -> String {
+    format!("{}.{:02}", cents / 100, cents.unsigned_abs() % 100)
 }
 
 fn parse_qty_milli(s: &str) -> Option<i64> {
@@ -705,6 +755,42 @@ pub fn fiscalize_params(sale_id: &str, issued_at: &str, req: &FiscalizeRequest) 
         "items": req.items,
         "payments": req.payments,
     })
+}
+
+/// Optional clinic logo for the printed receipt only. It is deliberately not
+/// part of the fiscal item/payment hash or ATK-signed coupon payload.
+pub fn fiscalize_params_with_receipt_logo(
+    sale_id: &str,
+    issued_at: &str,
+    req: &FiscalizeRequest,
+    logo_png_base64: Option<&str>,
+) -> Value {
+    let mut params = fiscalize_params(sale_id, issued_at, req);
+    if let (Some(encoded), Some(object)) = (logo_png_base64, params.as_object_mut()) {
+        object.insert(
+            "receiptLogoPngBase64".to_string(),
+            Value::String(encoded.to_string()),
+        );
+    }
+    params
+}
+
+/// `previewOnly` controls local delivery only; it is excluded from the fiscal
+/// item/payment payload and from the idempotency content hash.
+pub fn fiscalize_params_with_delivery_options(
+    sale_id: &str,
+    issued_at: &str,
+    req: &FiscalizeRequest,
+    logo_png_base64: Option<&str>,
+    preview_only: bool,
+) -> Value {
+    let mut params = fiscalize_params_with_receipt_logo(sale_id, issued_at, req, logo_png_base64);
+    if let Some(object) = params.as_object_mut() {
+        if preview_only {
+            object.insert("previewOnly".to_string(), Value::Bool(true));
+        }
+    }
+    params
 }
 
 /// Rezultati i `fiscalize`, `coupon.return`, `coupon.cancel`.
@@ -754,6 +840,54 @@ mod tests {
         assert!(encode_frame(&vec![0u8; MAX_FRAME_BYTES + 1]).is_err());
         let too_big = ((MAX_FRAME_BYTES + 1) as u32).to_le_bytes();
         assert_eq!(decode_frame_len(too_big).unwrap_err().code, "PROTOCOL");
+    }
+
+    #[test]
+    fn receipt_logo_is_optional_display_metadata_on_fiscalize_request() {
+        let req = FiscalizeRequest {
+            items: Vec::new(),
+            payments: Vec::new(),
+            total_cents: 0,
+        };
+        let without_logo =
+            fiscalize_params_with_receipt_logo("s1", "2026-10-15T10:00:00+02:00", &req, None);
+        assert!(without_logo.get("receiptLogoPngBase64").is_none());
+        let with_logo = fiscalize_params_with_receipt_logo(
+            "s1",
+            "2026-10-15T10:00:00+02:00",
+            &req,
+            Some("iVBORw0KGgo="),
+        );
+        assert_eq!(with_logo["receiptLogoPngBase64"], "iVBORw0KGgo=");
+        assert_eq!(with_logo["items"], without_logo["items"]);
+        assert_eq!(with_logo["payments"], without_logo["payments"]);
+    }
+
+    #[test]
+    fn preview_only_is_optional_delivery_metadata() {
+        let req = FiscalizeRequest {
+            items: Vec::new(),
+            payments: Vec::new(),
+            total_cents: 0,
+        };
+        let physical = fiscalize_params_with_delivery_options(
+            "s1",
+            "2026-10-15T10:00:00+02:00",
+            &req,
+            None,
+            false,
+        );
+        let preview = fiscalize_params_with_delivery_options(
+            "s1",
+            "2026-10-15T10:00:00+02:00",
+            &req,
+            None,
+            true,
+        );
+        assert!(physical.get("previewOnly").is_none());
+        assert_eq!(preview["previewOnly"], true);
+        assert_eq!(preview["items"], physical["items"]);
+        assert_eq!(preview["payments"], physical["payments"]);
     }
 
     #[test]
@@ -832,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn vat_mapping_defaults_and_overrides() {
+    fn vat_mapping_uses_fixed_atk_rates_and_ignores_legacy_overrides() {
         let r = VatRates::default();
         assert_eq!(r.rate_for_code("A"), 0);
         assert_eq!(r.rate_for_code("c"), 0);
@@ -845,9 +979,7 @@ mod tests {
             "sef_vat_rate_a" => Some("101".to_string()),
             _ => None,
         });
-        assert_eq!(o.e, 17);
-        assert_eq!(o.d, 8);
-        assert_eq!(o.a, 0);
+        assert_eq!(o, VatRates::default());
     }
 
     fn line(id: &str, qty: f64, price: f64, vat: &str) -> SaleLine {
@@ -888,30 +1020,25 @@ mod tests {
     }
 
     #[test]
-    fn single_payment_when_mismatch_or_none() {
+    fn mismatched_or_missing_payments_are_rejected() {
         let lines = [line("1", 1.0, 30.0, "C")];
-        // pagesë e pjesshme → një pagesë me totalin, metoda e pagesës më të madhe
-        let r = build_fiscalize_request(
+        // Pagesa e pjesshme nuk shndërrohet në pagesë të plotë me një metodë tjetër.
+        assert!(build_fiscalize_request(
             &lines,
             &[pay("bank", 20.0), pay("cash", 5.0)],
             &VatRates::default(),
         )
-        .unwrap();
-        assert_eq!(r.payments.len(), 1);
-        assert_eq!(r.payments[0].method, "transfer");
-        assert_eq!(r.payments[0].amount_cents, 3000);
-        // pa pagesa → cash
-        let r = build_fiscalize_request(&lines, &[], &VatRates::default()).unwrap();
-        assert_eq!(r.payments[0].method, "cash");
-        assert_eq!(r.payments[0].amount_cents, 3000);
-        // pagesa negative/zero injorohen
-        let r = build_fiscalize_request(
+        .is_err());
+        assert!(build_fiscalize_request(&lines, &[], &VatRates::default()).is_err());
+        assert!(build_fiscalize_request(
             &lines,
             &[pay("card", 0.0), pay("card", -5.0)],
             &VatRates::default(),
         )
-        .unwrap();
-        assert_eq!(r.payments[0].method, "cash");
+        .is_err());
+        assert!(
+            build_fiscalize_request(&lines, &[pay("cash", 30.01)], &VatRates::default(),).is_err()
+        );
     }
 
     #[test]
@@ -922,7 +1049,7 @@ mod tests {
             line("3", 3.0, 0.1, "E"),
         ];
         let r =
-            build_fiscalize_request(&lines, &[pay("cash", 100.0)], &VatRates::default()).unwrap();
+            build_fiscalize_request(&lines, &[pay("cash", 2.06)], &VatRates::default()).unwrap();
         // 0.5×333=166.5→167, 1.333×7=9.331→9, 3×10=30 → 206
         assert_eq!(r.total_cents, 206);
         assert_eq!(r.payments[0].amount_cents, 206);
@@ -930,32 +1057,78 @@ mod tests {
     }
 
     #[test]
-    fn invalid_lines_follow_enternet_rules() {
-        let r = build_fiscalize_request(
-            &[line("1", 0.0, -4.0, "A"), line("2", f64::NAN, 5.0, "")],
-            &[],
+    fn invalid_fiscal_lines_are_rejected_without_rewriting_values() {
+        assert!(build_fiscalize_request(
+            &[line("1", 0.0, 4.0, "A")],
+            &[pay("cash", 4.0)],
             &VatRates::default(),
         )
-        .unwrap();
-        assert_eq!(r.items[0].qty, "1");
-        assert_eq!(r.items[0].unit_price_cents, 0);
-        assert_eq!(r.items[1].qty, "1");
-        assert_eq!(r.total_cents, 500);
+        .is_err());
+        assert!(build_fiscalize_request(
+            &[line("1", 1.0, -4.0, "A")],
+            &[pay("cash", 4.0)],
+            &VatRates::default(),
+        )
+        .is_err());
+        assert!(build_fiscalize_request(
+            &[line("1", f64::NAN, 5.0, "D")],
+            &[pay("cash", 5.0)],
+            &VatRates::default(),
+        )
+        .is_err());
+        assert!(build_fiscalize_request(
+            &[line("1", 1.2345, 5.0, "D")],
+            &[pay("cash", 6.17)],
+            &VatRates::default(),
+        )
+        .is_err());
+        assert!(build_fiscalize_request(
+            &[line("1", 1.0, 5.0, "?")],
+            &[pay("cash", 5.0)],
+            &VatRates::default(),
+        )
+        .is_err());
+        assert!(build_fiscalize_request(
+            &[line("1", 1.0, 5.0, "D")],
+            &[pay("cash", 5.0)],
+            &VatRates::default(),
+        )
+        .is_ok());
+        assert!(build_fiscalize_request(
+            &[line("1", 1.0, 5.0, "D")],
+            &[pay("", 5.0)],
+            &VatRates::default(),
+        )
+        .is_err());
+        let mut blank_title = line("1", 1.0, 5.0, "D");
+        blank_title.title.clear();
+        assert!(
+            build_fiscalize_request(&[blank_title], &[pay("cash", 5.0)], &VatRates::default(),)
+                .is_err()
+        );
         assert!(build_fiscalize_request(&[], &[], &VatRates::default()).is_err());
     }
 
     #[test]
     fn check_sums_detects_mismatch() {
-        let mut r = build_fiscalize_request(&[line("1", 1.0, 5.0, "A")], &[], &VatRates::default())
-            .unwrap();
+        let mut r = build_fiscalize_request(
+            &[line("1", 1.0, 5.0, "A")],
+            &[pay("cash", 5.0)],
+            &VatRates::default(),
+        )
+        .unwrap();
         r.payments[0].amount_cents += 1;
         assert!(check_sums(&r).is_err());
     }
 
     #[test]
     fn fiscalize_params_shape() {
-        let r = build_fiscalize_request(&[line("vi-1", 1.0, 25.0, "D")], &[], &VatRates::default())
-            .unwrap();
+        let r = build_fiscalize_request(
+            &[line("vi-1", 1.0, 25.0, "D")],
+            &[pay("cash", 25.0)],
+            &VatRates::default(),
+        )
+        .unwrap();
         let p = fiscalize_params("sale-1", "2026-10-15T10:00:00+02:00", &r);
         assert_eq!(p["source"], "mjeku");
         assert_eq!(p["saleId"], "sale-1");
@@ -1019,7 +1192,7 @@ mod tests {
                 let session = Session::from_values(Some(name), Some("tok".into()), None).unwrap();
                 let req = build_fiscalize_request(
                     &[line("vi-1", 1.0, 25.0, "D")],
-                    &[],
+                    &[pay("cash", 25.0)],
                     &VatRates::default(),
                 )
                 .unwrap();
@@ -1109,21 +1282,46 @@ mod tests {
     #[test]
     fn capability_only_on_supported_platforms() {
         let caps = capabilities();
-        if cfg!(any(target_os = "windows", target_os = "android")) {
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                caps,
+                vec![
+                    CAPABILITY_BRIDGE_V1.to_string(),
+                    CAPABILITY_BUSINESS_SETTINGS.to_string(),
+                    CAPABILITY_WINDOWS_PRINTER_LIST.to_string(),
+                    CAPABILITY_COUPON_PREVIEW.to_string(),
+                    CAPABILITY_COUPON_PREVIEW_DELIVERY.to_string(),
+                    CAPABILITY_COUPON_EMAIL.to_string(),
+                    CAPABILITY_ATK_ACCESS_WINDOW.to_string(),
+                ]
+            );
+        } else if cfg!(target_os = "android") {
             assert_eq!(caps, vec![CAPABILITY_BRIDGE_V1.to_string()]);
         } else {
             assert!(caps.is_empty());
         }
         assert_eq!(CAPABILITY_BRIDGE_V1, "sef_programeri_bridge_v1");
+        assert_eq!(CAPABILITY_BUSINESS_SETTINGS, "sef_business_settings_v1");
+        assert_eq!(CAPABILITY_WINDOWS_PRINTER_LIST, "windows_printer_list");
+        assert_eq!(CAPABILITY_COUPON_PREVIEW, "coupon_preview_v1");
+        assert_eq!(
+            CAPABILITY_COUPON_PREVIEW_DELIVERY,
+            "coupon_preview_delivery_v1"
+        );
+        assert_eq!(CAPABILITY_COUPON_EMAIL, "coupon_email_v1");
+        assert_eq!(CAPABILITY_ATK_ACCESS_WINDOW, "atk_access_window_v1");
     }
 
     #[test]
     fn payment_method_mapping() {
-        assert_eq!(map_payment_method("cash"), "cash");
-        assert_eq!(map_payment_method("CARD"), "card");
-        assert_eq!(map_payment_method("bank"), "transfer");
-        assert_eq!(map_payment_method("other"), "other");
-        assert_eq!(map_payment_method("cheque"), "other");
-        assert_eq!(map_payment_method(""), "cash");
+        assert_eq!(map_payment_method("cash").unwrap(), "cash");
+        assert_eq!(map_payment_method("CARD").unwrap(), "card");
+        assert_eq!(map_payment_method("bank").unwrap(), "transfer");
+        assert_eq!(map_payment_method("other").unwrap(), "other");
+        assert_eq!(map_payment_method("cheque").unwrap(), "other");
+        assert_eq!(map_payment_method("coupon").unwrap(), "other");
+        assert_eq!(map_payment_method("cryptocurrency").unwrap(), "other");
+        assert!(map_payment_method("").is_err());
+        assert!(map_payment_method("unknown").is_err());
     }
 }

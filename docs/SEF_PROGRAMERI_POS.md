@@ -1,5 +1,16 @@
 # SEF (PROGRAMERI POS) te Mjeku
 
+## UI e ores fiskale ATK (2026-10-28)
+
+Faqja **Kuponët SEF** lexon nga ura lokale e PROGRAMERI POS nëse ora fiskale është ankoruar nga ATK
+për nisjen aktuale, paraqet kohën e besueshme dhe dallimin ndaj orës lokale. Butoni **Sinkronizo orën
+nga ATK** kërkon një përgjigje të freskët të shërbimit të orës së ATK-së përmes motorit ekzistues të
+POS-it. Ky veprim nuk ndryshon orën e Windows-it, nuk krijon kupon dhe nuk rezervon timestamp fiskal.
+Pas rinisjes, ankora e boot-it të kaluar paraqitet si e pavlefshme derisa POS të verifikojë kohën sërish.
+
+Kjo ndërfaqe mbetet vetëm për Windows desktop; Mjeku Android/macOS/iOS ende nuk ka transport funksional
+me bridge-in e PROGRAMERI POS.
+
 Statusi: kodi është shkruar (Faza 2 dhe 3 të planit); **nuk është ndërtuar si aplikacion i plotë dhe nuk është provuar me PROGRAMERI POS**. Shih "Çfarë është provuar".
 
 Kontrata e thirrjeve: `pos-native-windows/docs/MJEKU_SEF_BRIDGE_CONTRACT.md` (v1).
@@ -70,13 +81,13 @@ Kujdes: pas një gabimi lidhjeje ose kohe, ekrani ekzistues i fiskalizimit ofron
 
 ### Aftësia `sef_programeri_bridge_v1` (UI ↔ binari)
 
-`get_app_info` kthen fushën e re `capabilities: string[]`. Binari i ri raporton `["sef_programeri_bridge_v1"]` në Windows/Android dhe `[]` në macOS/iOS. UI-ja e re (`hasSefBridge(info)` te `api/types.ts`) shfaq zgjedhjen SEF (PROGRAMERI POS), fushat "TVSH për SEF", menunë/faqen **Kuponët** (me banerin Online/Offline/48h) dhe thërret `sef_bridge_info` **vetëm** kur aftësia ekziston. Pa të (binar i vjetër që s'e ka fushën), UI-ja e re sillet saktësisht si UI-ja e sotme: asnjë zgjedhje e re, asnjë faqe e re, asnjë thirrje e komandave të reja.
+`get_app_info` kthen fushën `capabilities: string[]`. Binari raporton `["sef_programeri_bridge_v1"]` në Windows/Android dhe `[]` në macOS/iOS; `coupon_preview_v1` dhe `coupon_preview_delivery_v1` raportohen vetëm në Windows. UI-ja (`hasSefBridge(info)` te `api/types.ts`) shfaq zgjedhjen SEF, fushat "TVSH për SEF" dhe faqen **Kuponët**. Print Preview i kopjes ekzistuese kërkon `coupon_preview_v1`; zgjedhja **Print Preview (pa printim fizik)** për shitje, kthim dhe anulim shfaqet vetëm kur edhe binari i Mjekut, edhe POS-i raportojnë `coupon_preview_delivery_v1`, që UI-ja e re të mos e ofrojë në binarët e vjetër. Android vazhdon me radhën fiskale/printerin ekzistues; print preview brenda Mjekut mbetet GAP në Android, macOS dhe iOS/iPadOS.
 
 ### Skedarët
 
 | Skedari | Çfarë |
 | --- | --- |
-| `src-tauri/src/sef_bridge.rs` | Klienti i urës: seanca nga env, kornizimi 4 bajt LE + JSON (maks. 1 MiB), mbështjellja `v/id/token/op/params`, transporti named pipe (Windows), stub Android, cent/TVSH/pagesat, teste. |
+| `src-tauri/src/sef_bridge.rs` | Klienti i urës: seanca nga env, kornizimi 4 bajt LE + JSON (maks. 4 MiB për PNG-në e kuponit), mbështjellja `v/id/token/op/params`, transporti named pipe (Windows), stub Android, cent/TVSH/pagesat, teste. |
 | `src-tauri/src/lib.rs` | `normalize_fiscal_printer_provider` (+`sef_programeri`), mbrojtja te `settings_set`, degët SEF te `invoice_export_fiscal_inp`, `fiscal_report_x_inp`, `fiscal_report_z_inp`, `fiscal_job_process_inner`; komandat e reja. |
 | `src-tauri/src/models.rs` | `AppInfo.capabilities` (`#[serde(default)]`). |
 | `src-tauri/src/db.rs` | Kolonat lokale te `sales`; `sef_collect_sale`, `sef_mark_fiscalized`, `sef_sale_coupon`. |
@@ -95,9 +106,10 @@ Rruga ENTERNET (`fiscal_receipt_generate_inp`, `C:\Temp`, `.inp/.out`) nuk ësht
 | `invoice_export_fiscal_inp` (ekzistuese) | `fiscalize` | financa |
 | `fiscal_report_x_inp` / `fiscal_report_z_inp` (ekzistuese) | `report.x` / `report.z` (data e sotme) | financa |
 | `sef_coupons_list` | `coupons.list` (`from`/`to` opsionale) | financa + motori SEF |
+| `sef_coupon_preview` | `coupon.preview` (imazhi origjinal i kuponit me QR, vetëm lexim) | financa + motori SEF + capability Windows |
 | `sef_coupon_copy` | `coupon.copy` | financa + motori SEF |
-| `sef_coupon_return` | `coupon.return` (artikujt `{id, qty}`, arsyeja) | financa + motori SEF |
-| `sef_coupon_cancel` | `coupon.cancel` (arsyeja) | financa + motori SEF |
+| `sef_coupon_return` | `coupon.return` (artikujt `{id, qty}`, arsyeja, `previewOnly` opsionale) | financa + motori SEF |
+| `sef_coupon_cancel` | `coupon.cancel` (arsyeja, `previewOnly` opsionale) | financa + motori SEF |
 | `sef_report` | `report.x` / `report.z` me tekst të plotë | financa + motori SEF |
 | `sef_sale_items` | — (rreshtat e fiskalizuar të shitjes, për "Kthe") | financa |
 | `sef_sale_coupon` | — (kuponi i ruajtur lokalisht) | financa |
@@ -156,7 +168,7 @@ Cilësimet pranojnë numër të plotë 0–100 (lejohet `%` në fund); bosh ose 
 cargo test --manifest-path src-tauri/Cargo.toml sef_bridge
 ```
 
-Testet mbulojnë kornizimin (LE, kufiri 1 MiB), mbështjelljen, përgjigjet ok/gabim/id/version, variablat e seancës, centët, sasitë, totalet e rreshtave, TVSH-në me mbishkrime, pagesat (përputhje, mospërputhje, pa pagesa), kontrollin e shumave, formën e `fiscalize`, dhe në Windows një server named pipe të vërtetë: roundtrip, pipe që mungon (`NOT_RUNNING`), server i heshtur (`TIMEOUT`), dhe thirrja nga `spawn_blocking` me runtime të ri (si te `lib.rs`).
+Testet mbulojnë kornizimin (LE, kufiri 4 MiB), mbështjelljen, përgjigjet ok/gabim/id/version, variablat e seancës, centët, sasitë, totalet e rreshtave, TVSH-në me mbishkrime, pagesat (përputhje, mospërputhje, pa pagesa), kontrollin e shumave, formën e `fiscalize`, dhe në Windows një server named pipe të vërtetë: roundtrip, pipe që mungon (`NOT_RUNNING`), server i heshtur (`TIMEOUT`), dhe thirrja nga `spawn_blocking` me runtime të ri (si te `lib.rs`).
 
 ### Me PROGRAMERI POS (ambient TEST)
 

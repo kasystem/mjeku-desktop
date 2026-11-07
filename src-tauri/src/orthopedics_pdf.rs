@@ -1,13 +1,13 @@
 //! Native, versioned orthopedic PDF renderer (A4).
 //! This document is generated from an immutable saved clinical-report version,
 //! never from a screenshot of the React WebView.
-use std::io::{BufWriter, Cursor};
 use anyhow::{Context, Result};
 use printpdf::{
     BuiltinFont, Color, Image, ImageTransform, IndirectFontRef, Mm, PdfDocument,
     PdfDocumentReference, PdfLayerReference, Rgb,
 };
 use serde_json::Value;
+use std::io::{BufWriter, Cursor};
 
 const PAGE_WIDTH: f32 = 210.0;
 const PAGE_HEIGHT: f32 = 297.0;
@@ -19,7 +19,11 @@ fn value<'a>(obj: &'a Value, key: &str) -> &'a str {
 }
 fn field(obj: &Value, key: &str, display: &str) -> Option<String> {
     let s = value(obj, key).trim();
-    if !s.is_empty() { Some(format!("{display}: {s}")) } else { None }
+    if !s.is_empty() {
+        Some(format!("{display}: {s}"))
+    } else {
+        None
+    }
 }
 fn report_type(kind: &str) -> &str {
     match kind {
@@ -35,8 +39,13 @@ fn report_type(kind: &str) -> &str {
     }
 }
 fn side_name(s: &str) -> &str {
-    match s { "right"=>"Djathtas", "left"=>"Majtas", "bilateral"=>"Dyaneshem",
-        "midline"=>"Ne vije te mesme", _=>s }
+    match s {
+        "right" => "Djathtas",
+        "left" => "Majtas",
+        "bilateral" => "Dyaneshem",
+        "midline" => "Ne vije te mesme",
+        _ => s,
+    }
 }
 
 // Explicit line breaking and pagination prevent the report from being cropped
@@ -57,16 +66,22 @@ impl ReportPage {
             self.layer = self.doc.get_page(page).get_layer(layer);
             self.page_no += 1;
             self.y = 277.0;
-            self.layer.set_fill_color(Color::Rgb(Rgb::new(0.10, 0.48, 0.53, None)));
+            self.layer
+                .set_fill_color(Color::Rgb(Rgb::new(0.10, 0.48, 0.53, None)));
             self.layer.use_text(
                 format!("PROGRAMERI POS   |   Ortopedi   |   Faqe {}", self.page_no),
-                8.0, Mm(LEFT), Mm(284.0), &self.bold
+                8.0,
+                Mm(LEFT),
+                Mm(284.0),
+                &self.bold,
             );
         }
         let text = text.trim_end_matches(['\r', '\n']);
         let font = if is_bold { &self.bold } else { &self.regular };
-        self.layer.set_fill_color(Color::Rgb(Rgb::new(0.12, 0.19, 0.24, None)));
-        self.layer.use_text(text, font_size, Mm(LEFT), Mm(self.y), font);
+        self.layer
+            .set_fill_color(Color::Rgb(Rgb::new(0.12, 0.19, 0.24, None)));
+        self.layer
+            .use_text(text, font_size, Mm(LEFT), Mm(self.y), font);
         self.y -= if font_size >= 12.0 { 7.4 } else { 5.5 };
     }
 
@@ -88,11 +103,15 @@ impl ReportPage {
                         self.line(&row, font_size, false);
                         row.clear();
                     }
-                    if !row.is_empty() { row.push(' '); }
+                    if !row.is_empty() {
+                        row.push(' ');
+                    }
                     row.push_str(&segment);
                 }
             }
-            if !row.is_empty() { self.line(&row, font_size, false); }
+            if !row.is_empty() {
+                self.line(&row, font_size, false);
+            }
         }
     }
 
@@ -112,16 +131,29 @@ fn chunks(text: &str, max: usize) -> Vec<String> {
             pieces.push(std::mem::take(&mut tmp));
         }
     }
-    if !tmp.is_empty() { pieces.push(tmp); }
+    if !tmp.is_empty() {
+        pieces.push(tmp);
+    }
     pieces
 }
 
-fn render_entries(page: &mut ReportPage, body: &Value, name: &str, heading: &str, fields: &[(&str, &str)]) {
-    let Some(rows) = body.get(name).and_then(Value::as_array) else { return; };
-    if rows.is_empty() { return; }
+fn render_entries(
+    page: &mut ReportPage,
+    body: &Value,
+    name: &str,
+    heading: &str,
+    fields: &[(&str, &str)],
+) {
+    let Some(rows) = body.get(name).and_then(Value::as_array) else {
+        return;
+    };
+    if rows.is_empty() {
+        return;
+    }
     page.section(heading);
     for (i, row) in rows.iter().enumerate() {
-        let parts: Vec<String> = fields.iter()
+        let parts: Vec<String> = fields
+            .iter()
             .filter_map(|(field_name, label)| field(row, field_name, label))
             .collect();
         page.wrapped(&format!("{}. {}", i + 1, parts.join("  |  ")), 9.0);
@@ -136,13 +168,20 @@ pub fn render_orthopedic_pdf(report: &Value, clinic_name: &str) -> Result<Vec<u8
     let body_json = value(report, "body_json");
     let body: Value = serde_json::from_str(body_json).context("parse saved clinical report")?;
     let (doc, p, l) = PdfDocument::new(
-        "Raport ortopedik - PROGRAMERI POS", Mm(PAGE_WIDTH), Mm(PAGE_HEIGHT), "Raport"
+        "Raport ortopedik - PROGRAMERI POS",
+        Mm(PAGE_WIDTH),
+        Mm(PAGE_HEIGHT),
+        "Raport",
     );
     let regular = doc.add_builtin_font(BuiltinFont::Helvetica)?;
     let bold = doc.add_builtin_font(BuiltinFont::HelveticaBold)?;
     let mut page = ReportPage {
         layer: doc.get_page(p).get_layer(l),
-        doc, regular, bold, y: 274.0, page_no: 1,
+        doc,
+        regular,
+        bold,
+        y: 274.0,
+        page_no: 1,
     };
 
     // Authentic POS identity from the application's existing source repository.
@@ -156,20 +195,31 @@ pub fn render_orthopedic_pdf(report: &Value, clinic_name: &str) -> Result<Vec<u8
                 // The original POS artwork has wide transparent margins;
                 // scale the full PNG larger so the actual emblem is legible.
                 let side_mm = 35.0;
-                img.add_to_layer(page.layer.clone(), ImageTransform {
-                    translate_x: Some(Mm(10.0)),
-                    translate_y: Some(Mm(254.0)),
-                    rotate: None,
-                    scale_x: Some(side_mm * dpi / (w_px * 25.4)),
-                    scale_y: Some(side_mm * dpi / (h_px * 25.4)),
-                    dpi: Some(dpi),
-                });
+                img.add_to_layer(
+                    page.layer.clone(),
+                    ImageTransform {
+                        translate_x: Some(Mm(10.0)),
+                        translate_y: Some(Mm(254.0)),
+                        rotate: None,
+                        scale_x: Some(side_mm * dpi / (w_px * 25.4)),
+                        scale_y: Some(side_mm * dpi / (h_px * 25.4)),
+                        dpi: Some(dpi),
+                    },
+                );
             }
         }
     }
-    page.layer.set_fill_color(Color::Rgb(Rgb::new(0.03, 0.55, 0.60, None)));
-    page.layer.use_text("PROGRAMERI POS", 14.0, Mm(44.0), Mm(279.0), &page.bold);
-    page.layer.use_text("ORTOPEDI & TRAUMATOLOGJI", 8.5, Mm(44.0), Mm(271.0), &page.regular);
+    page.layer
+        .set_fill_color(Color::Rgb(Rgb::new(0.03, 0.55, 0.60, None)));
+    page.layer
+        .use_text("PROGRAMERI POS", 14.0, Mm(44.0), Mm(279.0), &page.bold);
+    page.layer.use_text(
+        "ORTOPEDI & TRAUMATOLOGJI",
+        8.5,
+        Mm(44.0),
+        Mm(271.0),
+        &page.regular,
+    );
     page.y = 254.0;
     let title = report_type(value(report, "type"));
     page.line(&format!("RAPORT KLINIK: {}", title), 13.0, true);
@@ -177,65 +227,143 @@ pub fn render_orthopedic_pdf(report: &Value, clinic_name: &str) -> Result<Vec<u8
     if !clinic_name.trim().is_empty() {
         page.wrapped(&format!("Institucioni: {}", clinic_name.trim()), 9.5);
     }
-    page.wrapped(&format!("Pacienti: {}", value(report, "patient_name")), 10.0);
+    page.wrapped(
+        &format!("Pacienti: {}", value(report, "patient_name")),
+        10.0,
+    );
     let code = value(report, "patient_code");
-    if !code.is_empty() { page.wrapped(&format!("Kodi i pacientit: {}", code), 9.5); }
+    if !code.is_empty() {
+        page.wrapped(&format!("Kodi i pacientit: {}", code), 9.5);
+    }
     page.wrapped(&format!("Diagnoza: {}", value(report, "diagnosis")), 10.0);
-    page.wrapped(&format!(
-        "Regjioni: {}  |  Ana: {}  |  Episodi: {}",
-        value(report, "region"), side_name(value(report, "laterality")),
-        value(report, "episode_id")
-    ), 9.0);
-    page.wrapped(&format!(
-        "Versioni: {}  |  Statusi: {}  |  Data: {}",
-        report["version"].as_i64().unwrap_or(0),
-        value(report, "status").to_uppercase(), value(report, "created_at")
-    ), 9.0);
+    page.wrapped(
+        &format!(
+            "Regjioni: {}  |  Ana: {}  |  Episodi: {}",
+            value(report, "region"),
+            side_name(value(report, "laterality")),
+            value(report, "episode_id")
+        ),
+        9.0,
+    );
+    page.wrapped(
+        &format!(
+            "Versioni: {}  |  Statusi: {}  |  Data: {}",
+            report["version"].as_i64().unwrap_or(0),
+            value(report, "status").to_uppercase(),
+            value(report, "created_at")
+        ),
+        9.0,
+    );
     if value(report, "status") == "draft" {
         page.line("DRAFT - DOKUMENT I PAFINALIZUAR", 10.0, true);
     }
     if value(report, "status") == "amendment" {
-        page.wrapped(&format!("ARSYEJA E AMENDAMENTIT: {}", value(report, "reason")), 9.5);
+        page.wrapped(
+            &format!("ARSYEJA E AMENDAMENTIT: {}", value(report, "reason")),
+            9.5,
+        );
     }
 
     page.section("GJETJET KLINIKE / PERFUNDIMI");
     let narrative = value(&body, "narrative");
-    page.wrapped(if narrative.trim().is_empty() { "Nuk ka pershkrim klinik ne versionin e ruajtur." } else { narrative }, 9.5);
+    page.wrapped(
+        if narrative.trim().is_empty() {
+            "Nuk ka pershkrim klinik ne versionin e ruajtur."
+        } else {
+            narrative
+        },
+        9.5,
+    );
 
-    render_entries(&mut page, &body, "fractures", "FRAKTURAT", &[
-        ("boneRegion","Kocka"), ("laterality","Ana"), ("segment","Segmenti"),
-        ("classification","Klasifikimi"), ("currentStatus","Statusi"),
-        ("treatmentStrategy","Trajtimi")
-    ]);
-    render_entries(&mut page, &body, "assessments", "VLERESIMET", &[
-        ("category","Tipi"), ("joint","Nyja"), ("movement","Levizja"),
-        ("degrees","Grade"), ("pain","Dhimbja"), ("testName","Testi"),
-        ("testResult","Rezultati"), ("note","Shenimi")
-    ]);
-    render_entries(&mut page, &body, "operations", "NDERHYRJET OPERATIVE", &[
-        ("actual_procedure","Procedura"), ("operative_site","Regjioni"),
-        ("laterality","Ana"), ("operative_note","Raporti"),
-        ("surgeon_id","Kirurgu"), ("finalized_at","Data")
-    ]);
-    render_entries(&mut page, &body, "implants", "IMPLANTET", &[
-        ("manufacturer","Prodhuesi"), ("model","Modeli"), ("lot","Lot"),
-        ("serial","Serial"), ("status","Statusi"), ("removalStatus","Gjendja")
-    ]);
-    render_entries(&mut page, &body, "rehab", "REHABILITIMI", &[
-        ("protocol","Protokolli"), ("phase","Faza"),
-        ("loadRestrictions","Ngarkesa"), ("romRestrictions","ROM")
-    ]);
+    render_entries(
+        &mut page,
+        &body,
+        "fractures",
+        "FRAKTURAT",
+        &[
+            ("boneRegion", "Kocka"),
+            ("laterality", "Ana"),
+            ("segment", "Segmenti"),
+            ("classification", "Klasifikimi"),
+            ("currentStatus", "Statusi"),
+            ("treatmentStrategy", "Trajtimi"),
+        ],
+    );
+    render_entries(
+        &mut page,
+        &body,
+        "assessments",
+        "VLERESIMET",
+        &[
+            ("category", "Tipi"),
+            ("joint", "Nyja"),
+            ("movement", "Levizja"),
+            ("degrees", "Grade"),
+            ("pain", "Dhimbja"),
+            ("testName", "Testi"),
+            ("testResult", "Rezultati"),
+            ("note", "Shenimi"),
+        ],
+    );
+    render_entries(
+        &mut page,
+        &body,
+        "operations",
+        "NDERHYRJET OPERATIVE",
+        &[
+            ("actual_procedure", "Procedura"),
+            ("operative_site", "Regjioni"),
+            ("laterality", "Ana"),
+            ("operative_note", "Raporti"),
+            ("surgeon_id", "Kirurgu"),
+            ("finalized_at", "Data"),
+        ],
+    );
+    render_entries(
+        &mut page,
+        &body,
+        "implants",
+        "IMPLANTET",
+        &[
+            ("manufacturer", "Prodhuesi"),
+            ("model", "Modeli"),
+            ("lot", "Lot"),
+            ("serial", "Serial"),
+            ("status", "Statusi"),
+            ("removalStatus", "Gjendja"),
+        ],
+    );
+    render_entries(
+        &mut page,
+        &body,
+        "rehab",
+        "REHABILITIMI",
+        &[
+            ("protocol", "Protokolli"),
+            ("phase", "Faza"),
+            ("loadRestrictions", "Ngarkesa"),
+            ("romRestrictions", "ROM"),
+        ],
+    );
 
     page.y -= 5.0;
     page.section("AUTORIZIMI DHE GJURMUESHMERIA");
     page.wrapped(&format!("Autori (ID): {}", value(report, "author_id")), 9.5);
-    page.wrapped(&format!("ID raporti: {}  |  Versioni i ruajtur: {}", id,
-        report["version"].as_i64().unwrap_or(0)), 8.0);
+    page.wrapped(
+        &format!(
+            "ID raporti: {}  |  Versioni i ruajtur: {}",
+            id,
+            report["version"].as_i64().unwrap_or(0)
+        ),
+        8.0,
+    );
     page.wrapped("Dokumenti eshte gjeneruar nga versioni i ruajtur ne databazen klinike. Nuk eshte kopje e ekranit.", 8.0);
 
     let mut buf = BufWriter::new(Cursor::new(Vec::<u8>::new()));
     page.doc.save(&mut buf).context("encode orthopedic PDF")?;
-    let cursor = buf.into_inner().map_err(|e| anyhow::anyhow!("flush orthopedic PDF: {e}"))?;
+    let cursor = buf
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("flush orthopedic PDF: {e}"))?;
     Ok(cursor.into_inner())
 }
 
@@ -256,7 +384,7 @@ mod tests {
         });
         let bytes = render_orthopedic_pdf(&report, "Test Clinic").unwrap();
         assert!(bytes.starts_with(b"%PDF-"));
-        assert!(bytes.windows(5).any(|w| w==b"%%EOF"));
-        assert!(bytes.len()>1500);
+        assert!(bytes.windows(5).any(|w| w == b"%%EOF"));
+        assert!(bytes.len() > 1500);
     }
 }

@@ -419,8 +419,17 @@ impl LicenseEngine {
         self.db.setting_set(KEY_LICENSE_LAST_CHECKED_AT, &now)?;
 
         // Save departments from registry (comma-separated or JSON, default to stomatologji)
-        let depts = row.departments.as_deref().unwrap_or("stomatologji").trim().to_string();
-        let depts = if depts.is_empty() { "stomatologji".to_string() } else { depts };
+        let depts = row
+            .departments
+            .as_deref()
+            .unwrap_or("stomatologji")
+            .trim()
+            .to_string();
+        let depts = if depts.is_empty() {
+            "stomatologji".to_string()
+        } else {
+            depts
+        };
         self.db.setting_set(KEY_LICENSED_DEPARTMENTS, &depts)?;
 
         let mut ok = true;

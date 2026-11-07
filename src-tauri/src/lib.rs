@@ -1,14 +1,14 @@
-mod auth;
 mod atk_catalog;
+mod auth;
 mod db;
 mod desktop_updates;
 mod error_logs;
 mod invoice;
-mod orthopedics_pdf;
-mod physiotherapy_pdf;
 mod lab_devices;
 mod license_engine;
 mod models;
+mod orthopedics_pdf;
+mod physiotherapy_pdf;
 mod sef_bridge;
 mod sync_engine;
 mod ui_protocol;
@@ -18,13 +18,15 @@ mod util;
 use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
-use chrono::Utc;
-use chrono::Duration as ChronoDuration;
 use chrono::Datelike;
+use chrono::Duration as ChronoDuration;
+use chrono::Utc;
+use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
 #[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
@@ -34,16 +36,31 @@ use crate::db::Db;
 use crate::license_engine::LicenseEngine;
 use crate::models::{
     AppInfo, Appointment, AppointmentUpsertInput, AppointmentsListFilters, CashEntry,
-    CashEntryUpsertInput, CashListFilters, Client, ClientPhoto, ClientUpsertInput, DailySalesReport, Doctor,
-    DoctorLoginOption, DoctorUpsertInput, Payment, PaymentUpsertInput, PaymentsListFilters, Sale,
-    SaleUpsertInput, SalesListFilters, Service, ServiceUpsertInput, Visit, VisitItem,
-    VisitItemUpsertInput, VisitItemsListFilters, VisitUpsertInput, VisitsListFilters,
+    CashEntryUpsertInput, CashListFilters, Client, ClientPhoto, ClientUpsertInput,
+    DailySalesReport, Doctor, DoctorLoginOption, DoctorUpsertInput, Payment, PaymentUpsertInput,
+    PaymentsListFilters, Sale, SaleUpsertInput, SalesListFilters, Service, ServiceUpsertInput,
+    Visit, VisitItem, VisitItemUpsertInput, VisitItemsListFilters, VisitUpsertInput,
+    VisitsListFilters,
 };
 use crate::sync_engine::SyncEngine;
 use crate::updates::UpdatesEngine;
 
 const FISCAL_PRINTER_PROVIDER_KEY: &str = "fiscal_printer_provider";
 const SEF_PRINTER_NAME_KEY: &str = "sef_printer_name";
+const MSG_PEF_ONLY_REPORTS: &str =
+    "Raportet X/Z janë vetëm për PEF/printer fiskal; SEF nuk ka raporte X/Z.";
+const CENTRAL_BUSINESS_SETTING_KEYS: [&str; 10] = [
+    "clinic_name",
+    "clinic_owner_name",
+    "clinic_phone",
+    "clinic_email",
+    "clinic_address",
+    "clinic_city",
+    "clinic_business_no",
+    "clinic_website",
+    "clinic_bank_account",
+    "clinic_vat_registered",
+];
 const KEY_SUPABASE_URL: &str = "supabase_url";
 const KEY_SUPABASE_API_KEY: &str = "supabase_api_key";
 const KEY_SUPABASE_ANON_KEY: &str = "supabase_anon_key";
@@ -67,6 +84,9 @@ const TOKEN_MODE_NEW: &str = "new";
 struct AppState {
     db: Arc<Db>,
     auth: Arc<AuthState>,
+    // Granted only after this Mjeku process verifies the fixed ITAdmin account
+    // through its live PROGRAMERI POS bridge. Never persisted in SQLite.
+    pos_itadmin_settings_mode: AtomicBool,
     sync: Arc<SyncEngine>,
     updates: Arc<UpdatesEngine>,
     license: Arc<LicenseEngine>,
@@ -369,6 +389,13 @@ fn require_enternet_for_fiscal(provider: &str) -> Result<(), String> {
     Err("Printeri fiskal nuk është i konfiguruar saktë. Te Cilësimet zgjidh ENTERNET, Global EU ose SEF.".to_string())
 }
 
+fn require_pef_report_provider(provider: &str) -> Result<(), String> {
+    if provider == crate::sef_bridge::PROVIDER_VALUE {
+        return Err(MSG_PEF_ONLY_REPORTS.to_string());
+    }
+    require_enternet_for_fiscal(provider)
+}
+
 fn build_invoice_pdf_bytes_inner(
     db: &Db,
     data_dir: &std::path::Path,
@@ -379,15 +406,17 @@ fn build_invoice_pdf_bytes_inner(
         .setting_get("clinic_name")
         .map_err(err_string)?
         .unwrap_or_else(|| "Klinika".to_string());
-    let header_png: Option<Vec<u8>> = db
-        .setting_get("pdf_header_path")
-        .ok()
-        .flatten()
-        .and_then(|rel| {
-            let rel = rel.trim().to_string();
-            if rel.is_empty() { return None; }
-            std::fs::read(data_dir.join(rel)).ok()
-        });
+    let header_png: Option<Vec<u8>> =
+        db.setting_get("pdf_header_path")
+            .ok()
+            .flatten()
+            .and_then(|rel| {
+                let rel = rel.trim().to_string();
+                if rel.is_empty() {
+                    return None;
+                }
+                std::fs::read(data_dir.join(rel)).ok()
+            });
     let sale = db
         .sales_get(sale_id)
         .map_err(err_string)?
@@ -399,15 +428,17 @@ fn build_invoice_pdf_bytes_inner(
         .clients_get(&sale.client_id)
         .map_err(err_string)?
         .ok_or_else(|| "pacienti nuk u gjet".to_string())?;
-    let logo_png: Option<Vec<u8>> = db
-        .setting_get("clinic_logo_path")
-        .ok()
-        .flatten()
-        .and_then(|rel| {
-            let rel = rel.trim().to_string();
-            if rel.is_empty() { return None; }
-            std::fs::read(data_dir.join(rel)).ok()
-        });
+    let logo_png: Option<Vec<u8>> =
+        db.setting_get("clinic_logo_path")
+            .ok()
+            .flatten()
+            .and_then(|rel| {
+                let rel = rel.trim().to_string();
+                if rel.is_empty() {
+                    return None;
+                }
+                std::fs::read(data_dir.join(rel)).ok()
+            });
     let vis_items = db
         .visit_items_list(Some(crate::models::VisitItemsListFilters {
             visit_id: Some(sale_id.to_string()),
@@ -444,7 +475,11 @@ fn build_invoice_pdf_bytes_inner(
         for ln in &lines {
             let sub = ln.qty * ln.unit_price;
             total += sub;
-            if ln.fiscal { fiscal_total += sub; } else { non_fiscal_total += sub; }
+            if ln.fiscal {
+                fiscal_total += sub;
+            } else {
+                non_fiscal_total += sub;
+            }
         }
     }
     let bank_account = db
@@ -521,7 +556,14 @@ fn print_pdf_to_windows_printer(pdf_bytes: &[u8], printer_name: &str) -> anyhow:
     );
 
     let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
         .status()?;
 
     let _ = std::fs::remove_file(&pdf_path);
@@ -568,11 +610,19 @@ async fn get_app_info(
     Ok(AppInfo {
         version,
         ui_version,
-        sync_status: if state.is_demo_mode { "synced".to_string() } else { sync_status.sync_status },
+        sync_status: if state.is_demo_mode {
+            "synced".to_string()
+        } else {
+            sync_status.sync_status
+        },
         last_sync_time,
         last_sync_error: sync_status.last_sync_error,
         license_ok: state.is_demo_mode || lic.ok,
-        license_status: if state.is_demo_mode { "ok".to_string() } else { lic.status },
+        license_status: if state.is_demo_mode {
+            "ok".to_string()
+        } else {
+            lic.status
+        },
         license_active_until: lic.active_until,
         license_last_checked_at: lic.last_checked_at,
         license_seconds_left,
@@ -594,6 +644,31 @@ async fn auth_get_state(state: tauri::State<'_, AppState>) -> Result<AuthStateIn
         .await
         .map_err(err_string)?
         .map_err(err_string)?;
+    if matches!(session, SessionKind::None)
+        && state.pos_itadmin_settings_mode.load(Ordering::Acquire)
+        && live_pos_itadmin_claim().await
+    {
+        state.auth.set_session(SessionKind::None).await;
+        state.auth.admin_lock().await;
+        let db = state.db.clone();
+        let mut result = tokio::task::spawn_blocking(move || {
+            crate::auth::read_state(&db, false, SessionKind::None)
+        })
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+        result.session.kind = "pos_itadmin".to_string();
+        return Ok(result);
+    }
+    if !matches!(session, SessionKind::None) {
+        state
+            .pos_itadmin_settings_mode
+            .store(false, Ordering::Release);
+    } else if state.pos_itadmin_settings_mode.load(Ordering::Acquire) {
+        state
+            .pos_itadmin_settings_mode
+            .store(false, Ordering::Release);
+    }
     state.auth.set_session(session.clone()).await;
     if matches!(session, SessionKind::None) {
         state.auth.admin_lock().await;
@@ -1106,6 +1181,10 @@ async fn auth_user_logout(state: tauri::State<'_, AppState>) -> Result<(), Strin
         .map_err(err_string)?;
     state.auth.set_session(SessionKind::None).await;
     state.auth.admin_lock().await;
+    state
+        .pos_itadmin_settings_mode
+        .store(false, Ordering::Release);
+    clear_pos_itadmin_claim().await;
     Ok(())
 }
 
@@ -1176,6 +1255,10 @@ async fn auth_doctor_logout(state: tauri::State<'_, AppState>) -> Result<(), Str
         .map_err(err_string)?;
     state.auth.set_session(SessionKind::None).await;
     state.auth.admin_lock().await;
+    state
+        .pos_itadmin_settings_mode
+        .store(false, Ordering::Release);
+    clear_pos_itadmin_claim().await;
     Ok(())
 }
 
@@ -1219,6 +1302,25 @@ async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind
             Ok(s)
         }
     }
+}
+
+async fn require_pos_itadmin_settings(state: &tauri::State<'_, AppState>) -> Result<(), String> {
+    if !state.pos_itadmin_settings_mode.load(Ordering::Acquire) || !live_pos_itadmin_claim().await {
+        state
+            .pos_itadmin_settings_mode
+            .store(false, Ordering::Release);
+        return Err("Kjo cilësim kërkon verifikimin ITAdmin nga PROGRAMERI POS.".to_string());
+    }
+    Ok(())
+}
+
+async fn require_login_or_pos_itadmin_settings(
+    state: &tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if require_login(state).await.is_ok() {
+        return Ok(());
+    }
+    require_pos_itadmin_settings(state).await
 }
 
 async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
@@ -1304,8 +1406,10 @@ async fn require_orthopedic_clinician(
 ) -> Result<SessionKind, String> {
     let session = require_login(state).await?;
     match session {
-        SessionKind::Doctor { .. } |
-        SessionKind::User { role: crate::auth::UserRole::Owner } => Ok(session),
+        SessionKind::Doctor { .. }
+        | SessionKind::User {
+            role: crate::auth::UserRole::Owner,
+        } => Ok(session),
         _ => Err("Kërkohet rol klinik për të dhënat ortopedike.".to_string()),
     }
 }
@@ -1323,87 +1427,148 @@ async fn require_orthopedic_surgeon(
 }
 
 #[tauri::command]
-async fn orthopedic_episodes_list(state: tauri::State<'_, AppState>, client_id: Option<String>) -> Result<Vec<serde_json::Value>, String> {
+async fn orthopedic_episodes_list(
+    state: tauri::State<'_, AppState>,
+    client_id: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.orthopedic_episodes_list(client_id)).await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || db.orthopedic_episodes_list(client_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn orthopedic_episode_upsert(state: tauri::State<'_, AppState>, episode: serde_json::Value) -> Result<(), String> {
+async fn orthopedic_episode_upsert(
+    state: tauri::State<'_, AppState>,
+    episode: serde_json::Value,
+) -> Result<(), String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.orthopedic_episode_upsert(&episode)).await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || db.orthopedic_episode_upsert(&episode))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_episode_transition(
-    state: tauri::State<'_, AppState>, episode_id: String,
-    action: String, reason: String,
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+    action: String,
+    reason: String,
 ) -> Result<serde_json::Value, String> {
     let doctor = match require_orthopedic_surgeon(&state).await? {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
         _ => return Err("Kërkohet mjeku i identifikuar.".to_string()),
     };
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.orthopedic_episode_transition(
-        &episode_id, &action, &reason, &doctor,
-    )).await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_episode_transition(&episode_id, &action, &reason, &doctor)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_episode_transitions_list(
-    state: tauri::State<'_, AppState>, episode_id: String,
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_episode_transitions_list(&episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn orthopedic_surgery_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> {
+async fn orthopedic_surgery_upsert(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<(), String> {
     let status = value["status"].as_str().unwrap_or("draft");
-    if matches!(status, "approved" | "scheduled" | "ready" | "in_progress" | "completed") {
+    if matches!(
+        status,
+        "approved" | "scheduled" | "ready" | "in_progress" | "completed"
+    ) {
         let _ = require_orthopedic_surgeon(&state).await?;
     } else {
         let _ = require_orthopedic_clinician(&state).await?;
-    } let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_surgery_upsert(&value)?; db.orthopedic_audit("surgery",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+    }
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_surgery_upsert(&value)?;
+        db.orthopedic_audit("surgery", value["id"].as_str().unwrap_or_default(), &value)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
 #[tauri::command]
-async fn orthopedic_implant_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> {
+async fn orthopedic_implant_upsert(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<(), String> {
     let session = if value["status"].as_str() == Some("implanted")
-       || value["removal_status"].as_str() == Some("removed") {
+        || value["removal_status"].as_str() == Some("removed")
+    {
         require_orthopedic_surgeon(&state).await?
     } else {
         require_orthopedic_clinician(&state).await?
     };
     let actor = match session {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
-        SessionKind::User { role: crate::auth::UserRole::Owner } => "clinic_owner".to_string(),
+        SessionKind::User {
+            role: crate::auth::UserRole::Owner,
+        } => "clinic_owner".to_string(),
         _ => return Err("Nuk ke autorizim për implante.".to_string()),
     };
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
         db.orthopedic_implant_upsert(&value, &actor)?;
         db.orthopedic_audit("implant", value["id"].as_str().unwrap_or_default(), &value)
-    }).await.map_err(err_string)?.map_err(err_string)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 #[tauri::command]
-async fn orthopedic_rehab_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_rehab_upsert(&value)?; db.orthopedic_audit("rehab",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_rehab_upsert(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_rehab_upsert(&value)?;
+        db.orthopedic_audit("rehab", value["id"].as_str().unwrap_or_default(), &value)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
 
 #[tauri::command]
 async fn orthopedic_fracture_followups_list(
-    state: tauri::State<'_, AppState>, fracture_id: String,
+    state: tauri::State<'_, AppState>,
+    fracture_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_fracture_followups_list(&fracture_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_fracture_followup_add(
-    state: tauri::State<'_, AppState>, value: serde_json::Value,
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
 ) -> Result<(), String> {
     let surgeon_id = match require_orthopedic_surgeon(&state).await? {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
@@ -1411,22 +1576,28 @@ async fn orthopedic_fracture_followup_add(
     };
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_fracture_followup_add(&value, &surgeon_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_operations_list(
-    state: tauri::State<'_, AppState>, episode_id: String,
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_operations_list(&episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_operation_finalize(
-    state: tauri::State<'_, AppState>, value: serde_json::Value,
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
 ) -> Result<(), String> {
     let surgeon_id = match require_orthopedic_surgeon(&state).await? {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
@@ -1434,21 +1605,35 @@ async fn orthopedic_operation_finalize(
     };
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_operation_finalize(&value, &surgeon_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn orthopedic_surgeries_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
+async fn orthopedic_surgeries_list(
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.orthopedic_surgeries_list(&episode_id)).await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || db.orthopedic_surgeries_list(&episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn orthopedic_implants_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
+async fn orthopedic_implants_list(
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.orthopedic_implants_list(&episode_id)).await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || db.orthopedic_implants_list(&episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 /// An authenticated doctor links an existing orthopedic rehabilitation
@@ -1456,180 +1641,239 @@ async fn orthopedic_implants_list(state: tauri::State<'_, AppState>, episode_id:
 #[tauri::command]
 async fn physiotherapy_referral_create(
     state: tauri::State<'_, AppState>,
-    orthopedic_episode_id: String, rehab_plan_id: String,
+    orthopedic_episode_id: String,
+    rehab_plan_id: String,
 ) -> Result<serde_json::Value, String> {
-    let actor=match require_orthopedic_surgeon(&state).await? {
+    let actor = match require_orthopedic_surgeon(&state).await? {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
         _ => return Err("Kërkohet identiteti i mjekut.".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_referral_create(
-        &orthopedic_episode_id,&rehab_plan_id,&actor
-    )).await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.physiotherapy_referral_create(&orthopedic_episode_id, &rehab_plan_id, &actor)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 
 #[tauri::command]
 async fn physiotherapy_episodes_list(
-    state: tauri::State<'_, AppState>, orthopedic_episode_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+    orthopedic_episode_id: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let _=require_orthopedic_clinician(&state).await?;
-    let db=state.db.clone();
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.physiotherapy_episodes_list(orthopedic_episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn physiotherapy_sessions_list(
-    state: tauri::State<'_, AppState>, physiotherapy_episode_id: String,
+    state: tauri::State<'_, AppState>,
+    physiotherapy_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let _=require_orthopedic_clinician(&state).await?;
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_sessions_list(
-        &physiotherapy_episode_id
-    )).await.map_err(err_string)?.map_err(err_string)
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_sessions_list(&physiotherapy_episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn physiotherapy_session_add(
-    state: tauri::State<'_, AppState>, value: serde_json::Value,
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     // Only authenticated Doctor sessions may document treatment in the
     // current auth model. A separate physiotherapist role is future work.
-    let actor=match require_orthopedic_surgeon(&state).await? {
+    let actor = match require_orthopedic_surgeon(&state).await? {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
         _ => return Err("Kërkohet profesionist klinik i identifikuar.".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_session_add(&value,&actor))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_session_add(&value, &actor))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_measurements_list(state: tauri::State<'_, AppState>, physiotherapy_episode_id: String)
-    -> Result<Vec<serde_json::Value>, String> {
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_measurements_list(&physiotherapy_episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+async fn physiotherapy_measurements_list(
+    state: tauri::State<'_, AppState>,
+    physiotherapy_episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.physiotherapy_measurements_list(&physiotherapy_episode_id)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_measurement_add(state: tauri::State<'_, AppState>, value: serde_json::Value)
-    -> Result<serde_json::Value, String> {
-    let doctor=match require_orthopedic_surgeon(&state).await? {
-        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
-        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+async fn physiotherapy_measurement_add(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let doctor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_measurement_add(&value,&doctor))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_measurement_add(&value, &doctor))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_care_plans_list(state: tauri::State<'_, AppState>, physiotherapy_episode_id: String)
-    -> Result<Vec<serde_json::Value>, String> {
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
+async fn physiotherapy_care_plans_list(
+    state: tauri::State<'_, AppState>,
+    physiotherapy_episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.physiotherapy_care_plans_list(&physiotherapy_episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_care_plan_create(state: tauri::State<'_, AppState>, value: serde_json::Value)
-    -> Result<serde_json::Value, String> {
-    let doctor=match require_orthopedic_surgeon(&state).await? {
-        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
-        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+async fn physiotherapy_care_plan_create(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let doctor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_care_plan_create(&value,&doctor))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_care_plan_create(&value, &doctor))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_exercises_list(state: tauri::State<'_, AppState>)
-    -> Result<Vec<serde_json::Value>, String> {
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
+async fn physiotherapy_exercises_list(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.physiotherapy_exercises_list())
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_exercise_create(state: tauri::State<'_, AppState>, value: serde_json::Value)
-    -> Result<serde_json::Value, String> {
-    let doctor=match require_orthopedic_surgeon(&state).await? {
-        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
-        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+async fn physiotherapy_exercise_create(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let doctor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_exercise_create(&value,&doctor))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_exercise_create(&value, &doctor))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_hep_list(state: tauri::State<'_, AppState>, physiotherapy_episode_id: String)
-    -> Result<Vec<serde_json::Value>, String> {
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
+async fn physiotherapy_hep_list(
+    state: tauri::State<'_, AppState>,
+    physiotherapy_episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.physiotherapy_hep_list(&physiotherapy_episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_hep_assign(state: tauri::State<'_, AppState>, value: serde_json::Value)
-    -> Result<serde_json::Value, String> {
-    let doctor=match require_orthopedic_surgeon(&state).await? {
-        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
-        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+async fn physiotherapy_hep_assign(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let doctor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_hep_assign(&value,&doctor))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_hep_assign(&value, &doctor))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn physiotherapy_hep_logs_list(
-    state: tauri::State<'_, AppState>,physiotherapy_episode_id:String,
-)->Result<Vec<serde_json::Value>,String>{
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(
-        move || db.physiotherapy_hep_logs_list(&physiotherapy_episode_id)
-    ).await.map_err(err_string)?.map_err(err_string)
+    state: tauri::State<'_, AppState>,
+    physiotherapy_episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_hep_logs_list(&physiotherapy_episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_hep_log_add(state: tauri::State<'_, AppState>, value: serde_json::Value)
-    -> Result<serde_json::Value, String> {
-    let doctor=match require_orthopedic_surgeon(&state).await? {
-        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
-        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+async fn physiotherapy_hep_log_add(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let doctor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_hep_log_add(&value,&doctor))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_hep_log_add(&value, &doctor))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_reports_list(state: tauri::State<'_, AppState>, physiotherapy_episode_id: String)
-    -> Result<Vec<serde_json::Value>, String> {
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
+async fn physiotherapy_reports_list(
+    state: tauri::State<'_, AppState>,
+    physiotherapy_episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.physiotherapy_reports_list(&physiotherapy_episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn physiotherapy_report_create(state: tauri::State<'_, AppState>, value: serde_json::Value)
-    -> Result<serde_json::Value, String> {
-    let doctor=match require_orthopedic_surgeon(&state).await? {
-        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
-        _=>return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
+async fn physiotherapy_report_create(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let doctor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet përdorues klinik i identifikuar.".to_string()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move || db.physiotherapy_report_create(&value,&doctor))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_report_create(&value, &doctor))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 /// Export a clinical referral or a specific immutable report version.
@@ -1638,52 +1882,76 @@ async fn physiotherapy_report_create(state: tauri::State<'_, AppState>, value: s
 async fn physiotherapy_document_export_pdf(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    document_id: String, kind: String,
+    document_id: String,
+    kind: String,
 ) -> Result<String, String> {
-    let _=require_orthopedic_surgeon(&state).await?;
-    if !matches!(kind.as_str(),"referral"|"report") {
+    let _ = require_orthopedic_surgeon(&state).await?;
+    if !matches!(kind.as_str(), "referral" | "report") {
         return Err("Zgjidh referimin ose raportin klinik.".to_string());
     }
-    let db=state.db.clone();
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
-        let record=db.physiotherapy_document_data(&document_id,&kind)
+        let record = db
+            .physiotherapy_document_data(&document_id, &kind)
             .map_err(err_string)?;
-        let clinic=db.setting_get("clinic_name").map_err(err_string)?
-            .unwrap_or_else(||"Klinika".into());
-        let bytes=crate::physiotherapy_pdf::render(&record,&clinic,&kind)
-            .map_err(err_string)?;
-        let safe_id:String=document_id.chars()
-            .filter(|c|c.is_ascii_alphanumeric()).take(12).collect();
-        let name=if kind=="referral" {"Fizioterapi-Referim"}else{"Fizioterapi-Raport"};
-        let file=format!("{}-{}.pdf",name,safe_id);
+        let clinic = db
+            .setting_get("clinic_name")
+            .map_err(err_string)?
+            .unwrap_or_else(|| "Klinika".into());
+        let bytes =
+            crate::physiotherapy_pdf::render(&record, &clinic, &kind).map_err(err_string)?;
+        let safe_id: String = document_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(12)
+            .collect();
+        let name = if kind == "referral" {
+            "Fizioterapi-Referim"
+        } else {
+            "Fizioterapi-Raport"
+        };
+        let file = format!("{}-{}.pdf", name, safe_id);
         #[cfg(mobile)]
-        { return save_pdf_via_dialog(&app,&file,&bytes); }
+        {
+            return save_pdf_via_dialog(&app, &file, &bytes);
+        }
         #[cfg(desktop)]
         {
             use tauri_plugin_dialog::DialogExt;
-            let picked=app.dialog().file()
+            let picked = app
+                .dialog()
+                .file()
                 .set_title("Ruaj dokumentin klinik PDF")
-                .set_file_name(&file).add_filter("PDF",&["pdf"])
+                .set_file_name(&file)
+                .add_filter("PDF", &["pdf"])
                 .blocking_save_file()
-                .ok_or_else(||"Ruajtja e dokumentit u anulua.".to_string())?;
-            let path=picked.as_path().ok_or_else(
-                ||"Përzgjidh një destinacion skedari.".to_string())?;
-            std::fs::write(path,&bytes).map_err(err_string)?;
-            #[cfg(target_os="windows")]
-            {let _=std::process::Command::new("explorer.exe").arg(path).spawn();}
+                .ok_or_else(|| "Ruajtja e dokumentit u anulua.".to_string())?;
+            let path = picked
+                .as_path()
+                .ok_or_else(|| "Përzgjidh një destinacion skedari.".to_string())?;
+            std::fs::write(path, &bytes).map_err(err_string)?;
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+            }
             Ok(path.display().to_string())
         }
-    }).await.map_err(err_string)?
+    })
+    .await
+    .map_err(err_string)?
 }
 
 #[tauri::command]
 async fn physiotherapy_documents_list(
-    state: tauri::State<'_, AppState>, orthopedic_episode_id: String,
+    state: tauri::State<'_, AppState>,
+    orthopedic_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.physiotherapy_documents_list(&orthopedic_episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 /// Store a patient-linked clinical PDF through the native picker; never
@@ -1692,148 +1960,207 @@ async fn physiotherapy_documents_list(
 async fn physiotherapy_document_attach(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    orthopedic_episode_id: String, category: String, source_note: String,
+    orthopedic_episode_id: String,
+    category: String,
+    source_note: String,
 ) -> Result<serde_json::Value, String> {
-    let actor=match require_orthopedic_surgeon(&state).await? {
-        SessionKind::Doctor { doctor_id, .. }=>doctor_id,
-        _=>return Err("Kërkohet identiteti i profesionistit.".to_string()),
+    let actor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet identiteti i profesionistit.".to_string()),
     };
-    let db=state.db.clone();
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
         #[cfg(mobile)]
-        {let _=(app,db,orthopedic_episode_id,category,source_note,actor);
-         Err("Importi i dokumentit kryhet në aplikacionin desktop.".into())}
+        {
+            let _ = (app, db, orthopedic_episode_id, category, source_note, actor);
+            Err("Importi i dokumentit kryhet në aplikacionin desktop.".into())
+        }
         #[cfg(desktop)]
         {
+            use sha2::{Digest, Sha256};
             use tauri_plugin_dialog::DialogExt;
-            use sha2::{Digest,Sha256};
-            let file=app.dialog().file().set_title("Zgjidh raportin e rehabilitimit PDF")
-                .add_filter("PDF",&["pdf"]).blocking_pick_file()
-                .ok_or_else(||"Përzgjedhja e skedarit u anulua.".to_string())?;
-            let selected=file.as_path().ok_or_else(
-                ||"Zgjidh një skedar PDF të disponueshëm.".to_string())?;
-            let metadata=std::fs::metadata(selected).map_err(err_string)?;
-            if metadata.len()<100 || metadata.len()>20*1024*1024 {
+            let file = app
+                .dialog()
+                .file()
+                .set_title("Zgjidh raportin e rehabilitimit PDF")
+                .add_filter("PDF", &["pdf"])
+                .blocking_pick_file()
+                .ok_or_else(|| "Përzgjedhja e skedarit u anulua.".to_string())?;
+            let selected = file
+                .as_path()
+                .ok_or_else(|| "Zgjidh një skedar PDF të disponueshëm.".to_string())?;
+            let metadata = std::fs::metadata(selected).map_err(err_string)?;
+            if metadata.len() < 100 || metadata.len() > 20 * 1024 * 1024 {
                 return Err("Dokumenti duhet të jetë PDF nën 20 MB.".into());
             }
-            let bytes=std::fs::read(selected).map_err(err_string)?;
-            if !bytes.starts_with(b"%PDF-") || !bytes.windows(5).any(|w|w==b"%%EOF") {
+            let bytes = std::fs::read(selected).map_err(err_string)?;
+            if !bytes.starts_with(b"%PDF-") || !bytes.windows(5).any(|w| w == b"%%EOF") {
                 return Err("Skedari i zgjedhur nuk është PDF i plotë.".into());
             }
-            let digest=hex::encode(Sha256::digest(&bytes));
-            let basename=selected.file_name().and_then(|x|x.to_str())
-                .unwrap_or("Raport-Fizioterapie.pdf").to_string();
-            let relative=format!("rehab-pdf/{}.pdf",uuid::Uuid::new_v4());
-            let base=app.path().app_data_dir().map_err(err_string)?;
-            let directory=base.join("rehab-pdf");
+            let digest = hex::encode(Sha256::digest(&bytes));
+            let basename = selected
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("Raport-Fizioterapie.pdf")
+                .to_string();
+            let relative = format!("rehab-pdf/{}.pdf", uuid::Uuid::new_v4());
+            let base = app.path().app_data_dir().map_err(err_string)?;
+            let directory = base.join("rehab-pdf");
             std::fs::create_dir_all(&directory).map_err(err_string)?;
-            let target=base.join(&relative);
-            std::fs::write(&target,&bytes).map_err(err_string)?;
+            let target = base.join(&relative);
+            std::fs::write(&target, &bytes).map_err(err_string)?;
             match db.physiotherapy_document_register(
-                &orthopedic_episode_id,&category,&basename,&relative,
-                &digest,bytes.len() as i64,&source_note,&actor
-            ){
-                Ok(data)=>Ok(data),
-                Err(e)=>{
-                    let _=std::fs::remove_file(&target);
+                &orthopedic_episode_id,
+                &category,
+                &basename,
+                &relative,
+                &digest,
+                bytes.len() as i64,
+                &source_note,
+                &actor,
+            ) {
+                Ok(data) => Ok(data),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&target);
                     Err(err_string(e))
                 }
             }
         }
-    }).await.map_err(err_string)?
+    })
+    .await
+    .map_err(err_string)?
 }
 
 /// Resolves only locally managed PDF IDs; validates checksum before opening.
 #[tauri::command]
 async fn physiotherapy_document_open(
     app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>, document_id: String,
+    state: tauri::State<'_, AppState>,
+    document_id: String,
 ) -> Result<String, String> {
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
         #[cfg(mobile)]
-        {let _=(app,db,document_id);
-         Err("Hapja e PDF kryhet nga aplikacioni desktop.".into())}
+        {
+            let _ = (app, db, document_id);
+            Err("Hapja e PDF kryhet nga aplikacioni desktop.".into())
+        }
         #[cfg(desktop)]
         {
-            use sha2::{Digest,Sha256};
-            let (relative,expected)=db.physiotherapy_document_file(&document_id)
+            use sha2::{Digest, Sha256};
+            let (relative, expected) = db
+                .physiotherapy_document_file(&document_id)
                 .map_err(err_string)?;
-            let name=relative.strip_prefix("rehab-pdf/")
-                .ok_or_else(||"Vendndodhje e pavlefshme e dokumentit.".to_string())?;
-            if name.contains('/')||name.contains('\\')||name.contains("..")
-                ||!name.ends_with(".pdf") {
+            let name = relative
+                .strip_prefix("rehab-pdf/")
+                .ok_or_else(|| "Vendndodhje e pavlefshme e dokumentit.".to_string())?;
+            if name.contains('/')
+                || name.contains('\\')
+                || name.contains("..")
+                || !name.ends_with(".pdf")
+            {
                 return Err("Skedari nuk është në dosjen klinike.".into());
             }
-            let path=app.path().app_data_dir().map_err(err_string)?.join(&relative);
-            let bytes=std::fs::read(&path).map_err(err_string)?;
-            let actual=hex::encode(Sha256::digest(&bytes));
-            if actual!=expected || !bytes.starts_with(b"%PDF-") {
+            let path = app
+                .path()
+                .app_data_dir()
+                .map_err(err_string)?
+                .join(&relative);
+            let bytes = std::fs::read(&path).map_err(err_string)?;
+            let actual = hex::encode(Sha256::digest(&bytes));
+            if actual != expected || !bytes.starts_with(b"%PDF-") {
                 return Err("Integriteti i dokumentit klinik nuk përputhet.".into());
             }
-            #[cfg(target_os="windows")]
-            {std::process::Command::new("explorer.exe").arg(&path).spawn().map_err(err_string)?;}
-            #[cfg(not(target_os="windows"))]
-            {open::that(&path).map_err(err_string)?;}
+            #[cfg(target_os = "windows")]
+            {
+                std::process::Command::new("explorer.exe")
+                    .arg(&path)
+                    .spawn()
+                    .map_err(err_string)?;
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                open::that(&path).map_err(err_string)?;
+            }
             Ok("Dokumenti u hap në lexuesin PDF.".to_string())
         }
-    }).await.map_err(err_string)?
+    })
+    .await
+    .map_err(err_string)?
 }
 
 #[tauri::command]
 async fn physiotherapy_body_markers_list(
-    state:tauri::State<'_,AppState>,physiotherapy_episode_id:String,
-)->Result<Vec<serde_json::Value>,String>{
-    let _=require_orthopedic_surgeon(&state).await?;
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(
-        move || db.physiotherapy_body_markers_list(&physiotherapy_episode_id)
-    ).await.map_err(err_string)?.map_err(err_string)
+    state: tauri::State<'_, AppState>,
+    physiotherapy_episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_surgeon(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.physiotherapy_body_markers_list(&physiotherapy_episode_id)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 
 #[tauri::command]
 async fn physiotherapy_body_marker_add(
-    state:tauri::State<'_,AppState>,value:serde_json::Value,
-)->Result<serde_json::Value,String>{
-    let actor=match require_orthopedic_surgeon(&state).await?{
-        SessionKind::Doctor{doctor_id,..}=>doctor_id,
-        _=>return Err("Kërkohet mjeku i identifikuar.".into())
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let actor = match require_orthopedic_surgeon(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Kërkohet mjeku i identifikuar.".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(
-        move || db.physiotherapy_body_marker_add(&value,&actor)
-    ).await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.physiotherapy_body_marker_add(&value, &actor))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn orthopedic_rehab_plans_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> {
+async fn orthopedic_rehab_plans_list(
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.orthopedic_rehab_plans_list(&episode_id)).await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || db.orthopedic_rehab_plans_list(&episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_rehab_phase_reviews_list(
-    state: tauri::State<'_, AppState>, rehab_plan_id: String,
+    state: tauri::State<'_, AppState>,
+    rehab_plan_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_rehab_phase_reviews_list(&rehab_plan_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_rehab_phase_review_add(
-    state: tauri::State<'_, AppState>, value: serde_json::Value,
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
 ) -> Result<(), String> {
     let clinician = match require_orthopedic_surgeon(&state).await? {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
         _ => return Err("Kërkohet mjeku.".to_string()),
     };
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.orthopedic_rehab_phase_review_add(&value,&clinician))
-        .await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || db.orthopedic_rehab_phase_review_add(&value, &clinician))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 /// Native A4 PDF export of an existing, immutable clinical report version.
@@ -1850,14 +2177,21 @@ async fn orthopedic_report_export_pdf(
     }
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
-        let record = db.orthopedic_report_pdf_data(&report_id).map_err(err_string)?;
-        let clinic = db.setting_get("clinic_name")
+        let record = db
+            .orthopedic_report_pdf_data(&report_id)
+            .map_err(err_string)?;
+        let clinic = db
+            .setting_get("clinic_name")
             .map_err(err_string)?
             .unwrap_or_else(|| "Klinika".to_string());
-        let bytes = crate::orthopedics_pdf::render_orthopedic_pdf(&record, &clinic)
-            .map_err(err_string)?;
+        let bytes =
+            crate::orthopedics_pdf::render_orthopedic_pdf(&record, &clinic).map_err(err_string)?;
         let version = record["version"].as_i64().unwrap_or(1);
-        let id: String = report_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect();
+        let id: String = report_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(12)
+            .collect();
         let filename = format!("Ortopedi-Raport-v{}-{}.pdf", version, id);
         #[cfg(mobile)]
         {
@@ -1866,13 +2200,16 @@ async fn orthopedic_report_export_pdf(
         #[cfg(desktop)]
         {
             use tauri_plugin_dialog::DialogExt;
-            let chosen = app.dialog().file()
+            let chosen = app
+                .dialog()
+                .file()
                 .set_title("Ruaj raportin klinik PDF - A4")
                 .set_file_name(&filename)
                 .add_filter("PDF", &["pdf"])
                 .blocking_save_file()
                 .ok_or_else(|| "Ruajtja e PDF u anulua.".to_string())?;
-            let path = chosen.as_path()
+            let path = chosen
+                .as_path()
                 .ok_or_else(|| "Zgjedh një vendndodhje skedari në Windows.".to_string())?;
             std::fs::write(path, &bytes).map_err(err_string)?;
             // Open the generated PDF in Windows' registered PDF reader so the
@@ -1884,60 +2221,210 @@ async fn orthopedic_report_export_pdf(
             }
             Ok(path.display().to_string())
         }
-    }).await.map_err(err_string)?
+    })
+    .await
+    .map_err(err_string)?
 }
 
 #[tauri::command]
 async fn orthopedic_reports_list(
-    state: tauri::State<'_, AppState>, episode_id: String,
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.orthopedic_reports_list(&episode_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
 async fn orthopedic_report_version_create(
-    state: tauri::State<'_, AppState>, value: serde_json::Value,
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     // Distinguish medical report signing from surgery finalization.
     let clinician = match require_orthopedic_clinician(&state).await? {
         SessionKind::Doctor { doctor_id, .. } => doctor_id,
-        _ => return Err("Për nënshkrimin e raportit duhet të identifikohesh si Mjek, jo si Pronar.".to_string()),
+        _ => {
+            return Err(
+                "Për nënshkrimin e raportit duhet të identifikohesh si Mjek, jo si Pronar."
+                    .to_string(),
+            )
+        }
     };
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.orthopedic_report_version_create(&value,&clinician))
-        .await.map_err(err_string)?.map_err(err_string)
+    tokio::task::spawn_blocking(move || db.orthopedic_report_version_create(&value, &clinician))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn orthopedic_markers_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_markers_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_markers_list(
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_markers_list(&episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
 #[tauri::command]
-async fn orthopedic_marker_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_marker_upsert(&value)?; db.orthopedic_audit("marker",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_marker_upsert(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_marker_upsert(&value)?;
+        db.orthopedic_audit("marker", value["id"].as_str().unwrap_or_default(), &value)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
 
 #[tauri::command]
-async fn orthopedic_assessments_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_assessments_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_assessments_list(
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_assessments_list(&episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
 #[tauri::command]
-async fn orthopedic_assessment_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_assessment_upsert(&value)?; db.orthopedic_audit("assessment",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_assessment_upsert(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_assessment_upsert(&value)?;
+        db.orthopedic_audit(
+            "assessment",
+            value["id"].as_str().unwrap_or_default(),
+            &value,
+        )
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
 
 #[tauri::command]
-async fn orthopedic_fractures_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_fractures_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_fractures_list(
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_fractures_list(&episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
 #[tauri::command]
-async fn orthopedic_fracture_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_fracture_upsert(&value)?; db.orthopedic_audit("fracture",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_fracture_upsert(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_fracture_upsert(&value)?;
+        db.orthopedic_audit("fracture", value["id"].as_str().unwrap_or_default(), &value)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
 
 #[tauri::command]
-async fn orthopedic_imaging_links_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_imaging_links_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_imaging_links_list(
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_imaging_links_list(&episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
 #[tauri::command]
-async fn orthopedic_imaging_link_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_imaging_link_upsert(&value)?; db.orthopedic_audit("imaging_link",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_imaging_link_upsert(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_imaging_link_upsert(&value)?;
+        db.orthopedic_audit(
+            "imaging_link",
+            value["id"].as_str().unwrap_or_default(),
+            &value,
+        )
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
 
 #[tauri::command]
-async fn orthopedic_postop_visits_list(state: tauri::State<'_, AppState>, episode_id: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_postop_visits_list(&episode_id)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_postop_visits_list(
+    state: tauri::State<'_, AppState>,
+    episode_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_postop_visits_list(&episode_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
 #[tauri::command]
-async fn orthopedic_postop_visit_upsert(state: tauri::State<'_, AppState>, value: serde_json::Value) -> Result<(), String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||{db.orthopedic_postop_visit_upsert(&value)?; db.orthopedic_audit("postop_visit",value["id"].as_str().unwrap_or_default(),&value)}).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_postop_visit_upsert(
+    state: tauri::State<'_, AppState>,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.orthopedic_postop_visit_upsert(&value)?;
+        db.orthopedic_audit(
+            "postop_visit",
+            value["id"].as_str().unwrap_or_default(),
+            &value,
+        )
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
+}
 
 #[tauri::command]
-async fn orthopedic_implants_search(state: tauri::State<'_, AppState>, query: String) -> Result<Vec<serde_json::Value>, String> { let _=require_orthopedic_clinician(&state).await?; let db=state.db.clone(); tokio::task::spawn_blocking(move||db.orthopedic_implants_search(&query)).await.map_err(err_string)?.map_err(err_string) }
+async fn orthopedic_implants_search(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let _ = require_orthopedic_clinician(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.orthopedic_implants_search(&query))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
 
 #[tauri::command]
 async fn settings_set(
@@ -1951,13 +2438,32 @@ async fn settings_set(
     }
     let mut v = value;
 
+    if crate::sef_bridge::VAT_RATE_SETTING_KEYS.contains(&k.as_str()) {
+        return Err("Normat e TVSH-së për ATK janë fikse: A=0%, C=0%, D=8%, E=18%.".to_string());
+    }
+    let owner_managed = k == FISCAL_PRINTER_PROVIDER_KEY
+        || k == SEF_PRINTER_NAME_KEY
+        || CENTRAL_BUSINESS_SETTING_KEYS.contains(&k.as_str());
+    if owner_managed {
+        let _ = require_owner(&state).await?;
+    }
+    if CENTRAL_BUSINESS_SETTING_KEYS.contains(&k.as_str()) {
+        return Err("Të dhënat e biznesit dhe statusin e TVSH-së caktoji në AdminPanel të PROGRAMERI POS; Mjeku i merr nga konfigurimi qendror dhe nuk lejon shënim manual.".to_string());
+    }
+
     // Authentication/session state must only be changed through auth commands.
     // Vendor admin unlock must not permit arbitrary session or password-hash writes.
     if matches!(
         k.as_str(),
-        "admin_salt" | "admin_hash" | "user_salt" | "user_hash"
-            | "cashier_salt" | "cashier_hash" | "user_logged_in"
-            | "session" | "session_expires_at"
+        "admin_salt"
+            | "admin_hash"
+            | "user_salt"
+            | "user_hash"
+            | "cashier_salt"
+            | "cashier_hash"
+            | "user_logged_in"
+            | "session"
+            | "session_expires_at"
     ) {
         return Err("ky konfigurim menaxhohet vetem nga autentikimi".to_string());
     }
@@ -2005,7 +2511,7 @@ async fn settings_set(
                 return Err("kjo vlere kerkon hyrje si admin".to_string());
             }
         }
-    } else {
+    } else if !owner_managed {
         let _ = require_login(&state).await?;
     }
 
@@ -2022,6 +2528,16 @@ async fn settings_set(
         if v == crate::sef_bridge::PROVIDER_VALUE && current != crate::sef_bridge::PROVIDER_VALUE {
             return Err(crate::sef_bridge::MSG_SELECT_VIA_CONFIGURE.to_string());
         }
+    }
+
+    if k == SEF_PRINTER_NAME_KEY && !v.trim().is_empty() {
+        let printers = printers_list().await?;
+        if !printers.iter().any(|name| name == v.trim()) {
+            return Err(
+                "Zgjidh printerin nga lista e printerëve të instaluar në Windows.".to_string(),
+            );
+        }
+        v = v.trim().to_string();
     }
 
     let db = state.db.clone();
@@ -2095,7 +2611,8 @@ async fn lab_device_connect(
     profile_id: String,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
-    let profile = lab_devices::find_profile(&profile_id).ok_or("profil i panjohur i analizuesit")?;
+    let profile =
+        lab_devices::find_profile(&profile_id).ok_or("profil i panjohur i analizuesit")?;
     let db = state.db.clone();
     let lab_serial = state.lab_serial.clone();
     tokio::task::spawn_blocking(move || lab_serial.connect(db, port_name, profile))
@@ -2414,6 +2931,20 @@ async fn payments_upsert(
 }
 
 #[tauri::command]
+async fn payments_replace_for_sale(
+    state: tauri::State<'_, AppState>,
+    sale_id: String,
+    payments: Vec<PaymentUpsertInput>,
+) -> Result<Vec<Payment>, String> {
+    let _ = require_finance(&state).await?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.payments_replace_for_sale(&sale_id, payments))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
+#[tauri::command]
 async fn payments_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
@@ -2584,93 +3115,149 @@ async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> R
     .map_err(err_string)
 }
 
-
-
-
 #[tauri::command]
-async fn dental_treatment_plans_list(state:tauri::State<'_,AppState>,patient_id:String)->Result<Vec<serde_json::Value>,String>{
-    let (doctor_id,is_admin)=match require_login(&state).await?{
-        SessionKind::Doctor{doctor_id,is_admin}=>(doctor_id,is_admin),
-        _=>return Err("Doctor session required".into())
+async fn dental_treatment_plans_list(
+    state: tauri::State<'_, AppState>,
+    patient_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (doctor_id, is_admin) = match require_login(&state).await? {
+        SessionKind::Doctor {
+            doctor_id,
+            is_admin,
+        } => (doctor_id, is_admin),
+        _ => return Err("Doctor session required".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||{
-        if !is_admin&&!db.dental_patient_access(&patient_id,&doctor_id)?{bail!("Patient access denied");}
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.dental_patient_access(&patient_id, &doctor_id)? {
+            bail!("Patient access denied");
+        }
         db.dental_treatment_plans_list(&patient_id)
-    }).await.map_err(err_string)?.map_err(err_string)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 
 #[tauri::command]
-async fn dental_periodontal_exams_list(state:tauri::State<'_,AppState>,patient_id:String)->Result<Vec<serde_json::Value>,String>{
-    let (doctor_id,is_admin)=match require_login(&state).await?{
-        SessionKind::Doctor{doctor_id,is_admin}=>(doctor_id,is_admin),
-        _=>return Err("Doctor session required".into())
+async fn dental_periodontal_exams_list(
+    state: tauri::State<'_, AppState>,
+    patient_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (doctor_id, is_admin) = match require_login(&state).await? {
+        SessionKind::Doctor {
+            doctor_id,
+            is_admin,
+        } => (doctor_id, is_admin),
+        _ => return Err("Doctor session required".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||{
-        if !is_admin&&!db.dental_patient_access(&patient_id,&doctor_id)?{bail!("Patient access denied");}
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.dental_patient_access(&patient_id, &doctor_id)? {
+            bail!("Patient access denied");
+        }
         db.dental_periodontal_exams_list(&patient_id)
-    }).await.map_err(err_string)?.map_err(err_string)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 #[tauri::command]
-async fn dental_periodontal_exam_create(state:tauri::State<'_,AppState>,exam:serde_json::Value)->Result<serde_json::Value,String>{
-    let doctor_id=match require_login(&state).await?{
-        SessionKind::Doctor{doctor_id,..}=>doctor_id,
-        _=>return Err("Doctor session required".into())
+async fn dental_periodontal_exam_create(
+    state: tauri::State<'_, AppState>,
+    exam: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let doctor_id = match require_login(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Doctor session required".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||db.dental_periodontal_exam_create(exam,&doctor_id))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.dental_periodontal_exam_create(exam, &doctor_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn dental_finding_correct(state:tauri::State<'_,AppState>,correction:serde_json::Value)->Result<serde_json::Value,String>{
-    let doctor_id=match require_login(&state).await?{
-        SessionKind::Doctor{doctor_id,..}=>doctor_id,
-        _=>return Err("Doctor session required".into())
+async fn dental_finding_correct(
+    state: tauri::State<'_, AppState>,
+    correction: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let doctor_id = match require_login(&state).await? {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Doctor session required".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||db.dental_finding_correct(correction,&doctor_id))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.dental_finding_correct(correction, &doctor_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 #[tauri::command]
-async fn dental_finding_corrections_list(state:tauri::State<'_,AppState>,patient_id:String)->Result<Vec<serde_json::Value>,String>{
-    let (doctor_id,is_admin)=match require_login(&state).await?{
-        SessionKind::Doctor{doctor_id,is_admin}=>(doctor_id,is_admin),
-        _=>return Err("Doctor session required".into())
+async fn dental_finding_corrections_list(
+    state: tauri::State<'_, AppState>,
+    patient_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (doctor_id, is_admin) = match require_login(&state).await? {
+        SessionKind::Doctor {
+            doctor_id,
+            is_admin,
+        } => (doctor_id, is_admin),
+        _ => return Err("Doctor session required".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||{
-        if !is_admin&&!db.dental_patient_access(&patient_id,&doctor_id)?{bail!("Patient access denied");}
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if !is_admin && !db.dental_patient_access(&patient_id, &doctor_id)? {
+            bail!("Patient access denied");
+        }
         db.dental_finding_corrections_list(&patient_id)
-    }).await.map_err(err_string)?.map_err(err_string)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 
 #[tauri::command]
-async fn dental_findings_list(state:tauri::State<'_,AppState>,patient_id:String)->Result<Vec<serde_json::Value>,String>{
-    let session=require_login(&state).await?;
-    let (doctor_id,is_admin)=match session{
-        SessionKind::Doctor{doctor_id,is_admin}=>(doctor_id,is_admin),
-        _=>return Err("Doctor session required".into())
+async fn dental_findings_list(
+    state: tauri::State<'_, AppState>,
+    patient_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let session = require_login(&state).await?;
+    let (doctor_id, is_admin) = match session {
+        SessionKind::Doctor {
+            doctor_id,
+            is_admin,
+        } => (doctor_id, is_admin),
+        _ => return Err("Doctor session required".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||{
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
         if !is_admin {
-            if !db.dental_patient_access(&patient_id,&doctor_id)?{bail!("Patient access denied");}
+            if !db.dental_patient_access(&patient_id, &doctor_id)? {
+                bail!("Patient access denied");
+            }
         }
         db.dental_findings_list(&patient_id)
-    }).await.map_err(err_string)?.map_err(err_string)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)
 }
 #[tauri::command]
-async fn dental_finding_create(state:tauri::State<'_,AppState>,finding:serde_json::Value)->Result<serde_json::Value,String>{
-    let session=require_login(&state).await?;
-    let doctor_id=match session{
-        SessionKind::Doctor{doctor_id,..}=>doctor_id,
-        _=>return Err("Doctor session required".into())
+async fn dental_finding_create(
+    state: tauri::State<'_, AppState>,
+    finding: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let session = require_login(&state).await?;
+    let doctor_id = match session {
+        SessionKind::Doctor { doctor_id, .. } => doctor_id,
+        _ => return Err("Doctor session required".into()),
     };
-    let db=state.db.clone();
-    tokio::task::spawn_blocking(move||db.dental_finding_create(finding,&doctor_id))
-        .await.map_err(err_string)?.map_err(err_string)
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.dental_finding_create(finding, &doctor_id))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
@@ -3028,6 +3615,7 @@ async fn invoice_export_fiscal_inp(
     state: tauri::State<'_, AppState>,
     sale_id: String,
     allow_any_if_no_fiscal: Option<bool>,
+    preview_only: Option<bool>,
 ) -> Result<String, String> {
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
@@ -3036,9 +3624,12 @@ async fn invoice_export_fiscal_inp(
         // SEF përmes PROGRAMERI POS: asnjë skedar .inp, asnjë printim PDF këtu.
         let db = state.db.clone();
         let allow_any = allow_any_if_no_fiscal.unwrap_or(false);
-        return tokio::task::spawn_blocking(move || sef_fiscalize_blocking(&db, &sale_id, allow_any))
-            .await
-            .map_err(err_string)?;
+        let preview_only = preview_only.unwrap_or(false);
+        return tokio::task::spawn_blocking(move || {
+            sef_fiscalize_blocking(&db, &sale_id, allow_any, preview_only)
+        })
+        .await
+        .map_err(err_string)?;
     }
 
     if provider == "sef" {
@@ -3099,10 +3690,7 @@ async fn invoice_export_fiscal_inp(
 async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
-    if provider == crate::sef_bridge::PROVIDER_VALUE {
-        return sef_report_summary("report.x", None).await;
-    }
-    require_enternet_for_fiscal(&provider)?;
+    require_pef_report_provider(&provider)?;
     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         let mut files: Vec<String> = Vec::new();
 
@@ -3161,10 +3749,7 @@ async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String
 async fn fiscal_report_z_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
-    if provider == crate::sef_bridge::PROVIDER_VALUE {
-        return sef_report_summary("report.z", None).await;
-    }
-    require_enternet_for_fiscal(&provider)?;
+    require_pef_report_provider(&provider)?;
     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         let mut files: Vec<String> = Vec::new();
 
@@ -3258,7 +3843,11 @@ async fn history_reset_all(state: tauri::State<'_, AppState>) -> Result<(), Stri
 // qe Android 11+ e fsheh nga app-i standard "Files" (scoped storage). Prandaj ketu hapim save-dialog-un
 // nativ (SAF) qe useri te zgjedhe vete vendin — skedari garantohet i dukshem pas kesaj.
 #[cfg(mobile)]
-fn save_pdf_via_dialog(app: &tauri::AppHandle, default_name: &str, pdf_bytes: &[u8]) -> Result<String, String> {
+fn save_pdf_via_dialog(
+    app: &tauri::AppHandle,
+    default_name: &str,
+    pdf_bytes: &[u8],
+) -> Result<String, String> {
     use std::io::Write;
     use tauri_plugin_dialog::DialogExt;
     use tauri_plugin_fs::FsExt;
@@ -3273,7 +3862,10 @@ fn save_pdf_via_dialog(app: &tauri::AppHandle, default_name: &str, pdf_bytes: &[
 
     let mut opts = tauri_plugin_fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    let mut file = app.fs().open(chosen.clone(), opts).map_err(|e| e.to_string())?;
+    let mut file = app
+        .fs()
+        .open(chosen.clone(), opts)
+        .map_err(|e| e.to_string())?;
     file.write_all(pdf_bytes).map_err(|e| e.to_string())?;
 
     Ok(chosen
@@ -3315,7 +3907,11 @@ async fn invoice_export_pdf(
 
         #[cfg(mobile)]
         {
-            return save_pdf_via_dialog(&app_for_save, &format!("Fature-{}.pdf", sale_id), &pdf_bytes);
+            return save_pdf_via_dialog(
+                &app_for_save,
+                &format!("Fature-{}.pdf", sale_id),
+                &pdf_bytes,
+            );
         }
         #[cfg(desktop)]
         {
@@ -3492,7 +4088,11 @@ async fn visit_export_pdf(
 
         #[cfg(mobile)]
         {
-            return save_pdf_via_dialog(&app_for_save, &format!("Vizite-{}.pdf", visit.id), &pdf_bytes);
+            return save_pdf_via_dialog(
+                &app_for_save,
+                &format!("Vizite-{}.pdf", visit.id),
+                &pdf_bytes,
+            );
         }
         #[cfg(desktop)]
         {
@@ -3516,7 +4116,7 @@ fn fiscal_job_process_inner(db: &Db, job: &crate::models::FiscalJob) -> Result<(
         .unwrap_or_else(|| provider_raw.trim().to_ascii_lowercase());
     if provider == crate::sef_bridge::PROVIDER_VALUE {
         // Radha fiskale (p.sh. nga telefoni) fiskalizohet te ky PC përmes PROGRAMERI POS.
-        return sef_fiscalize_blocking(db, &job.sale_id, true).map(|_| ());
+        return sef_fiscalize_blocking(db, &job.sale_id, true, false).map(|_| ());
     }
     if provider != "enternet" && provider != "global_eu" {
         return Err("Provideri fiskal i këtij kompjuteri nuk është Enternet/Global EU".to_string());
@@ -3533,12 +4133,21 @@ fn fiscal_job_process_inner(db: &Db, job: &crate::models::FiscalJob) -> Result<(
     }
 }
 
-fn fiscal_job_mark(db: &Db, job: &crate::models::FiscalJob, status: &str, error: Option<String>) -> anyhow::Result<()> {
+fn fiscal_job_mark(
+    db: &Db,
+    job: &crate::models::FiscalJob,
+    status: &str,
+    error: Option<String>,
+) -> anyhow::Result<()> {
     let now = crate::util::now_iso();
     let mut row = job.clone();
     row.status = status.to_string();
     row.error = error;
-    row.processed_at = if status == "done" { Some(now.clone()) } else { row.processed_at.clone() };
+    row.processed_at = if status == "done" {
+        Some(now.clone())
+    } else {
+        row.processed_at.clone()
+    };
     row.updated_at = now;
     db.fiscal_job_upsert(&row)
 }
@@ -3678,7 +4287,12 @@ fn cents_to_text(c: i64) -> String {
 
 /// Fiskalizon shitjen përmes PROGRAMERI POS. Në sukses shënon shitjen dhe rreshtat
 /// si të fiskalizuar dhe ruan kuponin; në gabim nuk shënon asgjë.
-fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<String, String> {
+fn sef_fiscalize_blocking(
+    db: &Db,
+    sale_id: &str,
+    allow_any: bool,
+    preview_only: bool,
+) -> Result<String, String> {
     let sale_id = sale_id.trim().to_string();
     if sale_id.is_empty() {
         return Err("sale_id eshte i detyrueshem".to_string());
@@ -3706,10 +4320,12 @@ fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<Str
             item_type: it.catalog_item_type.clone(),
             stock_kind: it.catalog_item_id.as_ref().map(|_| "service".to_string()),
             atk_category_code: it.catalog_item_id.as_ref().and_then(|_| {
-                let value = it.atk_category_code.trim(); (!value.is_empty()).then(|| value.to_string())
+                let value = it.atk_category_code.trim();
+                (!value.is_empty()).then(|| value.to_string())
             }),
             atk_unit_code: it.catalog_item_id.as_ref().and_then(|_| {
-                let value = it.atk_unit_code.trim(); (!value.is_empty()).then(|| value.to_string())
+                let value = it.atk_unit_code.trim();
+                (!value.is_empty()).then(|| value.to_string())
             }),
         })
         .collect();
@@ -3721,10 +4337,43 @@ fn sef_fiscalize_blocking(db: &Db, sale_id: &str, allow_any: bool) -> Result<Str
             amount: *a,
         })
         .collect();
-    let req = crate::sef_bridge::build_fiscalize_request(&lines, &pays, &rates)
-        .map_err(err_string)?;
+    let req =
+        crate::sef_bridge::build_fiscalize_request(&lines, &pays, &rates).map_err(err_string)?;
     let issued_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-    let params = crate::sef_bridge::fiscalize_params(&data.sale.id, &issued_at, &req);
+    let clinic_logo = db.clinic_logo_png_bytes().map_err(err_string)?;
+    let logo_base64 = clinic_logo
+        .as_ref()
+        .map(|bytes| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes));
+    if logo_base64.is_some() {
+        let status = sef_call_blocking(
+            "status",
+            serde_json::json!({}),
+            crate::sef_bridge::DEFAULT_TIMEOUT,
+        )
+        .map_err(err_string)?;
+        let supports_logo = status
+            .get("bridgeCapabilities")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items.iter().any(|value| {
+                    value.as_str() == Some(crate::sef_bridge::CAPABILITY_RECEIPT_LOGO_OVERRIDE)
+                })
+            })
+            .unwrap_or(false);
+        if !supports_logo {
+            return Err(
+                "Përditëso PROGRAMERI POS për të përdorur logon e klinikës në kuponin fiskal."
+                    .to_string(),
+            );
+        }
+    }
+    let params = crate::sef_bridge::fiscalize_params_with_delivery_options(
+        &data.sale.id,
+        &issued_at,
+        &req,
+        logo_base64.as_deref(),
+        preview_only,
+    );
     let res = sef_call_blocking("fiscalize", params, crate::sef_bridge::DEFAULT_TIMEOUT)
         .map_err(err_string)?;
     let coupon = crate::sef_bridge::parse_coupon_result(res).map_err(err_string)?;
@@ -3765,32 +4414,101 @@ async fn require_sef_provider(state: &tauri::State<'_, AppState>) -> Result<(), 
     Ok(())
 }
 
-fn sef_today() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
-}
-
-async fn sef_report_summary(op: &str, date: Option<String>) -> Result<String, String> {
-    let date = date
-        .map(|d| d.trim().to_string())
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(sef_today);
-    let r = crate::sef_bridge::call(
-        op,
-        serde_json::json!({ "date": date }),
+async fn call_sef_action_idempotent(
+    db: Arc<Db>,
+    action: &str,
+    coupon_id: &str,
+    request_hash: &str,
+    mut params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let status = crate::sef_bridge::call(
+        "status",
+        serde_json::json!({}),
         crate::sef_bridge::DEFAULT_TIMEOUT,
     )
     .await
     .map_err(err_string)?;
-    let t = &r["totals"];
-    let sales = t["salesCents"].as_i64().unwrap_or(0);
-    let returns = t["returnsCents"].as_i64().unwrap_or(0);
-    let count = t["count"].as_i64().unwrap_or(0);
-    let name = if op == "report.z" { "Z" } else { "X" };
-    Ok(format!(
-        "{name} Raport SEF ({date}): shitje {} €, kthime {} €, kuponë {count}.",
-        cents_to_text(sales),
-        cents_to_text(returns)
-    ))
+    let supported = status
+        .get("bridgeCapabilities")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .any(|v| v.as_str() == Some("coupon_action_idempotency_v1"))
+        })
+        .unwrap_or(false);
+    if !supported {
+        return Err("Ura e PROGRAMERI POS nuk e mbështet ende përsëritjen e sigurt për kthim/anulim. Përditëso PROGRAMERI POS para këtij veprimi.".to_string());
+    }
+
+    let action_name = action.to_string();
+    let coupon = coupon_id.to_string();
+    let hash = request_hash.to_string();
+    let db_for_begin = db.clone();
+    let request_key = tokio::task::spawn_blocking(move || {
+        db_for_begin.sef_bridge_action_begin(&coupon, &action_name, &hash)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+    params["idempotencyKey"] = serde_json::Value::String(request_key.clone());
+
+    match crate::sef_bridge::call(
+        if action == "RETURN" {
+            "coupon.return"
+        } else {
+            "coupon.cancel"
+        },
+        params,
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(result) => {
+            let db_for_complete = db.clone();
+            let key = request_key.clone();
+            tokio::task::spawn_blocking(move || db_for_complete.sef_bridge_action_complete(&key))
+                .await
+                .map_err(err_string)?
+                .map_err(|_| "Veprimi mund të jetë lëshuar, por statusi lokal nuk u mbyll. Kontrollo Kuponët dhe përsërit të njëjtën kërkesë; mos krijo veprim tjetër për këtë kupon.".to_string())?;
+            Ok(result)
+        }
+        Err(error) => {
+            // CONFLICT is intentionally unresolved: the bridge may already hold a coupon under this key.
+            let definitive = matches!(
+                error.code.as_str(),
+                "VALIDATION"
+                    | "NOT_FOUND"
+                    | "NOT_ALLOWED"
+                    | "NOT_CONFIGURED"
+                    | "SEF_LOCKED_48H"
+                    | "OFFLINE_CAP_REACHED"
+                    | "INTEGRITY_BLOCKED"
+                    | "APPROVAL_PENDING"
+                    | "UNAUTHORIZED"
+            );
+            if definitive {
+                let db_for_reject = db;
+                let key = request_key;
+                tokio::task::spawn_blocking(move || db_for_reject.sef_bridge_action_reject(&key))
+                    .await
+                    .map_err(err_string)?
+                    .map_err(|_| "PROGRAMERI POS e refuzoi veprimin, por kërkesa nuk u lirua lokalisht. Rifillo Mjekun dhe kontrollo Kuponët para se të provosh me të dhëna të tjera.".to_string())?;
+            }
+            Err(error.message)
+        }
+    }
+}
+
+fn sef_action_request_hash(action: &str, coupon_id: &str, body: &serde_json::Value) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"mjeku-sef-action-v1\n");
+    digest.update(action.as_bytes());
+    digest.update(b"\n");
+    digest.update(coupon_id.as_bytes());
+    digest.update(b"\n");
+    digest.update(serde_json::to_vec(body).unwrap_or_default());
+    hex::encode(digest.finalize())
 }
 
 #[derive(serde::Serialize)]
@@ -3804,11 +4522,12 @@ struct SefBridgeInfo {
     context: Option<String>,
     provider_value: &'static str,
     provider: String,
+    capabilities: Vec<String>,
 }
 
 #[tauri::command]
 async fn sef_bridge_info(state: tauri::State<'_, AppState>) -> Result<SefBridgeInfo, String> {
-    let _ = require_login(&state).await?;
+    require_login_or_pos_itadmin_settings(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
     let launch_mode = match std::env::var("PROGRAMERI_MJEKU_LAUNCH_MODE").as_deref() {
         Ok("sef-bridge") => "sef-bridge",
@@ -3824,12 +4543,120 @@ async fn sef_bridge_info(state: tauri::State<'_, AppState>) -> Result<SefBridgeI
         context: crate::sef_bridge::context_id(),
         provider_value: crate::sef_bridge::PROVIDER_VALUE,
         provider,
+        capabilities: crate::sef_bridge::capabilities(),
     })
+}
+
+/// Returns the authenticated POS role from the live named-pipe session. The value
+/// is not inferred from Mjeku's Owner/Cashier account or from process environment.
+#[tauri::command]
+async fn sef_bridge_pos_session(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let _ = require_login(&state).await?;
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Ok(false);
+    }
+    let result = crate::sef_bridge::call(
+        "pos.session",
+        serde_json::json!({}),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)?;
+    Ok(result.get("isItAdmin").and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+/// UI hint for the pre-login form only. Authorization is always enforced by the POS host.
+#[tauri::command]
+fn sef_bridge_pos_auth_available() -> bool {
+    cfg!(target_os = "windows") && crate::sef_bridge::launched_from_programeri()
+}
+
+/// Verifies the fixed PROGRAMERI POS ITAdmin account through the authenticated local bridge.
+/// This command is intentionally callable before Mjeku login; it never accepts a role or username.
+#[tauri::command]
+async fn sef_bridge_pos_authenticate(
+    state: tauri::State<'_, AppState>,
+    password: String,
+) -> Result<bool, String> {
+    state
+        .pos_itadmin_settings_mode
+        .store(false, Ordering::Release);
+    state.auth.set_session(SessionKind::None).await;
+    state.auth.admin_lock().await;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    clear_pos_itadmin_claim().await;
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Err(crate::sef_bridge::MSG_NOT_LAUNCHED.to_string());
+    }
+    if password.trim().is_empty() || password.len() > 512 {
+        return Err("Shkruaj fjalëkalimin ITAdmin të PROGRAMERI POS.".to_string());
+    }
+    let result = crate::sef_bridge::call(
+        "pos.session.authenticate",
+        serde_json::json!({ "password": password }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)?;
+    let is_itadmin = result.get("isItAdmin").and_then(serde_json::Value::as_bool) == Some(true);
+    state
+        .pos_itadmin_settings_mode
+        .store(is_itadmin, Ordering::Release);
+    if !is_itadmin {
+        clear_pos_itadmin_claim().await;
+    }
+    Ok(is_itadmin)
+}
+
+#[tauri::command]
+async fn auth_pos_itadmin_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .pos_itadmin_settings_mode
+        .store(false, Ordering::Release);
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    state.auth.set_session(SessionKind::None).await;
+    state.auth.admin_lock().await;
+    clear_pos_itadmin_claim().await;
+    Ok(())
+}
+
+async fn live_pos_itadmin_claim() -> bool {
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return false;
+    }
+    crate::sef_bridge::call(
+        "pos.session",
+        serde_json::json!({}),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .ok()
+    .and_then(|result| result.get("isItAdmin").and_then(serde_json::Value::as_bool))
+        == Some(true)
+}
+
+async fn clear_pos_itadmin_claim() {
+    if cfg!(target_os = "windows") && crate::sef_bridge::launched_from_programeri() {
+        let _ = crate::sef_bridge::call(
+            "pos.session.clear",
+            serde_json::json!({}),
+            crate::sef_bridge::DEFAULT_TIMEOUT,
+        )
+        .await;
+    }
 }
 
 #[tauri::command]
 async fn sef_bridge_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let _ = require_login(&state).await?;
+    require_login_or_pos_itadmin_settings(&state).await?;
     crate::sef_bridge::call(
         "status",
         serde_json::json!({}),
@@ -3839,27 +4666,152 @@ async fn sef_bridge_status(state: tauri::State<'_, AppState>) -> Result<serde_js
     .map_err(err_string)
 }
 
+/// Opens the existing PROGRAMERI POS ATK auditor. The POS host owns the password
+/// check, audit database and read-only session; no audit data or credential is
+/// copied into Mjeku.
+#[tauri::command]
+async fn sef_bridge_open_atk_access(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let _ = require_owner(&state).await?;
+    let provider = get_fiscal_printer_provider(&state).await?;
+    if provider != crate::sef_bridge::PROVIDER_VALUE {
+        return Err("Qasja ATK kërkon SEF (PROGRAMERI POS).".to_string());
+    }
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Err("Qasja ATK hapet kur Mjeku niset nga PROGRAMERI POS në Windows.".to_string());
+    }
+    let result = crate::sef_bridge::call(
+        "atk.access.open",
+        serde_json::json!({}),
+        Duration::from_secs(300),
+    )
+    .await
+    .map_err(err_string)?;
+    result
+        .get("opened")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "PROGRAMERI POS nuk konfirmoi hapjen e Qasjes ATK.".to_string())
+}
+
+#[tauri::command]
+async fn sef_bridge_sync_clock(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    require_login_or_pos_itadmin_settings(&state).await?;
+    let provider = get_fiscal_printer_provider(&state).await?;
+    if provider != crate::sef_bridge::PROVIDER_VALUE {
+        return Err(
+            "Sinkronizimi i ores ATK perdoret vetem kur eshte zgjedhur SEF (PROGRAMERI POS)."
+                .to_string(),
+        );
+    }
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Err("Hape Mjekun nga PROGRAMERI POS per te sinkronizuar oren me ATK.".to_string());
+    }
+    crate::sef_bridge::call(
+        "clock.sync",
+        serde_json::json!({}),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
+/// Merr identitetin e biznesit nga profili qendror i PROGRAMERI POS dhe e ruan
+/// në Mjeku vetëm si cache lokale për paraqitje/printim.
+#[tauri::command]
+async fn sef_bridge_sync_business_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let _ = require_login(&state).await?;
+    if !crate::sef_bridge::platform_supported() || !crate::sef_bridge::launched_from_programeri() {
+        return Err(
+            "Hape Mjekun nga PROGRAMERI POS për të marrë cilësimet qendrore të biznesit."
+                .to_string(),
+        );
+    }
+    let payload = crate::sef_bridge::call(
+        "business.settings",
+        serde_json::json!({}),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)?;
+    let string_value = |key: &str| -> String {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let business_name = if string_value("businessName").is_empty() {
+        string_value("businessLegalName")
+    } else {
+        string_value("businessName")
+    };
+    let business_no = string_value("businessNo");
+    let vat_registered = payload
+        .get("businessInVat")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            "PROGRAMERI POS nuk ktheu statusin e TVSH-së. Kontrollo konfigurimin qendror."
+                .to_string()
+        })?;
+    if business_name.is_empty() || business_no.is_empty() {
+        return Err(
+            "Emri ose numri i biznesit mungon te konfigurimi qendror i PROGRAMERI POS/AdminPanel."
+                .to_string(),
+        );
+    }
+    let entries = vec![
+        ("clinic_name".to_string(), business_name),
+        ("clinic_owner_name".to_string(), string_value("ownerName")),
+        ("clinic_phone".to_string(), string_value("phone")),
+        ("clinic_email".to_string(), string_value("email")),
+        ("clinic_address".to_string(), string_value("address")),
+        ("clinic_city".to_string(), string_value("city")),
+        ("clinic_business_no".to_string(), business_no),
+        ("clinic_website".to_string(), string_value("website")),
+        (
+            "clinic_bank_account".to_string(),
+            string_value("bankAccount"),
+        ),
+        (
+            "clinic_vat_registered".to_string(),
+            if vat_registered { "1" } else { "0" }.to_string(),
+        ),
+    ];
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.settings_set_many(&entries))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
 /// Zgjedh SEF (PROGRAMERI POS) si motor fiskal: hap konfigurimin SEF të PROGRAMERI POS
 /// dhe e ruan motorin vetëm kur kthehet `ready:true`. Kur SEF është tashmë motori,
 /// vetëm rihap konfigurimin dhe kthen gjendjen `ready`.
 #[tauri::command]
 async fn sef_bridge_select_engine(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let session = require_login(&state).await?;
-    if matches!(
-        session,
-        SessionKind::User {
-            role: crate::auth::UserRole::Cashier
-        } | SessionKind::Doctor {
-            is_admin: false,
-            ..
-        }
-    ) {
-        return Err("nuk ke akses per kete seksion".to_string());
-    }
     if !crate::sef_bridge::platform_supported() {
         return Err(crate::sef_bridge::MSG_UNSUPPORTED_PLATFORM.to_string());
     }
     let current = get_fiscal_printer_provider(&state).await?;
+    // Existing SEF settings are only reopened with a verified POS ITAdmin
+    // session. First-time engine selection remains available to a Mjeku owner.
+    let pos_it_admin =
+        state.pos_itadmin_settings_mode.load(Ordering::Acquire) && live_pos_itadmin_claim().await;
+    if current == crate::sef_bridge::PROVIDER_VALUE {
+        if !pos_it_admin {
+            return Err(
+                "Rihapja e konfigurimit SEF lejohet vetem me sesionin ITAdmin te PROGRAMERI POS."
+                    .to_string(),
+            );
+        }
+        require_pos_itadmin_settings(&state).await?;
+    } else if !pos_it_admin {
+        let _ = require_owner(&state).await?;
+    }
     // PROGRAMERI POS dhe moduli Mjeku duhet të jenë aktivë (përgjigjet `status`).
     crate::sef_bridge::call(
         "status",
@@ -3884,7 +4836,10 @@ async fn sef_bridge_select_engine(state: tauri::State<'_, AppState>) -> Result<b
     }
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
-        db.setting_set(FISCAL_PRINTER_PROVIDER_KEY, crate::sef_bridge::PROVIDER_VALUE)
+        db.setting_set(
+            FISCAL_PRINTER_PROVIDER_KEY,
+            crate::sef_bridge::PROVIDER_VALUE,
+        )
     })
     .await
     .map_err(err_string)?
@@ -3936,6 +4891,62 @@ async fn sef_coupon_copy(
     .map_err(err_string)
 }
 
+#[tauri::command]
+async fn sef_coupon_preview(
+    state: tauri::State<'_, AppState>,
+    coupon_id: String,
+) -> Result<serde_json::Value, String> {
+    let _ = require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Err(
+            "Hape Mjekun nga PROGRAMERI POS në Windows për parapamjen e kuponit.".to_string(),
+        );
+    }
+    let coupon_id = coupon_id.trim().to_string();
+    if coupon_id.is_empty() {
+        return Err("Zgjidh kuponin.".to_string());
+    }
+    crate::sef_bridge::call(
+        "coupon.preview",
+        serde_json::json!({ "couponId": coupon_id }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
+#[tauri::command]
+async fn sef_coupon_email(
+    state: tauri::State<'_, AppState>,
+    coupon_id: String,
+    to_address: String,
+) -> Result<serde_json::Value, String> {
+    let _ = require_finance(&state).await?;
+    require_sef_provider(&state).await?;
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Err(
+            "Dërgimi i kuponit me email kërkon Mjekun e hapur nga PROGRAMERI POS në Windows."
+                .to_string(),
+        );
+    }
+    let coupon_id = coupon_id.trim().to_string();
+    let to_address = to_address.trim().to_string();
+    if coupon_id.is_empty() {
+        return Err("Zgjidh kuponin.".to_string());
+    }
+    if to_address.is_empty() || to_address.len() > 254 || !to_address.contains('@') {
+        return Err("Vendos një adresë email-i valide.".to_string());
+    }
+    crate::sef_bridge::call(
+        "coupon.email",
+        serde_json::json!({ "couponId": coupon_id, "toAddress": to_address }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_err(err_string)
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SefReturnItemInput {
     id: String,
@@ -3948,6 +4959,7 @@ async fn sef_coupon_return(
     coupon_id: String,
     items: Vec<SefReturnItemInput>,
     reason: String,
+    preview_only: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let _ = require_finance(&state).await?;
     require_sef_provider(&state).await?;
@@ -3959,30 +4971,44 @@ async fn sef_coupon_return(
     if reason.is_empty() {
         return Err("Shkruaj arsyen e kthimit.".to_string());
     }
+    if items.is_empty() || items.len() > 500 {
+        return Err("Kthimi duhet të ketë 1–500 artikuj.".to_string());
+    }
     let mut out = Vec::new();
     for it in items {
-        if !it.qty.is_finite() || it.qty <= 0.0 || it.id.trim().is_empty() {
-            continue;
+        let scaled = it.qty * 1000.0;
+        if !it.qty.is_finite()
+            || it.qty <= 0.0
+            || it.qty > 9_999_999.999
+            || (scaled - scaled.round()).abs() > 0.000001
+            || it.id.trim().is_empty()
+        {
+            return Err(
+                "Artikulli dhe sasia duhet të jenë të vlefshme (deri në 3 shifra pas presjes)."
+                    .to_string(),
+            );
         }
         let milli = crate::sef_bridge::qty_to_milli(it.qty);
         if milli <= 0 {
-            continue;
+            return Err("Sasia për kthim është më e vogël se njësia minimale.".to_string());
         }
         out.push(serde_json::json!({
             "id": it.id.trim(),
             "qty": crate::sef_bridge::qty_string(milli),
         }));
     }
-    if out.is_empty() {
-        return Err("Zgjidh të paktën një artikull dhe sasinë për kthim.".to_string());
-    }
-    crate::sef_bridge::call(
-        "coupon.return",
-        serde_json::json!({ "couponId": coupon_id, "items": out, "reason": reason }),
-        crate::sef_bridge::DEFAULT_TIMEOUT,
+    out.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let body = serde_json::json!({ "items": out, "reason": reason });
+    let request_hash = sef_action_request_hash("RETURN", &coupon_id, &body);
+    let db = state.db.clone();
+    call_sef_action_idempotent(
+        db,
+        "RETURN",
+        &coupon_id,
+        &request_hash,
+        serde_json::json!({ "couponId": coupon_id, "items": body["items"], "reason": body["reason"], "previewOnly": preview_only.unwrap_or(false) }),
     )
     .await
-    .map_err(err_string)
 }
 
 #[tauri::command]
@@ -3990,6 +5016,7 @@ async fn sef_coupon_cancel(
     state: tauri::State<'_, AppState>,
     coupon_id: String,
     reason: String,
+    preview_only: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let _ = require_finance(&state).await?;
     require_sef_provider(&state).await?;
@@ -4001,40 +5028,29 @@ async fn sef_coupon_cancel(
     if reason.is_empty() {
         return Err("Shkruaj arsyen e anulimit.".to_string());
     }
-    crate::sef_bridge::call(
-        "coupon.cancel",
-        serde_json::json!({ "couponId": coupon_id, "reason": reason }),
-        crate::sef_bridge::DEFAULT_TIMEOUT,
+    let body = serde_json::json!({ "reason": reason });
+    let request_hash = sef_action_request_hash("CANCEL", &coupon_id, &body);
+    let db = state.db.clone();
+    call_sef_action_idempotent(
+        db,
+        "CANCEL",
+        &coupon_id,
+        &request_hash,
+        serde_json::json!({ "couponId": coupon_id, "reason": body["reason"], "previewOnly": preview_only.unwrap_or(false) }),
     )
     .await
-    .map_err(err_string)
 }
 
 /// Raporti X/Z i plotë (tekst + totale) për faqen "Kuponët".
 #[tauri::command]
 async fn sef_report(
     state: tauri::State<'_, AppState>,
-    kind: String,
-    date: Option<String>,
+    _kind: String,
+    _date: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let _ = require_finance(&state).await?;
     require_sef_provider(&state).await?;
-    let op = match kind.trim().to_ascii_lowercase().as_str() {
-        "x" => "report.x",
-        "z" => "report.z",
-        _ => return Err("Raporti duhet të jetë X ose Z.".to_string()),
-    };
-    let date = date
-        .map(|d| d.trim().to_string())
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(sef_today);
-    crate::sef_bridge::call(
-        op,
-        serde_json::json!({ "date": date }),
-        crate::sef_bridge::DEFAULT_TIMEOUT,
-    )
-    .await
-    .map_err(err_string)
+    Err(MSG_PEF_ONLY_REPORTS.to_string())
 }
 
 /// Rreshtat e fiskalizuar të një shitjeje (për zgjedhjen e artikujve te "Kthe").
@@ -4091,10 +5107,7 @@ async fn prescriptions_list(
 }
 
 #[tauri::command]
-async fn prescriptions_delete(
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+async fn prescriptions_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.prescriptions_delete(&id))
@@ -4114,13 +5127,19 @@ async fn prescription_export_pdf(
     save: Option<bool>,
 ) -> Result<String, String> {
     let session = require_login(&state).await?;
-    let visit_id = visit_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let visit_id = visit_id
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     let kind = match kind.as_deref().map(str::trim) {
         Some("udhezim") => "udhezim".to_string(),
         _ => "recete".to_string(),
     };
-    let title = title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-    let content_in = content.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    let title = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let content_in = content
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
     let save = save.unwrap_or(false);
 
     let db = state.db.clone();
@@ -4147,25 +5166,32 @@ async fn prescription_export_pdf(
             .filter(|f| matches!(f.as_str(), "a4" | "a5" | "termik"))
             .unwrap_or_else(|| "a4".to_string());
 
-        let logo_png: Option<Vec<u8>> = db
-            .setting_get("clinic_logo_path")
-            .ok()
-            .flatten()
-            .and_then(|rel| {
-                let rel = rel.trim().to_string();
-                if rel.is_empty() { return None; }
-                std::fs::read(data_dir.join(rel)).ok()
-            });
+        let logo_png: Option<Vec<u8>> =
+            db.setting_get("clinic_logo_path")
+                .ok()
+                .flatten()
+                .and_then(|rel| {
+                    let rel = rel.trim().to_string();
+                    if rel.is_empty() {
+                        return None;
+                    }
+                    std::fs::read(data_dir.join(rel)).ok()
+                });
 
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-        let (date, doctor_id_opt, client_opt, diagnosis, content_final, file_tag) = match &visit_id {
+        let (date, doctor_id_opt, client_opt, diagnosis, content_final, file_tag) = match &visit_id
+        {
             Some(vid) => {
                 let visit = db
                     .visits_get(vid)
                     .map_err(err_string)?
                     .ok_or_else(|| "vizita nuk u gjet".to_string())?;
-                if let SessionKind::Doctor { doctor_id, is_admin: false } = &session {
+                if let SessionKind::Doctor {
+                    doctor_id,
+                    is_admin: false,
+                } = &session
+                {
                     let row_doctor = visit.doctor_id.as_deref().unwrap_or("").trim().to_string();
                     if row_doctor.is_empty() || row_doctor != doctor_id.trim() {
                         return Err("nuk ke akses ne kete vizite".to_string());
@@ -4182,7 +5208,15 @@ async fn prescription_export_pdf(
                     Some(client),
                     visit.diagnosis.clone(),
                     content,
-                    format!("{}-{}", if kind == "udhezim" { "Udhezim" } else { "Receta" }, visit.id),
+                    format!(
+                        "{}-{}",
+                        if kind == "udhezim" {
+                            "Udhezim"
+                        } else {
+                            "Receta"
+                        },
+                        visit.id
+                    ),
                 )
             }
             None => {
@@ -4197,7 +5231,15 @@ async fn prescription_export_pdf(
                     None,
                     None,
                     content_in.clone(),
-                    format!("{}-{}", if kind == "udhezim" { "Udhezim" } else { "Receta" }, ts),
+                    format!(
+                        "{}-{}",
+                        if kind == "udhezim" {
+                            "Udhezim"
+                        } else {
+                            "Receta"
+                        },
+                        ts
+                    ),
                 )
             }
         };
@@ -4322,7 +5364,10 @@ async fn regular_invoice_create(
             .ok()
             .flatten()
             .unwrap_or_else(|| "Klinika".to_string());
-        let bank_account = db.setting_get("clinic_bank_account").ok().flatten()
+        let bank_account = db
+            .setting_get("clinic_bank_account")
+            .ok()
+            .flatten()
             .filter(|s| !s.trim().is_empty());
         let header_png: Option<Vec<u8>> = db
             .setting_get("pdf_header_path")
@@ -4330,30 +5375,42 @@ async fn regular_invoice_create(
             .flatten()
             .and_then(|rel| {
                 let rel = rel.trim().to_string();
-                if rel.is_empty() { return None; }
+                if rel.is_empty() {
+                    return None;
+                }
                 std::fs::read(data_dir.join(rel)).ok()
             });
-        let logo_png: Option<Vec<u8>> = db
-            .setting_get("clinic_logo_path")
-            .ok()
-            .flatten()
-            .and_then(|rel| {
-                let rel = rel.trim().to_string();
-                if rel.is_empty() { return None; }
-                std::fs::read(data_dir.join(rel)).ok()
-            });
+        let logo_png: Option<Vec<u8>> =
+            db.setting_get("clinic_logo_path")
+                .ok()
+                .flatten()
+                .and_then(|rel| {
+                    let rel = rel.trim().to_string();
+                    if rel.is_empty() {
+                        return None;
+                    }
+                    std::fs::read(data_dir.join(rel)).ok()
+                });
 
-        let sale = db.sales_get(&sale_id).map_err(err_string)?
+        let sale = db
+            .sales_get(&sale_id)
+            .map_err(err_string)?
             .ok_or_else(|| "fatura nuk u gjet".to_string())?;
-        let invoice_no = db.sales_invoice_number(&sale.id).unwrap_or_else(|_| sale.id.clone());
-        let client = db.clients_get(&sale.client_id).map_err(err_string)?
+        let invoice_no = db
+            .sales_invoice_number(&sale.id)
+            .unwrap_or_else(|_| sale.id.clone());
+        let client = db
+            .clients_get(&sale.client_id)
+            .map_err(err_string)?
             .ok_or_else(|| "pacienti nuk u gjet".to_string())?;
 
-        let vis_items = db.visit_items_list(Some(crate::models::VisitItemsListFilters {
-            visit_id: Some(sale_id.clone()),
-            client_id: None,
-            include_deleted: Some(false),
-        })).map_err(err_string)?;
+        let vis_items = db
+            .visit_items_list(Some(crate::models::VisitItemsListFilters {
+                visit_id: Some(sale_id.clone()),
+                client_id: None,
+                include_deleted: Some(false),
+            }))
+            .map_err(err_string)?;
         let lines: Vec<crate::invoice::InvoiceLine> = vis_items
             .into_iter()
             .filter(|x| x.deleted == 0)
@@ -4370,11 +5427,17 @@ async fn regular_invoice_create(
         let (total, fiscal_total, non_fiscal_total) = if lines.is_empty() {
             (sale.total, sale.total, 0.0)
         } else {
-            let mut t = 0.0_f64; let mut ft = 0.0_f64; let mut nft = 0.0_f64;
+            let mut t = 0.0_f64;
+            let mut ft = 0.0_f64;
+            let mut nft = 0.0_f64;
             for ln in &lines {
                 let sub = ln.qty * ln.unit_price;
                 t += sub;
-                if ln.fiscal { ft += sub; } else { nft += sub; }
+                if ln.fiscal {
+                    ft += sub;
+                } else {
+                    nft += sub;
+                }
             }
             (t, ft, nft)
         };
@@ -4424,7 +5487,8 @@ async fn regular_invoice_create(
             total,
             Some(&filename),
             &now,
-        ).map_err(err_string)?;
+        )
+        .map_err(err_string)?;
 
         Ok(crate::models::RegularInvoice {
             id,
@@ -4451,10 +5515,8 @@ async fn regular_invoices_list(
     require_finance(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
-        db.regular_invoices_list(
-            date_from.as_deref(),
-            date_to.as_deref(),
-        ).map_err(err_string)
+        db.regular_invoices_list(date_from.as_deref(), date_to.as_deref())
+            .map_err(err_string)
     })
     .await
     .map_err(err_string)?
@@ -4466,51 +5528,79 @@ fn app_restart(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
-async fn sales_monthly_report(state: tauri::State<'_, AppState>, year: i32) -> Result<Vec<crate::models::MonthlyReportRow>, String> {
+async fn sales_monthly_report(
+    state: tauri::State<'_, AppState>,
+    year: i32,
+) -> Result<Vec<crate::models::MonthlyReportRow>, String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.sales_monthly_report(year))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn stock_suppliers_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate::models::StockSupplier>, String> {
+async fn stock_suppliers_list(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::models::StockSupplier>, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_suppliers_list())
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn stock_supplier_upsert(state: tauri::State<'_, AppState>, supplier: crate::models::StockSupplier) -> Result<(), String> {
+async fn stock_supplier_upsert(
+    state: tauri::State<'_, AppState>,
+    supplier: crate::models::StockSupplier,
+) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_supplier_upsert(&supplier))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn stock_supplier_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+async fn stock_supplier_delete(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_supplier_delete(&id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn stock_items_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate::models::StockItem>, String> {
+async fn stock_items_list(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::models::StockItem>, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_items_list())
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn stock_item_upsert(state: tauri::State<'_, AppState>, item: crate::models::StockItemUpsertInput) -> Result<(), String> {
+async fn stock_item_upsert(
+    state: tauri::State<'_, AppState>,
+    item: crate::models::StockItemUpsertInput,
+) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_item_upsert(&item))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
@@ -4518,61 +5608,97 @@ async fn stock_item_delete(state: tauri::State<'_, AppState>, id: String) -> Res
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_item_delete(&id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn stock_movements_list(state: tauri::State<'_, AppState>, item_id: String) -> Result<Vec<crate::models::StockMovement>, String> {
+async fn stock_movements_list(
+    state: tauri::State<'_, AppState>,
+    item_id: String,
+) -> Result<Vec<crate::models::StockMovement>, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_movements_list(&item_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn stock_movement_add(state: tauri::State<'_, AppState>, movement: crate::models::StockMovement) -> Result<(), String> {
+async fn stock_movement_add(
+    state: tauri::State<'_, AppState>,
+    movement: crate::models::StockMovement,
+) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_movement_add(&movement))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn sale_items_list(state: tauri::State<'_, AppState>, sale_id: String) -> Result<Vec<crate::models::SaleItem>, String> {
+async fn sale_items_list(
+    state: tauri::State<'_, AppState>,
+    sale_id: String,
+) -> Result<Vec<crate::models::SaleItem>, String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.sale_items_list(&sale_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn sale_items_replace(state: tauri::State<'_, AppState>, sale_id: String, items: Vec<crate::models::SaleItemInput>) -> Result<(), String> {
+async fn sale_items_replace(
+    state: tauri::State<'_, AppState>,
+    sale_id: String,
+    items: Vec<crate::models::SaleItemInput>,
+) -> Result<(), String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.sale_items_replace(&sale_id, &items))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 // ─── Offer commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn offers_list(state: tauri::State<'_, AppState>) -> Result<Vec<crate::models::Offer>, String> {
+async fn offers_list(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::models::Offer>, String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     let clinic_id = tokio::task::spawn_blocking({
         let db = db.clone();
         move || db.setting_get("clinic_id")
-    }).await.map_err(err_string)?.map_err(err_string)?.unwrap_or_default();
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?
+    .unwrap_or_default();
     tokio::task::spawn_blocking(move || db.offers_list(&clinic_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
-async fn offer_items_list(state: tauri::State<'_, AppState>, offer_id: String) -> Result<Vec<crate::models::OfferItem>, String> {
+async fn offer_items_list(
+    state: tauri::State<'_, AppState>,
+    offer_id: String,
+) -> Result<Vec<crate::models::OfferItem>, String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.offer_items_list(&offer_id))
-        .await.map_err(err_string)?.map_err(err_string)
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
 }
 
 #[tauri::command]
@@ -4594,16 +5720,25 @@ async fn offer_upsert(
     let clinic_id = tokio::task::spawn_blocking({
         let db = db.clone();
         move || db.setting_get("clinic_id")
-    }).await.map_err(err_string)?.map_err(err_string)?.unwrap_or_default();
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?
+    .unwrap_or_default();
 
     // Compute totals
-    let subtotal_raw: f64 = items.iter().map(|it| it.qty * it.unit_price * (1.0 - it.discount_pct / 100.0)).sum();
+    let subtotal_raw: f64 = items
+        .iter()
+        .map(|it| it.qty * it.unit_price * (1.0 - it.discount_pct / 100.0))
+        .sum();
     let subtotal = (subtotal_raw * 100.0).round() / 100.0;
     let vat_amount = (subtotal * vat_pct / 100.0 * 100.0).round() / 100.0;
     let total = (subtotal + vat_amount) * 100.0 / 100.0;
     let total = (total * 100.0).round() / 100.0;
 
-    let offer_id = id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let offer_id = id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let is_new = id.is_none();
 
     // Get offer_number
@@ -4613,12 +5748,16 @@ async fn offer_upsert(
         let month = now_dt.month();
         let year = now_dt.year();
         tokio::task::spawn_blocking(move || db2.next_offer_number(month, year))
-            .await.map_err(err_string)?.map_err(err_string)?
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?
     } else {
         let db2 = db.clone();
         let oid = offer_id.clone();
         tokio::task::spawn_blocking(move || db2.offer_get(&oid))
-            .await.map_err(err_string)?.map_err(err_string)?
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?
             .map(|o| o.offer_number)
             .unwrap_or_else(|| "000/00/0000".to_string())
     };
@@ -4629,7 +5768,9 @@ async fn offer_upsert(
         let db2 = db.clone();
         let oid = offer_id.clone();
         tokio::task::spawn_blocking(move || db2.offer_get(&oid))
-            .await.map_err(err_string)?.map_err(err_string)?
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?
             .map(|o| o.created_at)
             .unwrap_or_else(|| now.clone())
     };
@@ -4656,33 +5797,44 @@ async fn offer_upsert(
     let db2 = db.clone();
     let offer2 = offer.clone();
     tokio::task::spawn_blocking(move || db2.offer_upsert(&offer2))
-        .await.map_err(err_string)?.map_err(err_string)?;
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
 
     let db3 = db.clone();
     let now2 = crate::util::now_iso();
     let oid = offer_id.clone();
     let cid = clinic_id.clone();
     tokio::task::spawn_blocking(move || db3.offer_items_replace(&oid, &cid, &items, &now2))
-        .await.map_err(err_string)?.map_err(err_string)?;
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
 
     // Queue sync for offer
     let db4 = db.clone();
     let offer3 = offer.clone();
     tokio::task::spawn_blocking(move || db4.offer_queue_upsert(&offer3))
-        .await.map_err(err_string)?.map_err(err_string)?;
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
 
     // Queue sync for items
     let db5 = db.clone();
     let oid2 = offer_id.clone();
     let updated_items = tokio::task::spawn_blocking(move || db5.offer_items_list(&oid2))
-        .await.map_err(err_string)?.map_err(err_string)?;
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
     let db6 = db.clone();
     tokio::task::spawn_blocking(move || {
         for item in &updated_items {
             db6.offer_item_queue_upsert(item)?;
         }
         Ok::<_, anyhow::Error>(())
-    }).await.map_err(err_string)?.map_err(err_string)?;
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
 
     Ok(offer)
 }
@@ -4695,15 +5847,21 @@ async fn offer_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(
     let id2 = id.clone();
     let now2 = now.clone();
     tokio::task::spawn_blocking(move || db.offer_soft_delete(&id2, &now2))
-        .await.map_err(err_string)?.map_err(err_string)?;
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
     // Queue a soft-delete by re-fetching the row and queuing it
     let db2 = state.db.clone();
     let deleted_offer = tokio::task::spawn_blocking(move || db2.offer_get(&id))
-        .await.map_err(err_string)?.map_err(err_string)?;
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
     if let Some(offer) = deleted_offer {
         let db3 = state.db.clone();
         tokio::task::spawn_blocking(move || db3.offer_queue_upsert(&offer))
-            .await.map_err(err_string)?.map_err(err_string)?;
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?;
     }
     Ok(())
 }
@@ -4722,16 +5880,24 @@ async fn offer_set_status(
     let status2 = status.clone();
     let invoice_id2 = invoice_id.clone();
     let now2 = now.clone();
-    tokio::task::spawn_blocking(move || db.offer_set_status(&id2, &status2, invoice_id2.as_deref(), &now2))
-        .await.map_err(err_string)?.map_err(err_string)?;
+    tokio::task::spawn_blocking(move || {
+        db.offer_set_status(&id2, &status2, invoice_id2.as_deref(), &now2)
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
     // Queue sync
     let db2 = state.db.clone();
     let updated_offer = tokio::task::spawn_blocking(move || db2.offer_get(&id))
-        .await.map_err(err_string)?.map_err(err_string)?;
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
     if let Some(offer) = updated_offer {
         let db3 = state.db.clone();
         tokio::task::spawn_blocking(move || db3.offer_queue_upsert(&offer))
-            .await.map_err(err_string)?.map_err(err_string)?;
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?;
     }
     Ok(())
 }
@@ -4754,33 +5920,58 @@ async fn offer_pdf(
     let db = state.db.clone();
     let oid = offer_id.clone();
     let offer = tokio::task::spawn_blocking(move || db.offer_get(&oid))
-        .await.map_err(err_string)?.map_err(err_string)?
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?
         .ok_or_else(|| "Oferta nuk u gjet".to_string())?;
 
     let db2 = state.db.clone();
     let oid2 = offer_id.clone();
     let items = tokio::task::spawn_blocking(move || db2.offer_items_list(&oid2))
-        .await.map_err(err_string)?.map_err(err_string)?;
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
 
     let db3 = state.db.clone();
     let client_id = offer.client_id.clone();
-    let (clinic_name, clinic_address, clinic_phone, header_png, logo_png, client_name, client_phone, client_email) =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let clinic_name = db3.setting_get("clinic_name")?.unwrap_or_default();
-            let clinic_address = db3.setting_get("clinic_address")?;
-            let clinic_phone = db3.setting_get("clinic_phone")?;
-            let decode = |key: &str| -> Option<Vec<u8>> {
-                db3.setting_get(key).ok().flatten()
-                    .and_then(|s| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim()).ok())
-            };
-            let header_png = decode("header_image_b64");
-            let logo_png = decode("logo_image_b64");
-            let client = db3.clients_get(&client_id)?;
-            let client_name = client.as_ref().map(|c| c.name.clone()).unwrap_or_default();
-            let client_phone = client.as_ref().and_then(|c| c.phone.clone());
-            let client_email = client.as_ref().and_then(|c| c.email.clone());
-            Ok((clinic_name, clinic_address, clinic_phone, header_png, logo_png, client_name, client_phone, client_email))
-        }).await.map_err(err_string)?.map_err(err_string)?;
+    let (
+        clinic_name,
+        clinic_address,
+        clinic_phone,
+        header_png,
+        logo_png,
+        client_name,
+        client_phone,
+        client_email,
+    ) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let clinic_name = db3.setting_get("clinic_name")?.unwrap_or_default();
+        let clinic_address = db3.setting_get("clinic_address")?;
+        let clinic_phone = db3.setting_get("clinic_phone")?;
+        let decode = |key: &str| -> Option<Vec<u8>> {
+            db3.setting_get(key).ok().flatten().and_then(|s| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim()).ok()
+            })
+        };
+        let header_png = decode("header_image_b64");
+        let logo_png = decode("logo_image_b64");
+        let client = db3.clients_get(&client_id)?;
+        let client_name = client.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+        let client_phone = client.as_ref().and_then(|c| c.phone.clone());
+        let client_email = client.as_ref().and_then(|c| c.email.clone());
+        Ok((
+            clinic_name,
+            clinic_address,
+            clinic_phone,
+            header_png,
+            logo_png,
+            client_name,
+            client_phone,
+            client_email,
+        ))
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
 
     let pdf_data = crate::invoice::OfferPdfData {
         clinic_name,
@@ -4795,13 +5986,16 @@ async fn offer_pdf(
         client_phone,
         client_email,
         notes: offer.notes.clone(),
-        lines: items.iter().map(|it| crate::invoice::OfferPdfLine {
-            description: it.description.clone(),
-            qty: it.qty,
-            unit_price: it.unit_price,
-            discount_pct: it.discount_pct,
-            line_total: it.line_total,
-        }).collect(),
+        lines: items
+            .iter()
+            .map(|it| crate::invoice::OfferPdfLine {
+                description: it.description.clone(),
+                qty: it.qty,
+                unit_price: it.unit_price,
+                discount_pct: it.discount_pct,
+                line_total: it.line_total,
+            })
+            .collect(),
         vat_pct: offer.vat_pct,
         subtotal: offer.subtotal,
         vat_amount: offer.vat_amount,
@@ -4817,7 +6011,10 @@ async fn offer_pdf(
     {
         let out_dir = desktop_dir.unwrap_or_else(|| data_dir.join("temp"));
         std::fs::create_dir_all(&out_dir).map_err(err_string)?;
-        let out_path = out_dir.join(format!("Oferta-{}.pdf", offer.offer_number.replace('/', "-")));
+        let out_path = out_dir.join(format!(
+            "Oferta-{}.pdf",
+            offer.offer_number.replace('/', "-")
+        ));
         std::fs::write(&out_path, &pdf_bytes).map_err(err_string)?;
     }
     #[cfg(mobile)]
@@ -4825,12 +6022,17 @@ async fn offer_pdf(
         let app_for_save = app.clone();
         let pdf_bytes2 = pdf_bytes.clone();
         let file_name = format!("Oferta-{}.pdf", offer.offer_number.replace('/', "-"));
-        let _ = tokio::task::spawn_blocking(move || save_pdf_via_dialog(&app_for_save, &file_name, &pdf_bytes2))
-            .await
-            .map_err(err_string)?;
+        let _ = tokio::task::spawn_blocking(move || {
+            save_pdf_via_dialog(&app_for_save, &file_name, &pdf_bytes2)
+        })
+        .await
+        .map_err(err_string)?;
     }
 
-    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pdf_bytes))
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &pdf_bytes,
+    ))
 }
 
 #[tauri::command]
@@ -4928,10 +6130,7 @@ async fn client_photo_data(
 }
 
 #[tauri::command]
-async fn client_photo_delete(
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+async fn client_photo_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.client_photo_delete(&id))
@@ -4948,7 +6147,8 @@ pub fn run() {
         .register_uri_scheme_protocol("mjeku", ui_protocol::handle)
         .setup(|app| {
             #[cfg(desktop)]
-            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             let handle = app.handle();
             let data_dir = handle
                 .path()
@@ -5061,7 +6261,9 @@ pub fn run() {
 
             let session = if is_demo_mode {
                 // Reviewer-i futet direkt ne app, pa pasur nevoje te shkruaje asgje.
-                SessionKind::User { role: crate::auth::UserRole::Owner }
+                SessionKind::User {
+                    role: crate::auth::UserRole::Owner,
+                }
             } else {
                 crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None)
             };
@@ -5095,12 +6297,18 @@ pub fn run() {
                                 Err(_) => return,
                             };
                             for job in jobs {
-                                if fiscal_job_age_secs(&job.created_at) > FISCAL_JOB_AUTO_MAX_AGE_SECS {
+                                if fiscal_job_age_secs(&job.created_at)
+                                    > FISCAL_JOB_AUTO_MAX_AGE_SECS
+                                {
                                     continue; // kërkon aprovim manual
                                 }
                                 match fiscal_job_process_inner(&db2, &job) {
-                                    Ok(()) => { let _ = fiscal_job_mark(&db2, &job, "done", None); }
-                                    Err(e) => { let _ = fiscal_job_mark(&db2, &job, "failed", Some(e)); }
+                                    Ok(()) => {
+                                        let _ = fiscal_job_mark(&db2, &job, "done", None);
+                                    }
+                                    Err(e) => {
+                                        let _ = fiscal_job_mark(&db2, &job, "failed", Some(e));
+                                    }
                                 }
                             }
                         })
@@ -5129,6 +6337,7 @@ pub fn run() {
             app.manage(AppState {
                 db,
                 auth,
+                pos_itadmin_settings_mode: AtomicBool::new(false),
                 sync,
                 updates,
                 license,
@@ -5191,6 +6400,7 @@ pub fn run() {
             auth_user_login,
             auth_logs_admin_login,
             auth_user_logout,
+            auth_pos_itadmin_logout,
             auth_doctor_login,
             auth_doctor_logout,
             doctors_login_options,
@@ -5262,6 +6472,7 @@ pub fn run() {
             sales_mark_non_fiscal_manual,
             payments_list,
             payments_upsert,
+            payments_replace_for_sale,
             payments_delete,
             doctors_list,
             doctors_upsert,
@@ -5322,9 +6533,17 @@ pub fn run() {
             fiscal_job_cancel,
             fiscal_job_process,
             sef_bridge_info,
+            sef_bridge_pos_session,
+            sef_bridge_pos_auth_available,
+            sef_bridge_pos_authenticate,
             sef_bridge_status,
+            sef_bridge_open_atk_access,
+            sef_bridge_sync_clock,
+            sef_bridge_sync_business_settings,
             sef_bridge_select_engine,
             sef_coupons_list,
+            sef_coupon_preview,
+            sef_coupon_email,
             sef_coupon_copy,
             sef_coupon_return,
             sef_coupon_cancel,
@@ -5357,4 +6576,21 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod fiscal_report_provider_tests {
+    use super::*;
+
+    #[test]
+    fn xz_reports_are_rejected_for_programeri_sef_and_remain_pef_only() {
+        assert_eq!(
+            require_pef_report_provider(crate::sef_bridge::PROVIDER_VALUE).unwrap_err(),
+            MSG_PEF_ONLY_REPORTS
+        );
+        assert!(require_pef_report_provider("enternet").is_ok());
+        assert!(require_pef_report_provider("global_eu")
+            .unwrap_err()
+            .contains("Global EU"));
+    }
 }

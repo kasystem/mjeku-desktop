@@ -105,17 +105,17 @@ pub async fn check_now(
         if status == reqwest::StatusCode::NOT_FOUND {
             // Graceful fallback when repository has no published Releases yet.
             return Ok(DesktopUpdateInfo {
-        update_available: false,
-        current_version: current_version.clone(),
-        latest_version: Some(norm_ver(&current_version)),
-        published_at: None,
-        download_url: None,
-        notes: Some("Eshte ne versionin final, nuk ka update.".to_string()),
-        forced: false,
-        force_deadline_at: None,
-        last_manual_check_at: None,
-        checked_at: None,
-      });
+                update_available: false,
+                current_version: current_version.clone(),
+                latest_version: Some(norm_ver(&current_version)),
+                published_at: None,
+                download_url: None,
+                notes: Some("Eshte ne versionin final, nuk ka update.".to_string()),
+                forced: false,
+                force_deadline_at: None,
+                last_manual_check_at: None,
+                checked_at: None,
+            });
         }
         bail!("update check failed: {status} {body}");
     }

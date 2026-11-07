@@ -9,7 +9,9 @@ use serde_json::{Map, Value};
 
 use crate::db::Db;
 use crate::models::{
-    Appointment, CashEntry, Client, Doctor, FiscalJob, Offer, OfferItem, Payment, Prescription, Sale, Service, StockItem, StockMovement, StockSupplier, SyncQueueItem, Visit, VisitItem, DoctorAccount,
+    Appointment, CashEntry, Client, Doctor, DoctorAccount, FiscalJob, Offer, OfferItem, Payment,
+    Prescription, Sale, Service, StockItem, StockMovement, StockSupplier, SyncQueueItem, Visit,
+    VisitItem,
 };
 use crate::util::{is_network_error, now_iso, parse_rfc3339_to_utc};
 
@@ -149,7 +151,9 @@ impl SyncEngine {
         }
 
         // Sync clinic-level settings (bank account) — non-fatal.
-        let _ = self.sync_clinic_settings(&supabase_url, &api_key, &clinic_id).await;
+        let _ = self
+            .sync_clinic_settings(&supabase_url, &api_key, &clinic_id)
+            .await;
 
         // Mark successful sync time.
         self.db.set_last_sync_time(&sync_started_at)?;
@@ -287,7 +291,8 @@ impl SyncEngine {
                     continue;
                 }
             }
-            self.db.sync_queue_drop_pending_for_row("fiscal_jobs", &r.id)?;
+            self.db
+                .sync_queue_drop_pending_for_row("fiscal_jobs", &r.id)?;
             self.db.apply_remote_fiscal_job(&r)?;
         }
 
@@ -301,7 +306,8 @@ impl SyncEngine {
                     continue;
                 }
             }
-            self.db.sync_queue_drop_pending_for_row("prescriptions", &r.id)?;
+            self.db
+                .sync_queue_drop_pending_for_row("prescriptions", &r.id)?;
             self.db.apply_remote_prescription(&r)?;
         }
 
@@ -315,7 +321,8 @@ impl SyncEngine {
                     continue;
                 }
             }
-            self.db.sync_queue_drop_pending_for_row("stock_suppliers", &r.id)?;
+            self.db
+                .sync_queue_drop_pending_for_row("stock_suppliers", &r.id)?;
             self.db.apply_remote_stock_supplier(&r)?;
         }
 
@@ -329,7 +336,8 @@ impl SyncEngine {
                     continue;
                 }
             }
-            self.db.sync_queue_drop_pending_for_row("stock_items", &r.id)?;
+            self.db
+                .sync_queue_drop_pending_for_row("stock_items", &r.id)?;
             self.db.apply_remote_stock_item(&r)?;
         }
 
@@ -365,7 +373,8 @@ impl SyncEngine {
                 return Ok(());
             }
         }
-        self.db.sync_queue_drop_pending_for_row("doctor_accounts", &remote.doctor_id)?;
+        self.db
+            .sync_queue_drop_pending_for_row("doctor_accounts", &remote.doctor_id)?;
         self.db.apply_remote_doctor_account(remote)?;
         Ok(())
     }
@@ -482,7 +491,8 @@ impl SyncEngine {
                 return Ok(());
             }
         }
-        self.db.sync_queue_drop_pending_for_row("offers", &remote.id)?;
+        self.db
+            .sync_queue_drop_pending_for_row("offers", &remote.id)?;
         self.db.apply_remote_offer(remote)?;
         Ok(())
     }
@@ -494,7 +504,8 @@ impl SyncEngine {
                 return Ok(());
             }
         }
-        self.db.sync_queue_drop_pending_for_row("offer_items", &remote.id)?;
+        self.db
+            .sync_queue_drop_pending_for_row("offer_items", &remote.id)?;
         self.db.apply_remote_offer_item(remote)?;
         Ok(())
     }
@@ -524,21 +535,26 @@ impl SyncEngine {
         if !status.is_success() {
             let msg = serde_json::from_str::<Value>(&body)
                 .ok()
-                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_else(|| body.clone());
             let err_msg = format!("supabase pull failed {table}: {status} {msg}");
-            append_sync_error(
-                self.db.as_ref(),
-                "sync_fetch_table",
-                &err_msg,
-            );
+            append_sync_error(self.db.as_ref(), "sync_fetch_table", &err_msg);
             bail!("{err_msg}");
         }
         let rows: Vec<T> = serde_json::from_str(&body).context("decode json")?;
         Ok(rows)
     }
 
-    async fn push_queue(&self, supabase_url: &str, api_key: &str, clinic_id: &str) -> anyhow::Result<()> {
+    async fn push_queue(
+        &self,
+        supabase_url: &str,
+        api_key: &str,
+        clinic_id: &str,
+    ) -> anyhow::Result<()> {
         let items = self.db.sync_queue_list_pending(200)?;
         if items.is_empty() {
             return Ok(());
@@ -571,7 +587,10 @@ impl SyncEngine {
 
             // Inject clinic_id into the payload for all upserts.
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("clinic_id".to_string(), Value::String(clinic_id.to_string()));
+                obj.insert(
+                    "clinic_id".to_string(),
+                    Value::String(clinic_id.to_string()),
+                );
             }
 
             normalize_sync_row_for_table(&it.table_name, &mut v);
@@ -599,10 +618,14 @@ impl SyncEngine {
                 let mut payload: Vec<Value> = batch.iter().map(|(_, v)| v.clone()).collect();
                 normalize_object_batch_keys(&mut payload);
                 normalize_table_batch_values(&table, &mut payload);
-                
-                let conflict_col = if table == "doctor_accounts" { "doctor_id" } else { "id" };
+
+                let conflict_col = if table == "doctor_accounts" {
+                    "doctor_id"
+                } else {
+                    "id"
+                };
                 let url = format!("{base}/rest/v1/{table}?on_conflict={conflict_col}");
-                
+
                 let resp = with_supabase_auth(self.client.post(&url), api_key)
                     .header("Prefer", "resolution=merge-duplicates,return=minimal")
                     .header("clinic_id", clinic_id)
@@ -612,11 +635,29 @@ impl SyncEngine {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    let json_msg = serde_json::from_str::<Value>(&body)
-                        .ok()
-                        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                    let parsed = serde_json::from_str::<Value>(&body).ok();
+                    let json_msg = parsed
+                        .as_ref()
+                        .and_then(|v| {
+                            v.get("message")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or_else(|| body.clone());
-                    let msg = format!("supabase upsert failed {table}: {status} {json_msg}");
+                    let error_code = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("code").and_then(Value::as_str))
+                        .unwrap_or("");
+                    let missing_services_atk_column = table == "services"
+                        && json_msg.to_ascii_lowercase().contains("atk_category_code")
+                        && (json_msg.to_ascii_lowercase().contains("schema cache")
+                            || error_code == "PGRST204"
+                            || error_code == "42703");
+                    let msg = if missing_services_atk_column {
+                        format!("Supabase refuzoi sinkronizimin e shërbimeve: mungon kolona `services.atk_category_code` ({}). Apliko `src-tauri/migrations/product_catalog_atk_v1.sql` në projektin Supabase të Mjekut dhe rifresko cache-in e PostgREST (`NOTIFY pgrst, 'reload schema';`). Rreshtat dhe klasifikimet ATK mbeten lokalisht në radhë; sinkronizo përsëri pas migrimit.", status)
+                    } else {
+                        format!("supabase upsert failed {table}: {status} {json_msg}")
+                    };
                     append_sync_error(self.db.as_ref(), "sync_upsert", &msg);
                     for (qid, _) in batch {
                         self.db.sync_queue_mark_failed(&qid, &msg)?;
@@ -631,7 +672,11 @@ impl SyncEngine {
 
         // Deletes individually (PATCH deleted=1).
         for (it, v) in deletes {
-            let pk_col = if it.table_name == "doctor_accounts" { "doctor_id" } else { "id" };
+            let pk_col = if it.table_name == "doctor_accounts" {
+                "doctor_id"
+            } else {
+                "id"
+            };
             let id = v
                 .get(pk_col)
                 .and_then(|x| x.as_str())
@@ -682,7 +727,8 @@ impl SyncEngine {
         // Push local value to clinic_registry if set.
         if !local_bank.trim().is_empty() {
             let url = format!("{base}/rest/v1/clinic_registry?on_conflict=clinic_id");
-            let body = serde_json::json!([{ "clinic_id": clinic_id, "bank_account": local_bank.trim() }]);
+            let body =
+                serde_json::json!([{ "clinic_id": clinic_id, "bank_account": local_bank.trim() }]);
             let _ = with_supabase_auth(self.client.post(&url), api_key)
                 .header("Prefer", "resolution=merge-duplicates,return=minimal")
                 .header("clinic_id", clinic_id)
@@ -692,7 +738,8 @@ impl SyncEngine {
         }
 
         // Pull remote value; update local if remote differs and local is empty.
-        let url = format!("{base}/rest/v1/clinic_registry?clinic_id=eq.{clinic_id}&select=bank_account");
+        let url =
+            format!("{base}/rest/v1/clinic_registry?clinic_id=eq.{clinic_id}&select=bank_account");
         if let Ok(resp) = with_supabase_auth(self.client.get(&url), api_key)
             .header("clinic_id", clinic_id)
             .send()
@@ -771,8 +818,12 @@ fn normalize_sync_row_for_table(table: &str, row: &mut Value) {
                 obj.remove("supplier_name");
             }
             "stock_movements" => {
-                if !obj.contains_key("updated_at") || obj.get("updated_at").map(Value::is_null).unwrap_or(true) {
-                    if let Some(created) = obj.get("created_at").cloned() { obj.insert("updated_at".into(), created); }
+                if !obj.contains_key("updated_at")
+                    || obj.get("updated_at").map(Value::is_null).unwrap_or(true)
+                {
+                    if let Some(created) = obj.get("created_at").cloned() {
+                        obj.insert("updated_at".into(), created);
+                    }
                 }
             }
             "sales" => {

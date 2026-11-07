@@ -104,7 +104,9 @@ fn ui_bundle_looks_compatible(dir: &Path) -> bool {
             }
 
             if !has_programeri_sef_bridge
-                && bytes.windows(b"sef_bridge_select_engine".len()).any(|w| w == b"sef_bridge_select_engine")
+                && bytes
+                    .windows(b"sef_bridge_select_engine".len())
+                    .any(|w| w == b"sef_bridge_select_engine")
             {
                 has_programeri_sef_bridge = true;
             }
@@ -281,7 +283,9 @@ impl UpdatesEngine {
         ensure_ui_dirs(app)?;
         let pending = pending_ui_version(app)?;
         if let Some(v) = pending {
-            if version_installed(app, &v)? && ui_bundle_looks_compatible(&versions_dir(app)?.join(&v)) {
+            if version_installed(app, &v)?
+                && ui_bundle_looks_compatible(&versions_dir(app)?.join(&v))
+            {
                 set_pointer_atomic(&current_ptr_path(app)?, &v)?;
             }
             // Old or incompatible pending UI must never replace the SEF-capable seed.
@@ -349,7 +353,9 @@ impl UpdatesEngine {
     pub fn apply_downloaded_now(app: &tauri::AppHandle) -> anyhow::Result<bool> {
         let pending = pending_ui_version(app)?;
         if let Some(v) = pending {
-            if version_installed(app, &v)? && ui_bundle_looks_compatible(&versions_dir(app)?.join(&v)) {
+            if version_installed(app, &v)?
+                && ui_bundle_looks_compatible(&versions_dir(app)?.join(&v))
+            {
                 set_pointer_atomic(&current_ptr_path(app)?, &v)?;
                 clear_pending(app)?;
                 return Ok(true);
@@ -454,7 +460,6 @@ fn extract_zip_archive<R: std::io::Read + std::io::Seek>(
     mut archive: ZipArchive<R>,
     dest: &Path,
 ) -> anyhow::Result<()> {
-
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         let name = file.name().to_string();

@@ -107,3 +107,6 @@ UPDATE public.stock_movements
   WHERE updated_at IS NULL;
 CREATE INDEX IF NOT EXISTS stock_movements_clinic_updated_at_idx
   ON public.stock_movements (clinic_id, updated_at);
+
+-- Make new columns visible to PostgREST immediately after this migration.
+NOTIFY pgrst, 'reload schema';

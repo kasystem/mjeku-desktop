@@ -25,7 +25,8 @@ use crate::models::LabDeviceStatus;
 pub const PROTOCOL_ASTM_E1394: &str = "astm_e1394";
 
 pub fn known_profiles() -> Vec<AnalyzerProfile> {
-    let astm_default = |id: &str, brand: &str, model: &str| AnalyzerProfile {
+    let astm_default = |id: &str, brand: &str, model: &str| {
+        AnalyzerProfile {
         id: id.to_string(),
         brand: brand.to_string(),
         model: model.to_string(),
@@ -35,6 +36,7 @@ pub fn known_profiles() -> Vec<AnalyzerProfile> {
         parity: "none".to_string(),
         stop_bits: 1,
         notes: "ASTM E1394 mbi RS232, 9600 8N1 (default i dokumentuar publikisht — verifiko kundër ICD-së së pajisjes)".to_string(),
+    }
     };
 
     vec![
@@ -227,7 +229,10 @@ pub fn format_results_as_text(msg: &ParsedAstmMessage) -> String {
     let mut out = String::new();
     out.push_str("— Rezultate laboratori (import automatik) —\n");
     if !msg.patient_name.is_empty() {
-        out.push_str(&format!("Pacienti (nga analizuesi): {}\n", msg.patient_name));
+        out.push_str(&format!(
+            "Pacienti (nga analizuesi): {}\n",
+            msg.patient_name
+        ));
     }
     for r in &msg.results {
         let flag_suffix = if r.flag.trim().is_empty() {
@@ -237,7 +242,11 @@ pub fn format_results_as_text(msg: &ParsedAstmMessage) -> String {
         };
         out.push_str(&format!(
             "{}: {} {}{}{}\n",
-            if r.test_id.is_empty() { "?" } else { &r.test_id },
+            if r.test_id.is_empty() {
+                "?"
+            } else {
+                &r.test_id
+            },
             r.value,
             r.units,
             if r.ref_range.trim().is_empty() {
@@ -337,7 +346,6 @@ impl LabSerialManager {
         let mut st = self.status.lock().unwrap();
         st.connected = false;
     }
-
 }
 
 #[cfg(desktop)]
@@ -418,7 +426,8 @@ impl LabSerialManager {
                                     &text,
                                 ) {
                                     let mut st = status.lock().unwrap();
-                                    st.last_error = Some(format!("ruajtja e rezultatit dështoi: {e}"));
+                                    st.last_error =
+                                        Some(format!("ruajtja e rezultatit dështoi: {e}"));
                                 } else {
                                     let mut st = status.lock().unwrap();
                                     st.last_message_at = Some(crate::util::now_iso());
@@ -453,7 +462,9 @@ impl LabSerialManager {
         _port_name: String,
         _profile: AnalyzerProfile,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("Lidhja me analizues laboratorik mbështetet vetëm në desktop (Windows/macOS).")
+        anyhow::bail!(
+            "Lidhja me analizues laboratorik mbështetet vetëm në desktop (Windows/macOS)."
+        )
     }
 }
 

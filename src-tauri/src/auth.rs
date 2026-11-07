@@ -478,7 +478,8 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
 }
 
 fn session_set_expiry(db: &Db) -> anyhow::Result<()> {
-    let expiry = (chrono::Utc::now() + chrono::Duration::hours(SESSION_LIFETIME_HOURS)).to_rfc3339();
+    let expiry =
+        (chrono::Utc::now() + chrono::Duration::hours(SESSION_LIFETIME_HOURS)).to_rfc3339();
     db.setting_set(KEY_SESSION_EXPIRES_AT, &expiry)?;
     Ok(())
 }
@@ -601,8 +602,14 @@ mod security_session_tests {
 
     fn configured_db() -> Db {
         let db = Db::new_in_memory().expect("in-memory database");
-        setup_v2(&db, "Test clinic", "vendor-admin-test-123", "owner-test-123", Some("cashier-test-123"))
-            .expect("configure test clinic");
+        setup_v2(
+            &db,
+            "Test clinic",
+            "vendor-admin-test-123",
+            "owner-test-123",
+            Some("cashier-test-123"),
+        )
+        .expect("configure test clinic");
         db
     }
 
@@ -613,15 +620,24 @@ mod security_session_tests {
         db.setting_set(KEY_USER_LOGGED_IN, "1").unwrap();
         assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
         assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
-        assert_eq!(db.setting_get(KEY_USER_LOGGED_IN).unwrap().as_deref(), Some("0"));
+        assert_eq!(
+            db.setting_get(KEY_USER_LOGGED_IN).unwrap().as_deref(),
+            Some("0")
+        );
         assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
     }
 
     #[test]
     fn regular_role_login_remains_available() {
         let db = configured_db();
-        assert!(matches!(user_verify_role(&db, "owner-test-123").unwrap(), Some(UserRole::Owner)));
-        assert!(matches!(user_verify_role(&db, "cashier-test-123").unwrap(), Some(UserRole::Cashier)));
+        assert!(matches!(
+            user_verify_role(&db, "owner-test-123").unwrap(),
+            Some(UserRole::Owner)
+        ));
+        assert!(matches!(
+            user_verify_role(&db, "cashier-test-123").unwrap(),
+            Some(UserRole::Cashier)
+        ));
         assert!(user_verify_role(&db, "incorrect").unwrap().is_none());
     }
 
@@ -631,7 +647,10 @@ mod security_session_tests {
         db.setting_set(KEY_SESSION, "").unwrap();
         db.setting_set(KEY_USER_LOGGED_IN, "1").unwrap();
         assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
-        assert_eq!(db.setting_get(KEY_USER_LOGGED_IN).unwrap().as_deref(), Some("0"));
+        assert_eq!(
+            db.setting_get(KEY_USER_LOGGED_IN).unwrap().as_deref(),
+            Some("0")
+        );
     }
 
     #[test]
@@ -662,7 +681,8 @@ mod security_session_tests {
     fn expired_owner_session_is_revoked() {
         let db = configured_db();
         session_set_user(&db).unwrap();
-        db.setting_set(KEY_SESSION_EXPIRES_AT, "2000-01-01T00:00:00Z").unwrap();
+        db.setting_set(KEY_SESSION_EXPIRES_AT, "2000-01-01T00:00:00Z")
+            .unwrap();
         assert!(matches!(session_get(&db).unwrap(), SessionKind::None));
         assert_eq!(db.setting_get(KEY_SESSION).unwrap().as_deref(), Some(""));
     }
@@ -678,13 +698,23 @@ mod security_session_tests {
     fn cashier_session_receives_expiry() {
         let db = configured_db();
         session_set_cashier(&db).unwrap();
-        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { role: UserRole::Cashier }));
+        assert!(matches!(
+            session_get(&db).unwrap(),
+            SessionKind::User {
+                role: UserRole::Cashier
+            }
+        ));
     }
 
     #[test]
     fn owner_session_is_not_revoked_by_legacy_admin_cleanup() {
         let db = configured_db();
         session_set_user(&db).unwrap();
-        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { role: UserRole::Owner }));
+        assert!(matches!(
+            session_get(&db).unwrap(),
+            SessionKind::User {
+                role: UserRole::Owner
+            }
+        ));
     }
 }
