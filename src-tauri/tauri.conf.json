@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
   "productName": "Mjeku",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "identifier": "com.mjeku.desktop",
   "build": {
     "devUrl": "http://127.0.0.1:5173",
@@ -52,8 +52,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZFNkNEMjA1NjBEOUI4NjkKUldScHVObGdCZEpzYmhsYTBoeExqZkxtWG5MU3lkMGZON3Zzc2VidzJqSmZLcnFZQ2RlZ0NKaisK",
       "endpoints": [
-        "https://github.com/kasystem/mjeku-desktop/releases/latest/download/desktop-update.json",
-        "https://mjeku-ui.vercel.app/desktop-update.json"
+        "https://github.com/kasystem/mjeku-desktop/releases/latest/download/desktop-update.json"
       ],
       "dialog": false
     }

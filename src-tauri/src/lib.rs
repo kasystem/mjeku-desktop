@@ -4692,6 +4692,32 @@ async fn sef_bridge_open_atk_access(state: tauri::State<'_, AppState>) -> Result
         .ok_or_else(|| "PROGRAMERI POS nuk konfirmoi hapjen e Qasjes ATK.".to_string())
 }
 
+/// Opens the clinic's accounting in PROGRAMERI POS. The POS host asks for a POS
+/// login (role with accounting permission) and shows its own window; Mjeku
+/// receives no accounting data and never handles those credentials.
+#[tauri::command]
+async fn sef_bridge_open_accounting(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let _ = require_owner(&state).await?;
+    let provider = get_fiscal_printer_provider(&state).await?;
+    if provider != crate::sef_bridge::PROVIDER_VALUE {
+        return Err("Kontabiliteti kërkon SEF (PROGRAMERI POS).".to_string());
+    }
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Err("Kontabiliteti hapet kur Mjeku niset nga PROGRAMERI POS në Windows.".to_string());
+    }
+    let result = crate::sef_bridge::call(
+        "accounting.open",
+        serde_json::json!({}),
+        Duration::from_secs(300),
+    )
+    .await
+    .map_err(err_string)?;
+    result
+        .get("opened")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "PROGRAMERI POS nuk konfirmoi hapjen e Kontabilitetit.".to_string())
+}
+
 #[tauri::command]
 async fn sef_bridge_sync_clock(
     state: tauri::State<'_, AppState>,
@@ -6347,8 +6373,10 @@ pub fn run() {
             });
 
             // Silent background updater: check once on startup, download+install, then restart.
+            // When PROGRAMERI POS launched Mjeku, POS owns the version (it ships Mjeku inside its own
+            // signed update), so Mjeku must not replace itself underneath the fiscal bridge.
             #[cfg(desktop)]
-            if !tauri::is_dev() {
+            if !tauri::is_dev() && !crate::sef_bridge::launched_from_programeri() {
                 let handle_upd = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     // Wait 30 s so the app is fully ready before hitting the network.
@@ -6538,6 +6566,7 @@ pub fn run() {
             sef_bridge_pos_authenticate,
             sef_bridge_status,
             sef_bridge_open_atk_access,
+            sef_bridge_open_accounting,
             sef_bridge_sync_clock,
             sef_bridge_sync_business_settings,
             sef_bridge_select_engine,

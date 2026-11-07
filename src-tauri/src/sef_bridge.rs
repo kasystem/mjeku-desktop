@@ -62,6 +62,8 @@ pub const CAPABILITY_COUPON_PREVIEW_DELIVERY: &str = "coupon_preview_delivery_v1
 pub const CAPABILITY_COUPON_EMAIL: &str = "coupon_email_v1";
 pub const CAPABILITY_RECEIPT_LOGO_OVERRIDE: &str = "receipt_logo_override_v1";
 pub const CAPABILITY_ATK_ACCESS_WINDOW: &str = "atk_access_window_v1";
+/// Butoni "Kontabiliteti": PROGRAMERI POS hap kontabilitetin e klinikës (op `accounting.open`).
+pub const CAPABILITY_ACCOUNTING_WINDOW: &str = "accounting_window_v1";
 
 /// Lista e aftësive të binarit. Në macOS/iOS bosh (SEF nuk shfaqet fare).
 pub fn capabilities() -> Vec<String> {
@@ -77,6 +79,7 @@ pub fn capabilities() -> Vec<String> {
         values.push(CAPABILITY_COUPON_PREVIEW_DELIVERY.to_string());
         values.push(CAPABILITY_COUPON_EMAIL.to_string());
         values.push(CAPABILITY_ATK_ACCESS_WINDOW.to_string());
+        values.push(CAPABILITY_ACCOUNTING_WINDOW.to_string());
     }
     values
 }
@@ -1293,6 +1296,7 @@ mod tests {
                     CAPABILITY_COUPON_PREVIEW_DELIVERY.to_string(),
                     CAPABILITY_COUPON_EMAIL.to_string(),
                     CAPABILITY_ATK_ACCESS_WINDOW.to_string(),
+                    CAPABILITY_ACCOUNTING_WINDOW.to_string(),
                 ]
             );
         } else if cfg!(target_os = "android") {
@@ -1310,6 +1314,7 @@ mod tests {
         );
         assert_eq!(CAPABILITY_COUPON_EMAIL, "coupon_email_v1");
         assert_eq!(CAPABILITY_ATK_ACCESS_WINDOW, "atk_access_window_v1");
+        assert_eq!(CAPABILITY_ACCOUNTING_WINDOW, "accounting_window_v1");
     }
 
     #[test]

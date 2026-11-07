@@ -14,6 +14,8 @@ use crate::db::Db;
 
 const DEFAULT_UPDATE_BASE_URL: &str = "https://mjeku-ui.onrender.com";
 const FALLBACK_UPDATE_BASE_URL: &str = "https://mjeku-ui.vercel.app";
+/// Remote UI bundles (Render/Vercel) are retired; updates come only with the desktop binary.
+const REMOTE_UI_UPDATES_ENABLED: bool = false;
 
 const KEY_UPDATE_BASE_URL: &str = "update_base_url";
 
@@ -151,6 +153,12 @@ impl UpdatesEngine {
     }
 
     pub async fn check_now(&self, app: &tauri::AppHandle) -> anyhow::Result<()> {
+        // 0.6.1: the UI ships only inside the signed desktop binary (ui-seed.zip), which also
+        // wins at every start (ensure_seed_installed). No UI is downloaded from Render/Vercel.
+        if !REMOTE_UI_UPDATES_ENABLED {
+            let _ = app;
+            return Ok(());
+        }
         let _guard = self.lock.lock().await;
 
         ensure_ui_dirs(app)?;
