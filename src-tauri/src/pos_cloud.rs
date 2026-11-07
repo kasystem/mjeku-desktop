@@ -99,6 +99,10 @@ pub struct CodeActivation {
 /// POS project, which returns this PC's device identity plus the clinic's bootstrap login (salt + hash only).
 /// The old Mjeku project is not contacted.
 pub async fn activate_with_code(db: &Db, code: &str) -> anyhow::Result<CodeActivation> {
+    activate_with_code_for(db, code, None).await
+}
+
+async fn activate_with_code_for(db: &Db, code: &str, expected_clinic: Option<&str>) -> anyhow::Result<CodeActivation> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(45))
@@ -124,6 +128,11 @@ pub async fn activate_with_code(db: &Db, code: &str) -> anyhow::Result<CodeActiv
     if uuid::Uuid::parse_str(&clinic_id).is_err() {
         anyhow::bail!("Përgjigje e pavlefshme nga PROGRAMERI POS.");
     }
+    if let Some(expected) = expected_clinic {
+        if !clinic_id.eq_ignore_ascii_case(expected) {
+            anyhow::bail!("Ky kod i përket një klinike tjetër.");
+        }
+    }
     store_provision(db, &clinic_id, &v)?;
     let b = |k: &str| v.get("bootstrap").and_then(|x| x.get(k)).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string);
     let name = s("clinic_name");
@@ -138,6 +147,35 @@ pub async fn activate_with_code(db: &Db, code: &str) -> anyhow::Result<CodeActiv
         cashier_salt: b("cashier_salt"),
         cashier_hash: b("cashier_hash"),
     })
+}
+
+/// Links an already configured Mjeku (Android/iOS, or a desktop not opened by POS) to the clinic in the
+/// PROGRAMERI POS project with a one-time AdminPanelTOKENS code. The code must belong to THIS clinic.
+pub async fn link_device_with_code(db: &Db, code: &str) -> anyhow::Result<bool> {
+    let local = get(db, "clinic_id");
+    if uuid::Uuid::parse_str(local.trim()).is_err() {
+        anyhow::bail!("Mjeku nuk është konfiguruar ende për një klinikë.");
+    }
+    let act = activate_with_code_for(db, code, Some(local.trim())).await?;
+    let _ = act;
+    Ok(is_migrated(db))
+}
+
+#[derive(serde::Serialize)]
+pub struct PosCloudStatus {
+    pub linked: bool,
+    pub migrated: bool,
+    pub launched_from_programeri: bool,
+    pub switched_at: String,
+}
+
+pub fn status(db: &Db) -> PosCloudStatus {
+    PosCloudStatus {
+        linked: official(&get(db, KEY_URL)) && !get(db, KEY_PASSWORD).is_empty(),
+        migrated: is_migrated(db),
+        launched_from_programeri: crate::sef_bridge::launched_from_programeri(),
+        switched_at: get(db, KEY_SWITCHED),
+    }
 }
 
 fn store_provision(db: &Db, clinic_id: &str, v: &Value) -> anyhow::Result<()> {

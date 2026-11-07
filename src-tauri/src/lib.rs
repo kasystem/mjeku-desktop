@@ -801,7 +801,9 @@ async fn provision_apply_token(
 
     // 0.6.1: opened by PROGRAMERI POS → the clinic lives in the POS project; the old Mjeku project is
     // never contacted (codes are issued in AdminPanelTOKENS).
-    if cfg!(target_os = "windows") && crate::sef_bridge::launched_from_programeri() {
+    if (cfg!(target_os = "windows") && crate::sef_bridge::launched_from_programeri())
+        || token_code.starts_with("MJK-")
+    {
         return provision_via_pos(&state, &token_code).await;
     }
 
@@ -4735,6 +4737,28 @@ async fn sef_bridge_open_atk_access(state: tauri::State<'_, AppState>) -> Result
         .ok_or_else(|| "PROGRAMERI POS nuk konfirmoi hapjen e Qasjes ATK.".to_string())
 }
 
+/// Status of the PROGRAMERI POS cloud link (all platforms).
+#[tauri::command]
+async fn pos_cloud_status(state: tauri::State<'_, AppState>) -> Result<crate::pos_cloud::PosCloudStatus, String> {
+    Ok(crate::pos_cloud::status(state.db.as_ref()))
+}
+
+/// Links this already configured Mjeku (Android/iOS or desktop) to the clinic in the PROGRAMERI POS
+/// project with a one-time AdminPanelTOKENS code; from then on sync and licence use only that project.
+#[tauri::command]
+async fn pos_cloud_link_device(state: tauri::State<'_, AppState>, code: String) -> Result<bool, String> {
+    let _ = require_owner(&state).await?;
+    let code = normalize_provision_token(&code);
+    if code.is_empty() {
+        return Err("Shkruaj kodin nga PROGRAMERI POS.".to_string());
+    }
+    let migrated = crate::pos_cloud::link_device_with_code(state.db.as_ref(), &code)
+        .await
+        .map_err(err_string)?;
+    let _ = state.license.check_now().await;
+    Ok(migrated)
+}
+
 /// Opens the clinic's accounting in PROGRAMERI POS. The POS host asks for a POS
 /// login (role with accounting permission) and shows its own window; Mjeku
 /// receives no accounting data and never handles those credentials.
@@ -6610,6 +6634,8 @@ pub fn run() {
             sef_bridge_status,
             sef_bridge_open_atk_access,
             sef_bridge_open_accounting,
+            pos_cloud_status,
+            pos_cloud_link_device,
             sef_bridge_sync_clock,
             sef_bridge_sync_business_settings,
             sef_bridge_select_engine,
