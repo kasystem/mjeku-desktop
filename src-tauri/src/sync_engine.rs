@@ -117,7 +117,22 @@ impl SyncEngine {
         // 0.6.1: identity from PROGRAMERI POS; switch to its project once the clinic was copied there.
         crate::pos_cloud::provision_if_due(&self.db).await;
         crate::pos_catalog::push_if_changed(&self.db).await;
-        let pos = crate::pos_cloud::remote(&self.db, &self.client).await.ok().flatten();
+        let pos = match crate::pos_cloud::remote(&self.db, &self.client).await {
+            Ok(p) => p,
+            Err(e) => {
+                // Migrated clinic: never fall back to the old Mjeku project; retry on the next tick.
+                if crate::pos_cloud::is_migrated(&self.db) {
+                    append_sync_error(self.db.as_ref(), "sync_pos_auth", &format!("offline: {e}"));
+                    self.set_status("pending", Some("offline".to_string())).await;
+                    return Ok(());
+                }
+                None
+            }
+        };
+        if pos.is_none() && crate::pos_cloud::is_migrated(&self.db) {
+            self.set_status("pending", Some("offline".to_string())).await;
+            return Ok(());
+        }
         if let Ok(mut g) = self.pos_bearer.write() {
             *g = pos.as_ref().map(|p| p.bearer.clone());
         }

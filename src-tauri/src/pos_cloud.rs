@@ -80,6 +80,66 @@ pub async fn provision_if_due(db: &Db) {
     let _ = store_provision(db, &clinic_id, &v);
 }
 
+const PROVISION_FN: &str = "/functions/v1/mjeku-device-provision";
+
+/// Result of a first-run activation code claimed in the PROGRAMERI POS project.
+pub struct CodeActivation {
+    pub clinic_id: String,
+    pub clinic_name: String,
+    pub mode: String,
+    pub admin_salt: String,
+    pub admin_hash: String,
+    pub user_salt: String,
+    pub user_hash: String,
+    pub cashier_salt: Option<String>,
+    pub cashier_hash: Option<String>,
+}
+
+/// 0.6.1 first-run activation inside PROGRAMERI POS: the code (issued in AdminPanelTOKENS) is claimed in the
+/// POS project, which returns this PC's device identity plus the clinic's bootstrap login (salt + hash only).
+/// The old Mjeku project is not contacted.
+pub async fn activate_with_code(db: &Db, code: &str) -> anyhow::Result<CodeActivation> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(45))
+        .build()?;
+    let resp = client
+        .post(format!("https://{OFFICIAL_HOST}{PROVISION_FN}"))
+        .json(&serde_json::json!({
+            "code": code,
+            "device_label": std::env::var("COMPUTERNAME").unwrap_or_default(),
+            "app_version": env!("CARGO_PKG_VERSION"),
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Lidhja me PROGRAMERI POS dështoi: {e}. Kontrollo internetin."))?;
+    let status = resp.status();
+    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        let msg = v.get("message").and_then(Value::as_str).unwrap_or("Kodi i aktivizimit nuk është i vlefshëm ose është përdorur.");
+        anyhow::bail!("{msg}");
+    }
+    let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let clinic_id = s("clinic_id");
+    if uuid::Uuid::parse_str(&clinic_id).is_err() {
+        anyhow::bail!("Përgjigje e pavlefshme nga PROGRAMERI POS.");
+    }
+    store_provision(db, &clinic_id, &v)?;
+    let b = |k: &str| v.get("bootstrap").and_then(|x| x.get(k)).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string);
+    let name = s("clinic_name");
+    Ok(CodeActivation {
+        clinic_id,
+        clinic_name: if name.is_empty() { "Klinika".to_string() } else { name },
+        mode: s("token_mode"),
+        admin_salt: b("admin_salt").unwrap_or_default(),
+        admin_hash: b("admin_hash").unwrap_or_default(),
+        user_salt: b("user_salt").unwrap_or_default(),
+        user_hash: b("user_hash").unwrap_or_default(),
+        cashier_salt: b("cashier_salt"),
+        cashier_hash: b("cashier_hash"),
+    })
+}
+
 fn store_provision(db: &Db, clinic_id: &str, v: &Value) -> anyhow::Result<()> {
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
     if s("clinic_id") != clinic_id {
@@ -110,6 +170,12 @@ fn store_provision(db: &Db, clinic_id: &str, v: &Value) -> anyhow::Result<()> {
     db.setting_set(KEY_MIGRATED, if migrated { "1" } else { "0" })?;
     db.setting_set(KEY_LAST_PROVISION, &now_secs().to_string())?;
     Ok(())
+}
+
+/// True once POS reported that this clinic lives in the PROGRAMERI POS project: from then on the old
+/// Mjeku project is never contacted (sync, licence, settings).
+pub fn is_migrated(db: &Db) -> bool {
+    get(db, KEY_MIGRATED) == "1" && official(&get(db, KEY_URL)) && !get(db, KEY_PASSWORD).is_empty()
 }
 
 /// The POS remote when this clinic was migrated and the device holds an identity; otherwise

@@ -709,6 +709,41 @@ async fn auth_setup(
     Ok(out)
 }
 
+async fn provision_via_pos(state: &tauri::State<'_, AppState>, token_code: &str) -> Result<AuthStateInfo, String> {
+    let act = crate::pos_cloud::activate_with_code(state.db.as_ref(), token_code)
+        .await
+        .map_err(err_string)?;
+    let db = state.db.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        if act.mode == TOKEN_MODE_NEW {
+            crate::auth::provision_new(&db, &act.clinic_id, &act.clinic_name)
+        } else if !act.admin_hash.is_empty() && !act.user_hash.is_empty() {
+            crate::auth::provision_existing(
+                &db,
+                &act.clinic_id,
+                &act.clinic_name,
+                &act.admin_salt,
+                &act.admin_hash,
+                &act.user_salt,
+                &act.user_hash,
+                act.cashier_salt.as_deref(),
+                act.cashier_hash.as_deref(),
+            )
+        } else {
+            anyhow::bail!(
+                "Ky kod nuk ka kredencialet e klinikës. Në AdminPanelTOKENS krijo kod \"PC e re\" (me fjalëkalimet e pronarit/adminit)."
+            )
+        }
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+    state.auth.set_session(SessionKind::None).await;
+    state.auth.admin_lock().await;
+    let _ = state.license.check_now().await;
+    Ok(out)
+}
+
 const DEMO_MODE_TOKEN: &str = "DEMOPROGRAMERI";
 
 #[tauri::command]
@@ -762,6 +797,12 @@ async fn provision_apply_token(
         .map_err(err_string)?;
     if already_configured {
         return Err("aplikacioni eshte konfiguruar tashme".to_string());
+    }
+
+    // 0.6.1: opened by PROGRAMERI POS → the clinic lives in the POS project; the old Mjeku project is
+    // never contacted (codes are issued in AdminPanelTOKENS).
+    if cfg!(target_os = "windows") && crate::sef_bridge::launched_from_programeri() {
+        return provision_via_pos(&state, &token_code).await;
     }
 
     let db = state.db.clone();

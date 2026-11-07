@@ -189,6 +189,10 @@ impl LicenseEngine {
             return Ok(());
         }
 
+        if crate::pos_cloud::is_migrated(self.db.as_ref()) {
+            return self.check_pos(now).await;
+        }
+
         let supabase_url = self.db.setting_get(KEY_SUPABASE_URL)?;
         let api_key = self
             .db
@@ -350,19 +354,6 @@ impl LicenseEngine {
         }
 
         let row = rows.remove(0);
-        let approved = row.approved.unwrap_or(false);
-        let disabled = row.disabled.unwrap_or(false);
-        let active_until = row.active_until.and_then(|x| {
-            let t = x.trim().to_string();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        });
-        let enforce_ip = row.enforce_ip.unwrap_or(false);
-        let allowed_ip_list = row.allowed_ip_list.unwrap_or_default();
-
         // Heartbeat: update seen info; ignore errors.
         let heartbeat_payload = serde_json::json!({
           "clinic_name": clinic_name.trim(),
@@ -399,6 +390,24 @@ impl LicenseEngine {
                 );
             }
         }
+
+        self.apply_row(row, public_ip, now).await
+    }
+
+    /// Applies a clinic_registry row (old project or PROGRAMERI POS project) to local state.
+    async fn apply_row(&self, row: ClinicRegistryRow, public_ip: Option<String>, now: String) -> anyhow::Result<()> {
+        let approved = row.approved.unwrap_or(false);
+        let disabled = row.disabled.unwrap_or(false);
+        let active_until = row.active_until.and_then(|x| {
+            let t = x.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+        let enforce_ip = row.enforce_ip.unwrap_or(false);
+        let allowed_ip_list = row.allowed_ip_list.unwrap_or_default();
 
         self.db
             .setting_set(KEY_LICENSE_DISABLED, if disabled { "1" } else { "0" })?;
@@ -482,6 +491,85 @@ impl LicenseEngine {
         };
         self.set_state(out).await;
         Ok(())
+    }
+
+    /// 0.6.1: a clinic copied to the PROGRAMERI POS project reads its licence there (RPC
+    /// `mjeku.clinic_license_v1`, device JWT); the old Mjeku project is no longer contacted.
+    async fn check_pos(&self, now: String) -> anyhow::Result<()> {
+        let s = |k: &str| self.db.setting_get(k).ok().flatten().unwrap_or_default().trim().to_string();
+        let pos = match crate::pos_cloud::remote(self.db.as_ref(), &self.client).await {
+            Ok(Some(p)) => p,
+            other => {
+                if let Err(e) = other {
+                    append_license_error(self.db.as_ref(), "license_check_pos", &format!("offline: {e}"));
+                }
+                let st = Self::compute_offline_state(self.db.as_ref())?;
+                self.set_state(st).await;
+                return Ok(());
+            }
+        };
+        let public_ip = self.fetch_public_ip().await;
+        let heartbeat = serde_json::json!({
+            "ip": public_ip.clone().unwrap_or_default(),
+            "owner_name": s(KEY_CLINIC_OWNER_NAME),
+            "contact_phone": s(KEY_CLINIC_PHONE),
+            "contact_email": s(KEY_CLINIC_EMAIL),
+            "address": s(KEY_CLINIC_ADDRESS),
+            "city": s(KEY_CLINIC_CITY),
+            "business_no": s(KEY_CLINIC_BUSINESS_NO),
+            "website": s(KEY_CLINIC_WEBSITE),
+            "bank_account": s("clinic_bank_account"),
+            "app_version": env!("CARGO_PKG_VERSION"),
+        });
+        let resp = self
+            .client
+            .post(format!("{}/rest/v1/rpc/clinic_license_v1", pos.base))
+            .header("apikey", &pos.anon_key)
+            .header("Authorization", format!("Bearer {}", pos.bearer))
+            .header("Content-Profile", crate::pos_cloud::SCHEMA)
+            .header("Accept-Profile", crate::pos_cloud::SCHEMA)
+            .json(&serde_json::json!({ "p_heartbeat": heartbeat }))
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                append_license_error(self.db.as_ref(), "license_check_pos", &format!("offline: {e}"));
+                let st = Self::compute_offline_state(self.db.as_ref())?;
+                self.set_state(st).await;
+                return Ok(());
+            }
+        };
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            append_license_error(self.db.as_ref(), "license_check_pos", &format!("license check failed: {status} {body}"));
+            let mut st = Self::compute_offline_state(self.db.as_ref())?;
+            // A disabled device (403) is a hard stop; other failures keep the offline grace.
+            if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
+                st.ok = false;
+                st.status = "disabled".to_string();
+            } else {
+                st.ok = st.ok && st.status == "offline_grace";
+                st.status = "error".to_string();
+            }
+            self.set_state(st).await;
+            bail!("license check failed: {status}");
+        }
+        let v: serde_json::Value = serde_json::from_str(&body).context("decode clinic_license_v1")?;
+        if !v.get("found").and_then(|x| x.as_bool()).unwrap_or(false) {
+            self.db.setting_set(KEY_LICENSE_LAST_CHECKED_AT, &now)?;
+            let st = LicensePublicState { ok: false, status: "pending_approval".to_string(), active_until: None, last_checked_at: Some(now) };
+            self.set_state(st).await;
+            return Ok(());
+        }
+        if let Some(bank) = v.get("bank_account").and_then(|x| x.as_str()).map(str::trim).filter(|x| !x.is_empty()) {
+            if s("clinic_bank_account").is_empty() {
+                let _ = self.db.setting_set("clinic_bank_account", bank);
+            }
+        }
+        let row: ClinicRegistryRow = serde_json::from_value(v).context("decode licence row")?;
+        self.apply_row(row, public_ip, now).await
     }
 
     async fn set_state(&self, st: LicensePublicState) {
@@ -654,5 +742,24 @@ impl LicenseEngine {
         }
         db.setting_set(KEY_LICENSE_LAST_SEEN_DEVICE_TIME, now_iso_str)?;
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod pos_license_tests {
+    use super::*;
+
+    #[test]
+    fn pos_project_licence_payload_maps_to_registry_row() {
+        let v = serde_json::json!({
+            "found": true, "clinic_id": "a053ef91-0285-4014-a43d-832bada094dc", "clinic_name": "Test Dent",
+            "approved": true, "disabled": false, "active_until": "2027-10-20T08:18:49.279+00:00",
+            "enforce_ip": false, "allowed_ip_list": "", "departments": "all", "bank_account": "", "updated_at": null
+        });
+        let row: ClinicRegistryRow = serde_json::from_value(v).unwrap();
+        assert_eq!(row.approved, Some(true));
+        assert_eq!(row.disabled, Some(false));
+        assert_eq!(row.departments.as_deref(), Some("all"));
+        assert!(parse_rfc3339_to_utc(row.active_until.as_deref().unwrap()).is_ok());
     }
 }
