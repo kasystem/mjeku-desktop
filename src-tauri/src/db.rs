@@ -3700,6 +3700,73 @@ impl Db {
         Ok(Some(bytes))
     }
 
+    /// Katalogu i klinikës për PROGRAMERI POS (bridge `catalog.sync`): shërbimet dhe ofertat, përfshirë
+    /// të fshirat (që POS-i t'i çaktivizojë). Çmimet e ofertës dërgohen me TVSH (bruto), si te Ofertat e POS-it.
+    pub fn pos_catalog_snapshot(&self) -> anyhow::Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        let conn = self.conn()?;
+        let mut services = Vec::new();
+        {
+            let mut st = conn.prepare(
+                "SELECT id, title, default_price, COALESCE(vat_code,'C'), COALESCE(deleted,0) FROM services ORDER BY id LIMIT 5000",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "title": r.get::<_, String>(1)?,
+                    "priceCents": (r.get::<_, f64>(2)? * 100.0).round() as i64,
+                    "vatCode": r.get::<_, String>(3)?,
+                    "deleted": r.get::<_, i64>(4)? != 0,
+                }))
+            })?;
+            for row in rows {
+                services.push(row?);
+            }
+        }
+        let mut offers = Vec::new();
+        {
+            let mut st = conn.prepare(
+                "SELECT o.id, o.offer_number, COALESCE(c.name,''), o.status, o.created_at, COALESCE(o.valid_until,''),
+                        o.vat_pct, COALESCE(o.notes,''), o.deleted_at IS NOT NULL
+                 FROM offers o LEFT JOIN clients c ON c.id = o.client_id
+                 ORDER BY o.created_at DESC LIMIT 2000",
+            )?;
+            let mut items = conn.prepare(
+                "SELECT description, qty, unit_price, discount_pct FROM offer_items
+                 WHERE offer_id = ?1 AND deleted_at IS NULL ORDER BY sort_order LIMIT 500",
+            )?;
+            let heads: Vec<(String, String, String, String, String, String, f64, String, bool)> = st
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (id, number, client, status, created, valid, vat, notes, deleted) in heads {
+                let factor = 1.0 + vat.max(0.0) / 100.0;
+                let lines: Vec<serde_json::Value> = items
+                    .query_map(params![id], |r| {
+                        Ok(serde_json::json!({
+                            "description": r.get::<_, String>(0)?,
+                            "qty": r.get::<_, f64>(1)?,
+                            "unitPriceCents": (r.get::<_, f64>(2)? * factor * 100.0).round() as i64,
+                            "discountPct": r.get::<_, f64>(3)?,
+                        }))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                offers.push(serde_json::json!({
+                    "id": id, "number": number, "clientName": client, "status": status,
+                    "createdAt": created, "validUntil": valid, "vatPct": vat, "notes": notes,
+                    "deleted": deleted, "items": lines,
+                }));
+            }
+        }
+        Ok((services, offers))
+    }
+
+    #[cfg(test)]
+    pub fn execute_batch_for_tests(&self, sql: &str) -> anyhow::Result<()> {
+        self.conn()?.execute_batch(sql)?;
+        Ok(())
+    }
+
     pub fn setting_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
         let conn = self.conn()?;
         conn.execute(
