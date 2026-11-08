@@ -3707,7 +3707,9 @@ impl Db {
         let mut services = Vec::new();
         {
             let mut st = conn.prepare(
-                "SELECT id, title, default_price, COALESCE(vat_code,'C'), COALESCE(deleted,0) FROM services ORDER BY id LIMIT 5000",
+                "SELECT id, title, default_price, COALESCE(vat_code,'C'), COALESCE(deleted,0),
+                        COALESCE(atk_category_code,'SM'), COALESCE(atk_unit_code,'CP')
+                 FROM services ORDER BY id LIMIT 5000",
             )?;
             let rows = st.query_map([], |r| {
                 Ok(serde_json::json!({
@@ -3716,6 +3718,9 @@ impl Db {
                     "priceCents": (r.get::<_, f64>(2)? * 100.0).round() as i64,
                     "vatCode": r.get::<_, String>(3)?,
                     "deleted": r.get::<_, i64>(4)? != 0,
+                    // Official ATK classification, so POS shows it instead of "Pa klasifikim".
+                    "atkCategoryCode": r.get::<_, String>(5)?,
+                    "atkUnitCode": r.get::<_, String>(6)?,
                 }))
             })?;
             for row in rows {

@@ -41,6 +41,20 @@ pub struct PosServiceChange {
     pub deleted: bool,
     #[serde(default)]
     pub updated_at: String,
+    #[serde(default)]
+    pub atk_category_code: String,
+    #[serde(default)]
+    pub atk_unit_code: String,
+}
+
+/// ATK code from POS when it is a known official code; None keeps the service's current code.
+fn atk_from_pos(code: &str, valid: fn(&str) -> bool) -> Option<String> {
+    let c = code.trim().to_uppercase();
+    if !c.is_empty() && valid(&c) {
+        Some(c)
+    } else {
+        None
+    }
 }
 
 fn is_newer(a: &str, b: &str) -> bool {
@@ -85,8 +99,8 @@ pub fn apply_pos_change(db: &Db, c: &PosServiceChange) -> anyhow::Result<Option<
         title: title.to_string(),
         default_price: c.price_cents as f64 / 100.0,
         vat_code,
-        atk_category_code: None,
-        atk_unit_code: None,
+        atk_category_code: atk_from_pos(&c.atk_category_code, crate::atk_catalog::valid_category_code),
+        atk_unit_code: atk_from_pos(&c.atk_unit_code, crate::atk_catalog::valid_unit_code),
         sku: None,
         barcode: None,
         category: None,
@@ -153,7 +167,7 @@ mod tests {
     use super::*;
 
     fn change(id: &str, title: &str, cents: i64, deleted: bool, at: &str) -> PosServiceChange {
-        PosServiceChange { local_ref: 7, id: id.into(), title: title.into(), price_cents: cents, vat_code: "C".into(), deleted, updated_at: at.into() }
+        PosServiceChange { local_ref: 7, id: id.into(), title: title.into(), price_cents: cents, vat_code: "C".into(), deleted, updated_at: at.into(), atk_category_code: String::new(), atk_unit_code: String::new() }
     }
 
     #[test]
@@ -177,6 +191,15 @@ mod tests {
         // Deleted in POS.
         assert!(apply_pos_change(&db, &change(&new_id, "", 0, true, "2100-01-01T00:00:00Z")).unwrap().is_some());
         assert!(!db.services_list(None).unwrap().iter().any(|x| x.id == new_id));
+
+        // ATK codes from POS: a known code is applied, an unknown or empty one keeps the current code.
+        let mut atk = change("s1", "Mbushje e re", 4000, false, "2100-01-02T00:00:00Z");
+        atk.atk_unit_code = "SEC".to_string();
+        atk.atk_category_code = "XX".to_string();
+        apply_pos_change(&db, &atk).unwrap();
+        let s = db.services_list(None).unwrap().into_iter().find(|x| x.id == "s1").unwrap();
+        assert_eq!(s.atk_unit_code, "SEC");
+        assert_eq!(s.atk_category_code, "SM");
     }
 
     #[test]
@@ -202,6 +225,8 @@ mod tests {
         assert_eq!(services.len(), 2);
         assert_eq!(services[0]["priceCents"], 2550);
         assert_eq!(services[1]["deleted"], true);
+        assert_eq!(services[0]["atkCategoryCode"], "SM");
+        assert_eq!(services[0]["atkUnitCode"], "CP");
         assert_eq!(offers[0]["clientName"], "Arben");
         assert_eq!(offers[0]["items"][0]["unitPriceCents"], 11800);
     }
