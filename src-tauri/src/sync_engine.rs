@@ -118,6 +118,7 @@ impl SyncEngine {
         crate::pos_cloud::provision_if_due(&self.db).await;
         crate::pos_catalog::push_if_changed(&self.db).await;
         crate::pos_payments::push_if_changed(&self.db).await;
+        crate::pos_clinic::push_if_changed(&self.db).await;
         let pos = match crate::pos_cloud::remote(&self.db, &self.client).await {
             Ok(p) => p,
             Err(e) => {

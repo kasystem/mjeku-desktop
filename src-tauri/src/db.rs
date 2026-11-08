@@ -3704,6 +3704,92 @@ impl Db {
     /// të fshirat (që POS-i t'i çaktivizojë). Çmimet e ofertës dërgohen me TVSH (bruto), si te Ofertat e POS-it.
     /// Collected per sale for PROGRAMERI POS accounting (`payments.sync`): card/bank → bank, the rest → cash.
     /// Deleted payments stay in the grouping with zero, so a correction is sent too.
+    /// `clinic.sync` payload: patients (identity/contact only — no clinical fields), stock items (not services)
+    /// and stock movements (except those that came from POS, `skip_prefix`).
+    pub fn pos_clinic_snapshot(
+        &self,
+        skip_prefix: &str,
+    ) -> anyhow::Result<(Vec<serde_json::Value>, Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        let conn = self.conn()?;
+        let mut patients = Vec::new();
+        {
+            let mut st = conn.prepare(
+                "SELECT id, COALESCE(name,''), COALESCE(phone,''), COALESCE(city,''), COALESCE(deleted,0)
+                 FROM clients ORDER BY id LIMIT 50000",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "phone": r.get::<_, String>(2)?,
+                    "city": r.get::<_, String>(3)?,
+                    "deleted": r.get::<_, i64>(4)? != 0,
+                }))
+            })?;
+            for row in rows {
+                patients.push(row?);
+            }
+        }
+        let mut items = Vec::new();
+        {
+            let mut st = conn.prepare(
+                "SELECT id, COALESCE(name,''), COALESCE(unit,''), COALESCE(deleted,0) FROM stock_items
+                 WHERE COALESCE(stock_kind,'unknown')<>'service' ORDER BY id LIMIT 5000",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "unit": r.get::<_, String>(2)?,
+                    "deleted": r.get::<_, i64>(3)? != 0,
+                }))
+            })?;
+            for row in rows {
+                items.push(row?);
+            }
+        }
+        let mut movements = Vec::new();
+        {
+            let mut st = conn.prepare(
+                "SELECT m.id, m.item_id, m.movement_type, m.quantity, COALESCE(m.price_per_unit,0) FROM stock_movements m
+                 JOIN stock_items i ON i.id=m.item_id AND COALESCE(i.stock_kind,'unknown')<>'service'
+                 WHERE substr(m.id,1,length(?1))<>?1 ORDER BY m.created_at, m.id LIMIT 50000",
+            )?;
+            let rows = st.query_map([skip_prefix], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "itemId": r.get::<_, String>(1)?,
+                    "type": r.get::<_, String>(2)?,
+                    "quantity": r.get::<_, f64>(3)?,
+                    "pricePerUnit": r.get::<_, f64>(4)?,
+                }))
+            })?;
+            for row in rows {
+                movements.push(row?);
+            }
+        }
+        Ok((patients, items, movements))
+    }
+
+    /// Current quantity of a stock item (same formula as the stock screens); None when the item is unknown.
+    pub fn stock_item_quantity_for_sync(&self, item_id: &str) -> anyhow::Result<Option<f64>> {
+        let conn = self.conn()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id=?1 AND deleted=0)",
+            [item_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let q: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN movement_type='in' THEN quantity WHEN movement_type='out' THEN -quantity ELSE quantity END), 0) FROM stock_movements WHERE item_id=?1",
+            [item_id],
+            |r| r.get(0),
+        )?;
+        Ok(Some(q))
+    }
+
     pub fn pos_payment_totals(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn()?;
         let mut st = conn.prepare(
