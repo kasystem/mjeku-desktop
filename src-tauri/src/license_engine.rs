@@ -33,6 +33,9 @@ const KEY_LICENSE_LAST_PUBLIC_IP: &str = "license_last_public_ip";
 const KEY_LICENSE_LAST_CHECKED_AT: &str = "license_last_checked_at";
 const KEY_LICENSE_LAST_SEEN_DEVICE_TIME: &str = "license_last_seen_device_time";
 const KEY_LICENSED_DEPARTMENTS: &str = "licensed_departments";
+/// Offline days after `active_until`, as PROGRAMERI POS LicenseOfflineGuard (ExpiresAt + grace).
+/// Set only from the POS business licence (`clinic_license_v1.grace_period_days`); 0 otherwise.
+const KEY_LICENSE_EXPIRY_GRACE_DAYS: &str = "license_expiry_grace_days";
 
 const GRACE_DAYS: i64 = 7;
 const CLOCK_BACKWARD_TOLERANCE_SECS: i64 = 5 * 60;
@@ -563,6 +566,13 @@ impl LicenseEngine {
             self.set_state(st).await;
             return Ok(());
         }
+        // Licence follows the PROGRAMERI POS business licence: same offline grace after expiry.
+        let grace = if v.get("license_source").and_then(|x| x.as_str()) == Some("pos") {
+            v.get("grace_period_days").and_then(|x| x.as_i64()).unwrap_or(0).clamp(0, 30)
+        } else {
+            0
+        };
+        self.db.setting_set(KEY_LICENSE_EXPIRY_GRACE_DAYS, &grace.to_string())?;
         if let Some(bank) = v.get("bank_account").and_then(|x| x.as_str()).map(str::trim).filter(|x| !x.is_empty()) {
             if s("clinic_bank_account").is_empty() {
                 let _ = self.db.setting_set("clinic_bank_account", bank);
@@ -575,6 +585,16 @@ impl LicenseEngine {
     async fn set_state(&self, st: LicensePublicState) {
         let mut w = self.state.write().await;
         *w = st;
+    }
+
+    /// Offline-only grace after `active_until` (0 unless the licence comes from PROGRAMERI POS).
+    fn expiry_grace_days(db: &Db) -> i64 {
+        db.setting_get(KEY_LICENSE_EXPIRY_GRACE_DAYS)
+            .ok()
+            .flatten()
+            .and_then(|x| x.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .clamp(0, 30)
     }
 
     fn compute_offline_state(db: &Db) -> anyhow::Result<LicensePublicState> {
@@ -684,7 +704,7 @@ impl LicenseEngine {
 
         if let Some(u) = active_until.as_deref() {
             if let (Ok(until), Ok(now_dt)) = (parse_rfc3339_to_utc(u), parse_rfc3339_to_utc(&now)) {
-                if now_dt > until {
+                if now_dt > until + chrono::Duration::days(Self::expiry_grace_days(db)) {
                     return Ok(LicensePublicState {
                         ok: false,
                         status: "expired".to_string(),
@@ -761,5 +781,41 @@ mod pos_license_tests {
         assert_eq!(row.disabled, Some(false));
         assert_eq!(row.departments.as_deref(), Some("all"));
         assert!(parse_rfc3339_to_utc(row.active_until.as_deref().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn offline_grace_after_expiry_follows_the_pos_licence() {
+        let db = Db::new_in_memory().unwrap();
+        let now = chrono::Utc::now();
+        for (k, v) in [
+            (KEY_SUPABASE_URL, "https://example.invalid".to_string()),
+            (KEY_SUPABASE_API_KEY, "k".to_string()),
+            (KEY_CLINIC_ID, "a053ef91-0285-4014-a43d-832bada094dc".to_string()),
+            (KEY_LICENSE_APPROVED, "1".to_string()),
+            (KEY_LICENSE_DISABLED, "0".to_string()),
+            (KEY_LICENSE_ACTIVE_UNTIL, (now - chrono::Duration::days(1)).to_rfc3339()),
+            (KEY_LICENSE_LAST_CHECKED_AT, (now - chrono::Duration::days(2)).to_rfc3339()),
+        ] {
+            db.setting_set(k, &v).unwrap();
+        }
+        // No POS grace: expired one day ago -> blocked.
+        let st = LicenseEngine::compute_offline_state(&db).unwrap();
+        assert!(!st.ok);
+        assert_eq!(st.status, "expired");
+        // POS business licence grace (3 days): still usable offline.
+        db.setting_set(KEY_LICENSE_EXPIRY_GRACE_DAYS, "3").unwrap();
+        let st = LicenseEngine::compute_offline_state(&db).unwrap();
+        assert!(st.ok);
+        assert_eq!(st.status, "offline_grace");
+        // Past expiry + grace -> blocked.
+        db.setting_set(KEY_LICENSE_ACTIVE_UNTIL, &(now - chrono::Duration::days(4)).to_rfc3339()).unwrap();
+        let st = LicenseEngine::compute_offline_state(&db).unwrap();
+        assert!(!st.ok);
+        // Disabled online by the POS licence -> blocked even inside grace.
+        db.setting_set(KEY_LICENSE_ACTIVE_UNTIL, &(now - chrono::Duration::days(1)).to_rfc3339()).unwrap();
+        db.setting_set(KEY_LICENSE_DISABLED, "1").unwrap();
+        let st = LicenseEngine::compute_offline_state(&db).unwrap();
+        assert!(!st.ok);
+        assert_eq!(st.status, "disabled");
     }
 }
