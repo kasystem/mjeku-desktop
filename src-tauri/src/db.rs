@@ -3702,6 +3702,33 @@ impl Db {
 
     /// Katalogu i klinikës për PROGRAMERI POS (bridge `catalog.sync`): shërbimet dhe ofertat, përfshirë
     /// të fshirat (që POS-i t'i çaktivizojë). Çmimet e ofertës dërgohen me TVSH (bruto), si te Ofertat e POS-it.
+    /// Collected per sale for PROGRAMERI POS accounting (`payments.sync`): card/bank → bank, the rest → cash.
+    /// Deleted payments stay in the grouping with zero, so a correction is sent too.
+    pub fn pos_payment_totals(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn()?;
+        let mut st = conn.prepare(
+            "SELECT sale_id,
+                    COALESCE(SUM(CASE WHEN COALESCE(deleted,0)=0 AND LOWER(COALESCE(method,'')) NOT IN ('card','bank') THEN amount ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN COALESCE(deleted,0)=0 AND LOWER(COALESCE(method,'')) IN ('card','bank') THEN amount ELSE 0 END),0),
+                    MAX(COALESCE(date, updated_at, created_at, ''))
+             FROM payments WHERE sale_id IS NOT NULL AND TRIM(sale_id)<>''
+             GROUP BY sale_id ORDER BY MAX(COALESCE(date, updated_at, created_at, '')) DESC LIMIT 20000",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(serde_json::json!({
+                "saleId": r.get::<_, String>(0)?,
+                "cashCents": (r.get::<_, f64>(1)? * 100.0).round() as i64,
+                "bankCents": (r.get::<_, f64>(2)? * 100.0).round() as i64,
+                "lastPaidAt": r.get::<_, String>(3)?,
+            }))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn pos_catalog_snapshot(&self) -> anyhow::Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
         let conn = self.conn()?;
         let mut services = Vec::new();

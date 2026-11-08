@@ -10,6 +10,7 @@ mod models;
 mod orthopedics_pdf;
 mod physiotherapy_pdf;
 mod pos_catalog;
+mod pos_payments;
 mod pos_cloud;
 mod sef_bridge;
 mod sync_engine;
