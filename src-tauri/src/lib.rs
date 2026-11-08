@@ -89,6 +89,9 @@ struct AppState {
     // Granted only after this Mjeku process verifies the fixed ITAdmin account
     // through its live PROGRAMERI POS bridge. Never persisted in SQLite.
     pos_itadmin_settings_mode: AtomicBool,
+    // PROGRAMERI POS accountant (e.g. "kont") verified through the live bridge: only the
+    // POS accounting window is available, never patient data. Never persisted.
+    pos_accountant_mode: AtomicBool,
     sync: Arc<SyncEngine>,
     updates: Arc<UpdatesEngine>,
     license: Arc<LicenseEngine>,
@@ -662,7 +665,20 @@ async fn auth_get_state(state: tauri::State<'_, AppState>) -> Result<AuthStateIn
         result.session.kind = "pos_itadmin".to_string();
         return Ok(result);
     }
+    if matches!(session, SessionKind::None) && state.pos_accountant_mode.load(Ordering::Acquire) {
+        state.auth.admin_lock().await;
+        let db = state.db.clone();
+        let mut result = tokio::task::spawn_blocking(move || {
+            crate::auth::read_state(&db, false, SessionKind::None)
+        })
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+        result.session.kind = "pos_accountant".to_string();
+        return Ok(result);
+    }
     if !matches!(session, SessionKind::None) {
+        state.pos_accountant_mode.store(false, Ordering::Release);
         state
             .pos_itadmin_settings_mode
             .store(false, Ordering::Release);
@@ -1148,6 +1164,7 @@ async fn auth_user_login(
     state: tauri::State<'_, AppState>,
     password: String,
 ) -> Result<bool, String> {
+    let password_for_policy = password.clone();
     let db = state.db.clone();
     let role = tokio::task::spawn_blocking(move || crate::auth::user_verify_role(&db, &password))
         .await
@@ -1156,6 +1173,15 @@ async fn auth_user_login(
     let Some(role) = role else {
         return Ok(false);
     };
+    {
+        let db = state.db.clone();
+        let kind = SessionKind::User { role: role.clone() };
+        let pw = password_for_policy;
+        tokio::task::spawn_blocking(move || crate::auth::mark_password_change_if_short(&db, &kind, &pw))
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?;
+    }
 
     let db2 = state.db.clone();
     match role {
@@ -1217,8 +1243,191 @@ async fn auth_logs_admin_login(
     Ok(false)
 }
 
+const MSG_PASSWORD_CHANGE_REQUIRED: &str =
+    "Fjalëkalimi duhet të ketë të paktën 12 karaktere. Ndrysho fjalëkalimin për të vazhduar.";
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LoginOutcome {
+    ok: bool,
+    // owner | cashier | doctor | pos_accountant | none
+    kind: String,
+}
+
+impl LoginOutcome {
+    fn failed() -> Self {
+        Self { ok: false, kind: "none".to_string() }
+    }
+}
+
+async fn start_user_session(
+    state: &tauri::State<'_, AppState>,
+    role: crate::auth::UserRole,
+    password: Option<String>,
+) -> Result<LoginOutcome, String> {
+    let db = state.db.clone();
+    let kind = SessionKind::User { role: role.clone() };
+    let kind2 = kind.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        match role {
+            crate::auth::UserRole::Owner => crate::auth::session_set_user(&db)?,
+            crate::auth::UserRole::Cashier => crate::auth::session_set_cashier(&db)?,
+            crate::auth::UserRole::LogsAdmin => crate::auth::session_set_logs_admin(&db)?,
+        }
+        // A PROGRAMERI POS user (password None) is governed by the POS password rules.
+        crate::auth::mark_password_change_if_short(&db, &kind2, password.as_deref().unwrap_or(&"x".repeat(crate::auth::MIN_PASSWORD_LEN)))?;
+        Ok(())
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+    let label = match &kind {
+        SessionKind::User { role } => role.as_str().to_string(),
+        _ => "none".to_string(),
+    };
+    state.pos_accountant_mode.store(false, Ordering::Release);
+    state.auth.set_session(kind).await;
+    Ok(LoginOutcome { ok: true, kind: label })
+}
+
+/// PROGRAMERI POS user through the live bridge (only when Mjeku was launched from POS):
+/// Pronar/Admin → owner session; Kontabilist → accounting only (no patient data).
+async fn pos_user_login(
+    state: &tauri::State<'_, AppState>,
+    username: &str,
+    password: &str,
+) -> Result<LoginOutcome, String> {
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Ok(LoginOutcome::failed());
+    }
+    let result = match crate::sef_bridge::call(
+        "pos.user.authenticate",
+        serde_json::json!({ "username": username, "password": password }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(r) => r,
+        // Older PROGRAMERI POS without pos_user_login_v1: behave as wrong credentials.
+        Err(_) => return Ok(LoginOutcome::failed()),
+    };
+    match result.get("role").and_then(serde_json::Value::as_str).unwrap_or("") {
+        "owner" => start_user_session(state, crate::auth::UserRole::Owner, None).await,
+        "accountant" => {
+            state.pos_accountant_mode.store(true, Ordering::Release);
+            Ok(LoginOutcome { ok: true, kind: "pos_accountant".to_string() })
+        }
+        _ => Ok(LoginOutcome::failed()),
+    }
+}
+
+/// Single login form: `admin` (or empty) + clinic password → owner/cashier; a doctor code →
+/// doctor; any other user (e.g. `kont`) or a POS `admin` → PROGRAMERI POS user via the bridge.
+#[tauri::command]
+async fn auth_login(
+    state: tauri::State<'_, AppState>,
+    username: String,
+    password: String,
+) -> Result<LoginOutcome, String> {
+    let code = username.trim().to_string();
+    if password.trim().is_empty() || password.len() > 512 || code.len() > 128 {
+        return Ok(LoginOutcome::failed());
+    }
+    // A new login always replaces the previous one (Mjeku and POS-side grants).
+    state.pos_accountant_mode.store(false, Ordering::Release);
+    state.pos_itadmin_settings_mode.store(false, Ordering::Release);
+    clear_pos_itadmin_claim().await;
+    {
+        let db = state.db.clone();
+        tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?;
+        state.auth.set_session(SessionKind::None).await;
+        state.auth.admin_lock().await;
+    }
+
+    let is_admin_name = code.is_empty() || code.eq_ignore_ascii_case(crate::auth::DEFAULT_OWNER_USERNAME);
+    if is_admin_name {
+        let db = state.db.clone();
+        let pw = password.clone();
+        let role = tokio::task::spawn_blocking(move || crate::auth::user_verify_role(&db, &pw))
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?;
+        if let Some(role) = role {
+            return start_user_session(&state, role, Some(password)).await;
+        }
+        if code.is_empty() {
+            return Ok(LoginOutcome::failed());
+        }
+        return pos_user_login(&state, &code, &password).await;
+    }
+
+    let db = state.db.clone();
+    let key = code.clone();
+    let doctor = tokio::task::spawn_blocking(move || db.doctor_id_from_code_or_id(&key))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    if let Some(did) = doctor {
+        let db = state.db.clone();
+        let pw = password.clone();
+        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<SessionKind>> {
+            match crate::auth::doctor_verify(&db, &did, &pw)? {
+                crate::auth::DoctorVerify::Ok { .. } => {
+                    let session = crate::auth::session_set_doctor(&db, &did)?;
+                    crate::auth::mark_password_change_if_short(&db, &session, &pw)?;
+                    Ok(Some(session))
+                }
+                _ => Ok(None),
+            }
+        })
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+        return match res {
+            Some(session) => {
+                state.auth.set_session(session).await;
+                Ok(LoginOutcome { ok: true, kind: "doctor".to_string() })
+            }
+            None => Ok(LoginOutcome::failed()),
+        };
+    }
+    pos_user_login(&state, &code, &password).await
+}
+
+/// The logged-in owner, cashier or doctor changes their own password (min. 12 characters).
+/// Allowed while a forced change is pending; that is the only way out of it besides logout.
+#[tauri::command]
+async fn auth_change_own_password(
+    state: tauri::State<'_, AppState>,
+    new_password: String,
+) -> Result<AuthStateInfo, String> {
+    let db = state.db.clone();
+    let session = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    if matches!(session, SessionKind::None) {
+        return Err("duhet te hysh per te vazhduar".to_string());
+    }
+    let db = state.db.clone();
+    let s2 = session.clone();
+    tokio::task::spawn_blocking(move || crate::auth::change_own_password(&db, &s2, &new_password))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)?;
+    let admin_unlocked = state.auth.is_admin_unlocked().await;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || crate::auth::read_state(&db, admin_unlocked, session))
+        .await
+        .map_err(err_string)?
+        .map_err(err_string)
+}
+
 #[tauri::command]
 async fn auth_user_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.pos_accountant_mode.store(false, Ordering::Release);
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
         .await
@@ -1280,11 +1489,14 @@ async fn auth_doctor_login(
         crate::auth::DoctorVerify::WrongPassword => Ok(false),
         crate::auth::DoctorVerify::Ok { .. } => {
             let db2 = state.db.clone();
-            let session =
-                tokio::task::spawn_blocking(move || crate::auth::session_set_doctor(&db2, &did))
-                    .await
-                    .map_err(err_string)?
-                    .map_err(err_string)?;
+            let session = tokio::task::spawn_blocking(move || -> anyhow::Result<SessionKind> {
+                let session = crate::auth::session_set_doctor(&db2, &did)?;
+                crate::auth::mark_password_change_if_short(&db2, &session, &password)?;
+                Ok(session)
+            })
+            .await
+            .map_err(err_string)?
+            .map_err(err_string)?;
             state.auth.set_session(session).await;
             Ok(true)
         }
@@ -1293,6 +1505,7 @@ async fn auth_doctor_login(
 
 #[tauri::command]
 async fn auth_doctor_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.pos_accountant_mode.store(false, Ordering::Release);
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
         .await
@@ -1327,10 +1540,17 @@ async fn doctor_account_update(
 async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
     // Recheck expiry and account validity at the command authorization boundary.
     let db = state.db.clone();
-    let s = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
-        .await
-        .map_err(err_string)?
-        .map_err(err_string)?;
+    let (s, must_change) = tokio::task::spawn_blocking(move || -> anyhow::Result<(SessionKind, bool)> {
+        let s = crate::auth::session_get(&db)?;
+        let must_change = crate::auth::password_change_required_for(&db, &s)?;
+        Ok((s, must_change))
+    })
+    .await
+    .map_err(err_string)?
+    .map_err(err_string)?;
+    if must_change {
+        return Err(MSG_PASSWORD_CHANGE_REQUIRED.to_string());
+    }
     if matches!(s, SessionKind::None) {
         state.auth.set_session(SessionKind::None).await;
         state.auth.admin_lock().await;
@@ -1437,6 +1657,8 @@ async fn settings_get_all(
             "user_logged_in",
             "session",
             "session_expires_at",
+            "password_change_required",
+            "owner_default_password_reset_v1",
         ] {
             map.remove(k);
         }
@@ -2509,6 +2731,8 @@ async fn settings_set(
             | "user_logged_in"
             | "session"
             | "session_expires_at"
+            | "password_change_required"
+            | "owner_default_password_reset_v1"
     ) {
         return Err("ky konfigurim menaxhohet vetem nga autentikimi".to_string());
     }
@@ -4626,6 +4850,7 @@ async fn sef_bridge_pos_authenticate(
     state
         .pos_itadmin_settings_mode
         .store(false, Ordering::Release);
+    state.pos_accountant_mode.store(false, Ordering::Release);
     state.auth.set_session(SessionKind::None).await;
     state.auth.admin_lock().await;
     let db = state.db.clone();
@@ -4659,6 +4884,7 @@ async fn sef_bridge_pos_authenticate(
 
 #[tauri::command]
 async fn auth_pos_itadmin_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.pos_accountant_mode.store(false, Ordering::Release);
     state
         .pos_itadmin_settings_mode
         .store(false, Ordering::Release);
@@ -4764,7 +4990,16 @@ async fn pos_cloud_link_device(state: tauri::State<'_, AppState>, code: String) 
 /// receives no accounting data and never handles those credentials.
 #[tauri::command]
 async fn sef_bridge_open_accounting(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let _ = require_owner(&state).await?;
+    // Owner and the POS accountant open accounting without a second login; an admin doctor
+    // still gets the PROGRAMERI POS login dialog.
+    let mjeku_session = if state.pos_accountant_mode.load(Ordering::Acquire) {
+        "accountant"
+    } else {
+        match require_owner(&state).await? {
+            SessionKind::User { role: crate::auth::UserRole::Owner } => "owner",
+            _ => "",
+        }
+    };
     let provider = get_fiscal_printer_provider(&state).await?;
     if provider != crate::sef_bridge::PROVIDER_VALUE {
         return Err("Kontabiliteti kërkon SEF (PROGRAMERI POS).".to_string());
@@ -4774,7 +5009,7 @@ async fn sef_bridge_open_accounting(state: tauri::State<'_, AppState>) -> Result
     }
     let result = crate::sef_bridge::call(
         "accounting.open",
-        serde_json::json!({}),
+        serde_json::json!({ "session": mjeku_session }),
         Duration::from_secs(300),
     )
     .await
@@ -6358,6 +6593,9 @@ pub fn run() {
                     role: crate::auth::UserRole::Owner,
                 }
             } else {
+                if let Ok(true) = crate::auth::ensure_owner_default_password_v1(db.as_ref()) {
+                    eprintln!("[auth] owner login restored to the default admin account (one-time v1)");
+                }
                 crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None)
             };
             let auth = Arc::new(AuthState::new(session));
@@ -6431,6 +6669,7 @@ pub fn run() {
                 db,
                 auth,
                 pos_itadmin_settings_mode: AtomicBool::new(false),
+                pos_accountant_mode: AtomicBool::new(false),
                 sync,
                 updates,
                 license,
@@ -6498,6 +6737,8 @@ pub fn run() {
             auth_pos_itadmin_logout,
             auth_doctor_login,
             auth_doctor_logout,
+            auth_login,
+            auth_change_own_password,
             doctors_login_options,
             doctor_account_update,
             settings_get_all,

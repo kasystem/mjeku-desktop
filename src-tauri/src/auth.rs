@@ -23,6 +23,20 @@ const KEY_SESSION: &str = "session";
 const KEY_SESSION_EXPIRES_AT: &str = "session_expires_at";
 const SESSION_LIFETIME_HOURS: i64 = 12;
 
+/// Minimum length for every Mjeku password that is set or changed (same rule as PROGRAMERI POS).
+pub const MIN_PASSWORD_LEN: usize = 12;
+/// Default owner login restored once on every existing installation (owner decision 2026-11-08).
+pub const DEFAULT_OWNER_USERNAME: &str = "admin";
+pub const DEFAULT_OWNER_PASSWORD: &str = "admin12345678";
+const KEY_OWNER_DEFAULT_RESET_V1: &str = "owner_default_password_reset_v1";
+/// Session whose password is shorter than MIN_PASSWORD_LEN: "owner" | "cashier" | "doctor:<id>".
+/// While set, every protected command is refused until that password is changed.
+const KEY_PASSWORD_CHANGE_REQUIRED: &str = "password_change_required";
+/// "keep" (default): stay logged in, like Restaurant without automatic logout.
+/// "after_invoice": the UI ends the session after each issued invoice.
+pub const KEY_SESSION_MODE: &str = "session_mode";
+const KEEP_SESSION_DAYS: i64 = 3650;
+
 #[derive(Debug, Clone)]
 pub enum UserRole {
     Owner,
@@ -54,6 +68,8 @@ pub struct SessionInfo {
     pub doctor_id: Option<String>,
     pub doctor_name: Option<String>,
     pub doctor_is_admin: bool,
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -135,6 +151,7 @@ fn session_info_from_kind(db: &Db, kind: &SessionKind) -> anyhow::Result<Session
             doctor_id: None,
             doctor_name: None,
             doctor_is_admin: false,
+            must_change_password: false,
         }),
         SessionKind::User { role } => Ok(SessionInfo {
             kind: "user".to_string(),
@@ -142,6 +159,7 @@ fn session_info_from_kind(db: &Db, kind: &SessionKind) -> anyhow::Result<Session
             doctor_id: None,
             doctor_name: None,
             doctor_is_admin: matches!(role, UserRole::Owner | UserRole::Cashier),
+            must_change_password: password_change_required_for(db, kind)?,
         }),
         SessionKind::Doctor {
             doctor_id,
@@ -157,6 +175,7 @@ fn session_info_from_kind(db: &Db, kind: &SessionKind) -> anyhow::Result<Session
                 doctor_id: Some(doctor_id.clone()),
                 doctor_name,
                 doctor_is_admin: *is_admin,
+                must_change_password: password_change_required_for(db, kind)?,
             })
         }
     }
@@ -200,19 +219,19 @@ pub fn setup_v2(
         bail!("emri i klinikes eshte i detyrueshem");
     }
     let admin_password = admin_password.trim();
-    if admin_password.len() < 6 {
-        bail!("fjalekalimi i adminit duhet te kete te pakten 6 karaktere");
+    if admin_password.chars().count() < MIN_PASSWORD_LEN {
+        bail!("fjalekalimi i adminit duhet te kete te pakten {MIN_PASSWORD_LEN} karaktere");
     }
     let owner_password = owner_password.trim();
-    if owner_password.len() < 4 {
-        bail!("fjalekalimi i pergjithshem duhet te kete te pakten 4 karaktere");
+    if owner_password.chars().count() < MIN_PASSWORD_LEN {
+        bail!("fjalekalimi i pergjithshem duhet te kete te pakten {MIN_PASSWORD_LEN} karaktere");
     }
     let cashier_password = cashier_password
         .map(|x| x.trim().to_string())
         .filter(|x| !x.is_empty());
     if let Some(pw) = cashier_password.as_deref() {
-        if pw.len() < 4 {
-            bail!("fjalekalimi i arketares duhet te kete te pakten 4 karaktere");
+        if pw.chars().count() < MIN_PASSWORD_LEN {
+            bail!("fjalekalimi i arketares duhet te kete te pakten {MIN_PASSWORD_LEN} karaktere");
         }
     }
 
@@ -349,8 +368,8 @@ pub fn admin_verify(db: &Db, password: &str) -> anyhow::Result<bool> {
 
 pub fn admin_change_password(db: &Db, new_password: &str) -> anyhow::Result<()> {
     let new_password = new_password.trim();
-    if new_password.len() < 6 {
-        bail!("fjalekalimi i ri duhet te kete te pakten 6 karaktere");
+    if new_password.chars().count() < MIN_PASSWORD_LEN {
+        bail!("fjalekalimi i ri duhet te kete te pakten {MIN_PASSWORD_LEN} karaktere");
     }
     let salt = Uuid::new_v4().to_string();
     let hash = hash_password(&salt, new_password);
@@ -404,12 +423,15 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
     let raw = raw.trim();
     if !raw.is_empty() {
         let expires = db.setting_get(KEY_SESSION_EXPIRES_AT)?.unwrap_or_default();
-        let valid = chrono::DateTime::parse_from_rfc3339(expires.trim())
-            .map(|t| t.with_timezone(&chrono::Utc) > chrono::Utc::now())
-            .unwrap_or(false);
-        if !valid {
-            session_clear(db)?;
-            return Ok(SessionKind::None);
+        let expires = chrono::DateTime::parse_from_rfc3339(expires.trim())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .ok();
+        match expires {
+            Some(t) if t > chrono::Utc::now() => session_touch(db, t)?,
+            _ => {
+                session_clear(db)?;
+                return Ok(SessionKind::None);
+            }
         }
     }
     if raw.is_empty() {
@@ -477,10 +499,31 @@ pub fn session_get(db: &Db) -> anyhow::Result<SessionKind> {
     Ok(SessionKind::None)
 }
 
+pub fn session_mode_keep(db: &Db) -> anyhow::Result<bool> {
+    let mode = db.setting_get(KEY_SESSION_MODE)?.unwrap_or_default();
+    Ok(!mode.trim().eq_ignore_ascii_case("after_invoice"))
+}
+
+fn session_lifetime(db: &Db) -> anyhow::Result<chrono::Duration> {
+    Ok(if session_mode_keep(db)? {
+        chrono::Duration::days(KEEP_SESSION_DAYS)
+    } else {
+        chrono::Duration::hours(SESSION_LIFETIME_HOURS)
+    })
+}
+
 fn session_set_expiry(db: &Db) -> anyhow::Result<()> {
-    let expiry =
-        (chrono::Utc::now() + chrono::Duration::hours(SESSION_LIFETIME_HOURS)).to_rfc3339();
+    let expiry = (chrono::Utc::now() + session_lifetime(db)?).to_rfc3339();
     db.setting_set(KEY_SESSION_EXPIRES_AT, &expiry)?;
+    Ok(())
+}
+
+/// "keep" mode: a session that is still valid is extended, so the device stays logged in
+/// (sessions created by older versions with a 12-hour expiry are not dropped).
+fn session_touch(db: &Db, expires: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
+    if session_mode_keep(db)? && expires < chrono::Utc::now() + chrono::Duration::days(30) {
+        session_set_expiry(db)?;
+    }
     Ok(())
 }
 
@@ -525,10 +568,92 @@ pub fn session_set_doctor(db: &Db, doctor_id: &str) -> anyhow::Result<SessionKin
 }
 
 pub fn session_clear(db: &Db) -> anyhow::Result<()> {
+    db.setting_set(KEY_PASSWORD_CHANGE_REQUIRED, "")?;
     db.setting_set(KEY_SESSION_EXPIRES_AT, "")?;
     db.setting_set(KEY_SESSION, "")?;
     db.setting_set(KEY_USER_LOGGED_IN, "0")?;
     Ok(())
+}
+
+fn session_key(kind: &SessionKind) -> Option<String> {
+    match kind {
+        SessionKind::User { role: UserRole::Owner } => Some("owner".to_string()),
+        SessionKind::User { role: UserRole::Cashier } => Some("cashier".to_string()),
+        SessionKind::Doctor { doctor_id, .. } => Some(format!("doctor:{doctor_id}")),
+        _ => None,
+    }
+}
+
+/// Called after a successful login: a password shorter than MIN_PASSWORD_LEN must be changed
+/// before the session can be used (owner decision: forced change).
+pub fn mark_password_change_if_short(db: &Db, kind: &SessionKind, password: &str) -> anyhow::Result<()> {
+    let flag = match session_key(kind) {
+        Some(k) if password.trim().chars().count() < MIN_PASSWORD_LEN => k,
+        _ => String::new(),
+    };
+    db.setting_set(KEY_PASSWORD_CHANGE_REQUIRED, &flag)?;
+    Ok(())
+}
+
+pub fn password_change_required_for(db: &Db, kind: &SessionKind) -> anyhow::Result<bool> {
+    let flag = db.setting_get(KEY_PASSWORD_CHANGE_REQUIRED)?.unwrap_or_default();
+    Ok(match session_key(kind) {
+        Some(k) => !flag.trim().is_empty() && flag.trim() == k,
+        None => false,
+    })
+}
+
+fn set_owner_password(db: &Db, password: &str) -> anyhow::Result<()> {
+    let salt = Uuid::new_v4().to_string();
+    let hash = hash_password(&salt, password);
+    db.setting_set(KEY_USER_SALT, &salt)?;
+    db.setting_set(KEY_USER_HASH, &hash)?;
+    Ok(())
+}
+
+/// The logged-in user changes their own password (owner, cashier or doctor). Clears the
+/// forced-change flag for that session.
+pub fn change_own_password(db: &Db, kind: &SessionKind, new_password: &str) -> anyhow::Result<()> {
+    let new_password = new_password.trim();
+    if new_password.chars().count() < MIN_PASSWORD_LEN {
+        bail!("fjalekalimi i ri duhet te kete te pakten {MIN_PASSWORD_LEN} karaktere");
+    }
+    match kind {
+        SessionKind::User { role: UserRole::Owner } => set_owner_password(db, new_password)?,
+        SessionKind::User { role: UserRole::Cashier } => {
+            let salt = Uuid::new_v4().to_string();
+            let hash = hash_password(&salt, new_password);
+            db.setting_set(KEY_CASHIER_SALT, &salt)?;
+            db.setting_set(KEY_CASHIER_HASH, &hash)?;
+        }
+        SessionKind::Doctor { doctor_id, .. } => {
+            let Some((_, _, is_admin)) = db.doctor_account_get(doctor_id)? else {
+                bail!("ky mjek nuk ka login");
+            };
+            let salt = Uuid::new_v4().to_string();
+            let hash = hash_password(&salt, new_password);
+            db.doctor_account_set(doctor_id, &salt, &hash, is_admin, &now_iso())?;
+        }
+        _ => bail!("ky sesion nuk ka fjalekalim te Mjekut"),
+    }
+    db.setting_set(KEY_PASSWORD_CHANGE_REQUIRED, "")?;
+    Ok(())
+}
+
+/// One-time migration (owner decision 2026-11-08): every installation that was already
+/// configured before this version gets the owner login `admin` / `admin12345678` again.
+/// Fresh installations only record the marker, so a password chosen at setup is never reset.
+/// Existing sessions stay logged in. Returns true when the password was reset.
+pub fn ensure_owner_default_password_v1(db: &Db) -> anyhow::Result<bool> {
+    if db.setting_get(KEY_OWNER_DEFAULT_RESET_V1)?.as_deref() == Some("1") {
+        return Ok(false);
+    }
+    let reset = is_configured(db)?;
+    if reset {
+        set_owner_password(db, DEFAULT_OWNER_PASSWORD)?;
+    }
+    db.setting_set(KEY_OWNER_DEFAULT_RESET_V1, "1")?;
+    Ok(reset)
 }
 
 pub enum DoctorVerify {
@@ -579,8 +704,8 @@ pub fn doctor_account_update(
 
     let now = now_iso();
     if let Some(pw) = password.map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        if pw.len() < 4 {
-            bail!("fjalekalimi i mjekut duhet te kete te pakten 4 karaktere");
+        if pw.chars().count() < MIN_PASSWORD_LEN {
+            bail!("fjalekalimi i mjekut duhet te kete te pakten {MIN_PASSWORD_LEN} karaktere");
         }
         let salt = Uuid::new_v4().to_string();
         let hash = hash_password(&salt, pw);
@@ -716,5 +841,84 @@ mod security_session_tests {
                 role: UserRole::Owner
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod single_login_policy_tests {
+    use super::*;
+
+    fn configured_db() -> Db {
+        let db = Db::new_in_memory().expect("in-memory database");
+        setup_v2(&db, "Klinika", "vendor-admin-test-123", "owner-chosen-pass", None).expect("setup");
+        db
+    }
+
+    #[test]
+    fn new_passwords_need_twelve_characters() {
+        let db = Db::new_in_memory().unwrap();
+        assert!(setup_v2(&db, "Klinika", "vendor-admin-test-123", "short-pass", None).is_err());
+        let db = configured_db();
+        assert!(admin_change_password(&db, "eleven-char").is_err());
+        assert!(admin_change_password(&db, "twelve-chars").is_ok());
+        let owner = SessionKind::User { role: UserRole::Owner };
+        assert!(change_own_password(&db, &owner, "1234").is_err());
+    }
+
+    #[test]
+    fn short_password_login_forces_a_change() {
+        let db = configured_db();
+        let owner = SessionKind::User { role: UserRole::Owner };
+        session_set_user(&db).unwrap();
+        mark_password_change_if_short(&db, &owner, "1234").unwrap();
+        assert!(password_change_required_for(&db, &owner).unwrap());
+        // Another session kind is not affected by the owner's flag.
+        assert!(!password_change_required_for(&db, &SessionKind::User { role: UserRole::Cashier }).unwrap());
+        change_own_password(&db, &owner, "new-owner-password").unwrap();
+        assert!(!password_change_required_for(&db, &owner).unwrap());
+        assert!(matches!(user_verify_role(&db, "new-owner-password").unwrap(), Some(UserRole::Owner)));
+        // A long password never sets the flag.
+        mark_password_change_if_short(&db, &owner, "new-owner-password").unwrap();
+        assert!(!password_change_required_for(&db, &owner).unwrap());
+    }
+
+    #[test]
+    fn default_owner_password_is_restored_once_and_keeps_sessions() {
+        let db = configured_db();
+        session_set_user(&db).unwrap();
+        assert!(ensure_owner_default_password_v1(&db).unwrap());
+        assert!(matches!(user_verify_role(&db, DEFAULT_OWNER_PASSWORD).unwrap(), Some(UserRole::Owner)));
+        assert!(user_verify_role(&db, "owner-chosen-pass").unwrap().is_none());
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { role: UserRole::Owner }));
+        // Later changes by the client are never reset again.
+        change_own_password(&db, &SessionKind::User { role: UserRole::Owner }, "client-own-password").unwrap();
+        assert!(!ensure_owner_default_password_v1(&db).unwrap());
+        assert!(matches!(user_verify_role(&db, "client-own-password").unwrap(), Some(UserRole::Owner)));
+    }
+
+    #[test]
+    fn fresh_installation_keeps_the_password_chosen_at_setup() {
+        let db = Db::new_in_memory().unwrap();
+        assert!(!ensure_owner_default_password_v1(&db).unwrap());
+        setup_v2(&db, "Klinika", "vendor-admin-test-123", "owner-chosen-pass", None).unwrap();
+        assert!(!ensure_owner_default_password_v1(&db).unwrap());
+        assert!(matches!(user_verify_role(&db, "owner-chosen-pass").unwrap(), Some(UserRole::Owner)));
+    }
+
+    #[test]
+    fn keep_mode_extends_old_sessions_and_after_invoice_mode_does_not() {
+        let db = configured_db();
+        db.setting_set(KEY_SESSION, "owner").unwrap();
+        let soon = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        db.setting_set(KEY_SESSION_EXPIRES_AT, &soon).unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { .. }));
+        let extended = db.setting_get(KEY_SESSION_EXPIRES_AT).unwrap().unwrap();
+        let extended = chrono::DateTime::parse_from_rfc3339(&extended).unwrap();
+        assert!(extended > chrono::Utc::now() + chrono::Duration::days(365));
+
+        db.setting_set(KEY_SESSION_MODE, "after_invoice").unwrap();
+        db.setting_set(KEY_SESSION_EXPIRES_AT, &soon).unwrap();
+        assert!(matches!(session_get(&db).unwrap(), SessionKind::User { .. }));
+        assert_eq!(db.setting_get(KEY_SESSION_EXPIRES_AT).unwrap().unwrap(), soon);
     }
 }
