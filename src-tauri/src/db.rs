@@ -8662,6 +8662,18 @@ impl Db {
             .flatten())
     }
 
+    /// (notes, vat_code) of a service, used to apply a PROGRAMERI POS edit without losing local fields.
+    pub fn service_notes_and_vat(&self, id: &str) -> anyhow::Result<Option<(Option<String>, String)>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT notes, COALESCE(vat_code,'C') FROM services WHERE id=?1",
+                params![id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?)
+    }
+
     pub fn appointments_updated_at(&self, id: &str) -> anyhow::Result<Option<String>> {
         let conn = self.conn()?;
         Ok(conn
