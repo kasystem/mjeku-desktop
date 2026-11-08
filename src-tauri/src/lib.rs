@@ -5021,6 +5021,20 @@ async fn sef_bridge_open_accounting(state: tauri::State<'_, AppState>) -> Result
         .ok_or_else(|| "PROGRAMERI POS nuk konfirmoi hapjen e Kontabilitetit.".to_string())
 }
 
+/// A4 B2B invoices that PROGRAMERI POS generated from this clinic's SEF sales (read-only here).
+/// Returns an empty list when Mjeku was not launched from POS or POS is older (no `b2b.list`).
+#[tauri::command]
+async fn sef_bridge_b2b_list(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let _ = require_login(&state).await?;
+    if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
+        return Ok(serde_json::json!([]));
+    }
+    match crate::sef_bridge::call("b2b.list", serde_json::json!({}), crate::sef_bridge::DEFAULT_TIMEOUT).await {
+        Ok(v) => Ok(v.get("invoices").cloned().unwrap_or_else(|| serde_json::json!([]))),
+        Err(_) => Ok(serde_json::json!([])),
+    }
+}
+
 #[tauri::command]
 async fn sef_bridge_sync_clock(
     state: tauri::State<'_, AppState>,
@@ -6739,6 +6753,7 @@ pub fn run() {
             auth_doctor_login,
             auth_doctor_logout,
             auth_login,
+            sef_bridge_b2b_list,
             auth_change_own_password,
             doctors_login_options,
             doctor_account_update,

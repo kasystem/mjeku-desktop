@@ -110,6 +110,109 @@ pub fn apply_pos_change(db: &Db, c: &PosServiceChange) -> anyhow::Result<Option<
     Ok(Some(row.id))
 }
 
+/// One offer line as POS sends it back (gross unit price, same convention as `catalog.sync`).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PosOfferItem {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub qty: f64,
+    #[serde(default)]
+    pub unit_price_cents: i64,
+    #[serde(default)]
+    pub discount_pct: f64,
+}
+
+/// An offer edited or deleted in PROGRAMERI POS (`catalog.pending` -> `offers`).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PosOfferChange {
+    pub id: String,
+    /// POS status: DRAFT | CONVERTED | CANCELLED.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub valid_until: String,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub items: Vec<PosOfferItem>,
+}
+
+/// Same mapping POS uses for mirrored offers; a Mjeku status that already maps to the POS one is kept.
+fn pos_status_of(mjeku: &str) -> &'static str {
+    match mjeku.trim().to_lowercase().as_str() {
+        "rejected" | "cancelled" | "canceled" | "expired" => "CANCELLED",
+        "invoiced" | "converted" | "accepted" => "CONVERTED",
+        _ => "DRAFT",
+    }
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// Applies one offer change from POS (status, validity, lines; notes stay Mjeku's). Returns true when it
+/// can be acknowledged (applied, already deleted or unknown here), false when the local edit is newer.
+pub fn apply_pos_offer_change(db: &Db, c: &PosOfferChange) -> anyhow::Result<bool> {
+    let Some(mut o) = db.offer_get(c.id.trim())? else {
+        return Ok(true);
+    };
+    if !is_newer(&c.updated_at, &o.updated_at) {
+        return Ok(false);
+    }
+    let now = crate::util::now_iso();
+    if c.deleted {
+        if o.deleted_at.is_none() {
+            db.offer_soft_delete(&o.id, &now)?;
+            o.deleted_at = Some(now.clone());
+            o.updated_at = now;
+            db.offer_queue_upsert(&o)?;
+        }
+        return Ok(true);
+    }
+    let pos_status = c.status.trim().to_uppercase();
+    if !pos_status.is_empty() && pos_status_of(&o.status) != pos_status {
+        o.status = match pos_status.as_str() {
+            "CANCELLED" => "rejected",
+            "CONVERTED" => "accepted",
+            _ => "draft",
+        }
+        .to_string();
+    }
+    if !c.valid_until.trim().is_empty() {
+        o.valid_until = Some(c.valid_until.trim().to_string());
+    }
+    let factor = 1.0 + o.vat_pct / 100.0;
+    let items: Vec<crate::models::OfferItemInput> = c
+        .items
+        .iter()
+        .filter(|i| !i.description.trim().is_empty() && i.unit_price_cents >= 0)
+        .map(|i| crate::models::OfferItemInput {
+            id: None,
+            description: i.description.trim().to_string(),
+            qty: if i.qty > 0.0 { i.qty } else { 1.0 },
+            unit_price: round2(i.unit_price_cents as f64 / 100.0 / factor),
+            discount_pct: i.discount_pct.clamp(0.0, 100.0),
+        })
+        .collect();
+    let subtotal: f64 = items.iter().map(|i| i.qty * i.unit_price * (1.0 - i.discount_pct / 100.0)).sum();
+    o.subtotal = round2(subtotal);
+    o.vat_amount = round2(o.subtotal * o.vat_pct / 100.0);
+    o.total = round2(o.subtotal + o.vat_amount);
+    o.updated_at = now.clone();
+    db.offer_upsert(&o)?;
+    db.offer_items_replace(&o.id, &o.clinic_id, &items, &now)?;
+    db.offer_queue_upsert(&o)?;
+    for item in db.offer_items_list(&o.id)? {
+        db.offer_item_queue_upsert(&item)?;
+    }
+    Ok(true)
+}
+
 /// Pulls services edited in POS, applies them and acknowledges. An older POS without
 /// `catalog.pending` answers with an error, which is ignored.
 pub async fn pull_pos_changes(db: &Db, clinic_id: &str) {
@@ -121,8 +224,21 @@ pub async fn pull_pos_changes(db: &Db, clinic_id: &str) {
         .cloned()
         .and_then(|x| serde_json::from_value(x).ok())
         .unwrap_or_default();
-    if changes.is_empty() {
+    let offer_changes: Vec<PosOfferChange> = v
+        .get("offers")
+        .cloned()
+        .and_then(|x| serde_json::from_value(x).ok())
+        .unwrap_or_default();
+    if changes.is_empty() && offer_changes.is_empty() {
         return;
+    }
+    let mut offer_acks = Vec::new();
+    for c in &offer_changes {
+        match apply_pos_offer_change(db, c) {
+            Ok(true) => offer_acks.push(serde_json::json!({ "id": c.id })),
+            Ok(false) => {}
+            Err(e) => eprintln!("[pos_catalog] POS offer {} not applied: {e}", c.id),
+        }
     }
     let mut links = Vec::new();
     for c in &changes {
@@ -132,8 +248,8 @@ pub async fn pull_pos_changes(db: &Db, clinic_id: &str) {
             Err(e) => eprintln!("[pos_catalog] POS change {} not applied: {e}", c.local_ref),
         }
     }
-    if !links.is_empty() {
-        let _ = crate::sef_bridge::call("catalog.ack", serde_json::json!({ "clinicId": clinic_id, "links": links }), Duration::from_secs(30)).await;
+    if !links.is_empty() || !offer_acks.is_empty() {
+        let _ = crate::sef_bridge::call("catalog.ack", serde_json::json!({ "clinicId": clinic_id, "links": links, "offers": offer_acks }), Duration::from_secs(30)).await;
     }
 }
 
@@ -200,6 +316,50 @@ mod tests {
         let s = db.services_list(None).unwrap().into_iter().find(|x| x.id == "s1").unwrap();
         assert_eq!(s.atk_unit_code, "SEC");
         assert_eq!(s.atk_category_code, "SM");
+    }
+
+    #[test]
+    fn pos_offer_edits_update_status_lines_and_deletion() {
+        let db = Db::new_in_memory().unwrap();
+        db.execute_batch_for_tests(
+            "INSERT INTO offers(id,clinic_id,client_id,offer_number,status,vat_pct,notes,created_at,updated_at) VALUES('o1','c','c1','OF-1','sent',18,'shenim','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z');
+             INSERT INTO offer_items(id,offer_id,clinic_id,description,qty,unit_price,discount_pct,line_total,created_at,updated_at) VALUES('i1','o1','c','Implant',1,500,0,500,'2026-11-01','2026-11-01');",
+        )
+        .unwrap();
+        // POS: cancelled, price 472 EUR gross (= 400 net at 18%).
+        let change = PosOfferChange {
+            id: "o1".into(),
+            status: "CANCELLED".into(),
+            valid_until: "2026-12-31".into(),
+            deleted: false,
+            updated_at: "2026-11-08T00:00:00Z".into(),
+            items: vec![PosOfferItem { description: "Implant".into(), qty: 1.0, unit_price_cents: 47200, discount_pct: 0.0 }],
+        };
+        assert!(apply_pos_offer_change(&db, &change).unwrap());
+        let o = db.offer_get("o1").unwrap().unwrap();
+        assert_eq!(o.status, "rejected");
+        assert_eq!(o.valid_until.as_deref(), Some("2026-12-31"));
+        assert_eq!(o.notes.as_deref(), Some("shenim"));
+        assert_eq!(o.subtotal, 400.0);
+        assert_eq!(o.total, 472.0);
+        assert_eq!(db.offer_items_list("o1").unwrap()[0].unit_price, 400.0);
+        // A DRAFT from POS does not turn "sent" into "draft" (both map to DRAFT).
+        let mut same = change.clone();
+        same.status = "DRAFT".into();
+        same.updated_at = "2100-01-01T00:00:00Z".into();
+        db.execute_batch_for_tests("UPDATE offers SET status='sent' WHERE id='o1';").unwrap();
+        apply_pos_offer_change(&db, &same).unwrap();
+        assert_eq!(db.offer_get("o1").unwrap().unwrap().status, "sent");
+        // Deleted in POS.
+        let mut del = same.clone();
+        del.deleted = true;
+        del.updated_at = "2100-01-02T00:00:00Z".into();
+        assert!(apply_pos_offer_change(&db, &del).unwrap());
+        assert!(db.offer_get("o1").unwrap().unwrap().deleted_at.is_some());
+        // Unknown offer: acknowledged without changes.
+        let mut unknown = del.clone();
+        unknown.id = "nuk-ka".into();
+        assert!(apply_pos_offer_change(&db, &unknown).unwrap());
     }
 
     #[test]
