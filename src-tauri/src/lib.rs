@@ -15,9 +15,32 @@ mod pos_payments;
 mod pos_cloud;
 mod sef_bridge;
 mod sync_engine;
+#[cfg(not(feature = "embedded"))]
 mod ui_protocol;
 mod updates;
 mod util;
+#[cfg(feature = "embedded")]
+pub mod embedded;
+
+#[cfg(not(feature = "embedded"))]
+pub(crate) use tauri::{AppHandle, State};
+#[cfg(feature = "embedded")]
+pub(crate) use crate::embedded::{AppHandle, State};
+
+/// `tauri::async_runtime::spawn` në desktop/Tauri; runtime-i i vetë Mjekut kur është brenda POS-it.
+pub(crate) fn rt_spawn<F>(f: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    #[cfg(not(feature = "embedded"))]
+    {
+        crate::rt_spawn(f);
+    }
+    #[cfg(feature = "embedded")]
+    {
+        crate::embedded::spawn(f);
+    }
+}
 
 use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -31,8 +54,10 @@ use chrono::Datelike;
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+#[cfg(not(feature = "embedded"))]
+#[allow(unused_imports)]
 use tauri::{Emitter, Manager};
-#[cfg(desktop)]
+#[cfg(all(desktop, not(feature = "embedded")))]
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::auth::{AuthState, AuthStateInfo, SessionKind};
@@ -371,7 +396,7 @@ fn normalize_fiscal_printer_provider(v: &str) -> Option<String> {
     }
 }
 
-async fn get_fiscal_printer_provider(state: &tauri::State<'_, AppState>) -> Result<String, String> {
+async fn get_fiscal_printer_provider(state: &State<'_, AppState>) -> Result<String, String> {
     let db = state.db.clone();
     let raw = tokio::task::spawn_blocking(move || db.setting_get(FISCAL_PRINTER_PROVIDER_KEY))
         .await
@@ -517,7 +542,7 @@ fn build_invoice_pdf_bytes_inner(
     crate::invoice::render_invoice_pdf(&data).map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn printers_list() -> Result<Vec<String>, String> {
     #[cfg(target_os = "windows")]
     {
@@ -584,10 +609,10 @@ fn print_pdf_to_windows_printer(pdf_bytes: &[u8], printer_name: &str) -> anyhow:
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn get_app_info(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<AppInfo, String> {
     let version = app.package_info().version.to_string();
     let ui_version =
@@ -642,8 +667,8 @@ async fn get_app_info(
     })
 }
 
-#[tauri::command]
-async fn auth_get_state(state: tauri::State<'_, AppState>) -> Result<AuthStateInfo, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn auth_get_state(state: State<'_, AppState>) -> Result<AuthStateInfo, String> {
     // Revalidate persisted session expiry on every state refresh instead of
     // trusting an indefinitely cached in-memory role.
     let db = state.db.clone();
@@ -701,9 +726,9 @@ async fn auth_get_state(state: tauri::State<'_, AppState>) -> Result<AuthStateIn
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn auth_setup(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     clinic_name: String,
     admin_password: String,
     user_password: String,
@@ -727,7 +752,7 @@ async fn auth_setup(
     Ok(out)
 }
 
-async fn provision_via_pos(state: &tauri::State<'_, AppState>, token_code: &str) -> Result<AuthStateInfo, String> {
+async fn provision_via_pos(state: &State<'_, AppState>, token_code: &str) -> Result<AuthStateInfo, String> {
     let act = crate::pos_cloud::activate_with_code(state.db.as_ref(), token_code)
         .await
         .map_err(err_string)?;
@@ -764,10 +789,10 @@ async fn provision_via_pos(state: &tauri::State<'_, AppState>, token_code: &str)
 
 const DEMO_MODE_TOKEN: &str = "DEMOPROGRAMERI";
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn provision_apply_token(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     token: String,
 ) -> Result<AuthStateInfo, String> {
     let token_code = normalize_provision_token(&token);
@@ -1119,9 +1144,9 @@ async fn provision_apply_token(
     Ok(out)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn auth_admin_unlock(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     password: String,
 ) -> Result<bool, String> {
     let db = state.db.clone();
@@ -1137,15 +1162,15 @@ async fn auth_admin_unlock(
     }
 }
 
-#[tauri::command]
-async fn auth_admin_lock(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn auth_admin_lock(state: State<'_, AppState>) -> Result<(), String> {
     state.auth.admin_lock().await;
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn auth_admin_change_password(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     new_password: String,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
@@ -1161,9 +1186,9 @@ async fn auth_admin_change_password(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn auth_user_login(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     password: String,
 ) -> Result<bool, String> {
     let password_for_policy = password.clone();
@@ -1231,9 +1256,9 @@ async fn auth_user_login(
 // Legacy standalone logs-admin password login is intentionally disabled.
 // Logs administrators must authenticate through the existing role-based user login.
 // Never reintroduce a shared credential compiled into the executable.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn auth_logs_admin_login(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     _username: String,
     _password: String,
 ) -> Result<bool, String> {
@@ -1262,7 +1287,7 @@ impl LoginOutcome {
 }
 
 async fn start_user_session(
-    state: &tauri::State<'_, AppState>,
+    state: &State<'_, AppState>,
     role: crate::auth::UserRole,
     password: Option<String>,
 ) -> Result<LoginOutcome, String> {
@@ -1294,7 +1319,7 @@ async fn start_user_session(
 /// PROGRAMERI POS user through the live bridge (only when Mjeku was launched from POS):
 /// Pronar/Admin → owner session; Kontabilist → accounting only (no patient data).
 async fn pos_user_login(
-    state: &tauri::State<'_, AppState>,
+    state: &State<'_, AppState>,
     username: &str,
     password: &str,
 ) -> Result<LoginOutcome, String> {
@@ -1324,9 +1349,9 @@ async fn pos_user_login(
 
 /// Single login form: `admin` (or empty) + clinic password → owner/cashier; a doctor code →
 /// doctor; any other user (e.g. `kont`) or a POS `admin` → PROGRAMERI POS user via the bridge.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn auth_login(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     username: String,
     password: String,
 ) -> Result<LoginOutcome, String> {
@@ -1400,9 +1425,9 @@ async fn auth_login(
 
 /// The logged-in owner, cashier or doctor changes their own password (min. 12 characters).
 /// Allowed while a forced change is pending; that is the only way out of it besides logout.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn auth_change_own_password(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     new_password: String,
 ) -> Result<AuthStateInfo, String> {
     let db = state.db.clone();
@@ -1427,8 +1452,8 @@ async fn auth_change_own_password(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn auth_user_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn auth_user_logout(state: State<'_, AppState>) -> Result<(), String> {
     state.pos_accountant_mode.store(false, Ordering::Release);
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
@@ -1444,9 +1469,9 @@ async fn auth_user_logout(state: tauri::State<'_, AppState>) -> Result<(), Strin
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn doctors_login_options(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<DoctorLoginOption>, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.doctors_login_options())
@@ -1455,9 +1480,9 @@ async fn doctors_login_options(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn auth_doctor_login(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     doctor_id: String,
     password: String,
 ) -> Result<bool, String> {
@@ -1505,8 +1530,8 @@ async fn auth_doctor_login(
     }
 }
 
-#[tauri::command]
-async fn auth_doctor_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn auth_doctor_logout(state: State<'_, AppState>) -> Result<(), String> {
     state.pos_accountant_mode.store(false, Ordering::Release);
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || crate::auth::session_clear(&db))
@@ -1522,9 +1547,9 @@ async fn auth_doctor_logout(state: tauri::State<'_, AppState>) -> Result<(), Str
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn doctor_account_update(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     doctor_id: String,
     password: Option<String>,
     is_admin: bool,
@@ -1539,7 +1564,7 @@ async fn doctor_account_update(
     .map_err(err_string)
 }
 
-async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
+async fn require_login(state: &State<'_, AppState>) -> Result<SessionKind, String> {
     // Recheck expiry and account validity at the command authorization boundary.
     let db = state.db.clone();
     let (s, must_change) = tokio::task::spawn_blocking(move || -> anyhow::Result<(SessionKind, bool)> {
@@ -1571,7 +1596,7 @@ async fn require_login(state: &tauri::State<'_, AppState>) -> Result<SessionKind
     }
 }
 
-async fn require_pos_itadmin_settings(state: &tauri::State<'_, AppState>) -> Result<(), String> {
+async fn require_pos_itadmin_settings(state: &State<'_, AppState>) -> Result<(), String> {
     if !state.pos_itadmin_settings_mode.load(Ordering::Acquire) || !live_pos_itadmin_claim().await {
         state
             .pos_itadmin_settings_mode
@@ -1582,7 +1607,7 @@ async fn require_pos_itadmin_settings(state: &tauri::State<'_, AppState>) -> Res
 }
 
 async fn require_login_or_pos_itadmin_settings(
-    state: &tauri::State<'_, AppState>,
+    state: &State<'_, AppState>,
 ) -> Result<(), String> {
     if require_login(state).await.is_ok() {
         return Ok(());
@@ -1590,7 +1615,7 @@ async fn require_login_or_pos_itadmin_settings(
     require_pos_itadmin_settings(state).await
 }
 
-async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
+async fn require_finance(state: &State<'_, AppState>) -> Result<SessionKind, String> {
     let s = require_login(state).await?;
     match &s {
         SessionKind::User {
@@ -1604,7 +1629,7 @@ async fn require_finance(state: &tauri::State<'_, AppState>) -> Result<SessionKi
     }
 }
 
-async fn require_logs_admin(state: &tauri::State<'_, AppState>) -> Result<(), String> {
+async fn require_logs_admin(state: &State<'_, AppState>) -> Result<(), String> {
     // The legacy logs-admin login is disabled; never trust an in-memory role.
     let db = state.db.clone();
     let s = tokio::task::spawn_blocking(move || crate::auth::session_get(&db))
@@ -1619,7 +1644,7 @@ async fn require_logs_admin(state: &tauri::State<'_, AppState>) -> Result<(), St
     }
 }
 
-async fn require_owner(state: &tauri::State<'_, AppState>) -> Result<SessionKind, String> {
+async fn require_owner(state: &State<'_, AppState>) -> Result<SessionKind, String> {
     let s = require_login(state).await?;
     match &s {
         SessionKind::User {
@@ -1630,9 +1655,9 @@ async fn require_owner(state: &tauri::State<'_, AppState>) -> Result<SessionKind
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn settings_get_all(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<HashMap<String, String>, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
@@ -1671,7 +1696,7 @@ async fn settings_get_all(
 
 /// Clinical data is not available to cashier or logs-only accounts.
 async fn require_orthopedic_clinician(
-    state: &tauri::State<'_, AppState>,
+    state: &State<'_, AppState>,
 ) -> Result<SessionKind, String> {
     let session = require_login(state).await?;
     match session {
@@ -1686,7 +1711,7 @@ async fn require_orthopedic_clinician(
 /// Only a doctor may authorize actual surgery or implantation; a clinic
 /// administrator can manage clinic settings but cannot certify procedures.
 async fn require_orthopedic_surgeon(
-    state: &tauri::State<'_, AppState>,
+    state: &State<'_, AppState>,
 ) -> Result<SessionKind, String> {
     let session = require_orthopedic_clinician(state).await?;
     match session {
@@ -1695,9 +1720,9 @@ async fn require_orthopedic_surgeon(
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_episodes_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     client_id: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1708,9 +1733,9 @@ async fn orthopedic_episodes_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_episode_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode: serde_json::Value,
 ) -> Result<(), String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1721,9 +1746,9 @@ async fn orthopedic_episode_upsert(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_episode_transition(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
     action: String,
     reason: String,
@@ -1741,9 +1766,9 @@ async fn orthopedic_episode_transition(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_episode_transitions_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1754,9 +1779,9 @@ async fn orthopedic_episode_transitions_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_surgery_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let status = value["status"].as_str().unwrap_or("draft");
@@ -1777,9 +1802,9 @@ async fn orthopedic_surgery_upsert(
     .map_err(err_string)?
     .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_implant_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let session = if value["status"].as_str() == Some("implanted")
@@ -1805,9 +1830,9 @@ async fn orthopedic_implant_upsert(
     .map_err(err_string)?
     .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_rehab_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1821,9 +1846,9 @@ async fn orthopedic_rehab_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_fracture_followups_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     fracture_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1834,9 +1859,9 @@ async fn orthopedic_fracture_followups_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_fracture_followup_add(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let surgeon_id = match require_orthopedic_surgeon(&state).await? {
@@ -1850,9 +1875,9 @@ async fn orthopedic_fracture_followup_add(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_operations_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1863,9 +1888,9 @@ async fn orthopedic_operations_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_operation_finalize(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let surgeon_id = match require_orthopedic_surgeon(&state).await? {
@@ -1879,9 +1904,9 @@ async fn orthopedic_operation_finalize(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_surgeries_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1892,9 +1917,9 @@ async fn orthopedic_surgeries_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_implants_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1907,9 +1932,9 @@ async fn orthopedic_implants_list(
 
 /// An authenticated doctor links an existing orthopedic rehabilitation
 /// protocol to the shared Physiotherapy core. The patient ID is derived by SQL.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_referral_create(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     orthopedic_episode_id: String,
     rehab_plan_id: String,
 ) -> Result<serde_json::Value, String> {
@@ -1926,9 +1951,9 @@ async fn physiotherapy_referral_create(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_episodes_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     orthopedic_episode_id: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1939,9 +1964,9 @@ async fn physiotherapy_episodes_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_sessions_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     physiotherapy_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -1952,9 +1977,9 @@ async fn physiotherapy_sessions_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_session_add(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     // Only authenticated Doctor sessions may document treatment in the
@@ -1970,9 +1995,9 @@ async fn physiotherapy_session_add(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_measurements_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     physiotherapy_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
@@ -1985,9 +2010,9 @@ async fn physiotherapy_measurements_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_measurement_add(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let doctor = match require_orthopedic_surgeon(&state).await? {
@@ -2001,9 +2026,9 @@ async fn physiotherapy_measurement_add(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_care_plans_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     physiotherapy_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
@@ -2014,9 +2039,9 @@ async fn physiotherapy_care_plans_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_care_plan_create(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let doctor = match require_orthopedic_surgeon(&state).await? {
@@ -2030,9 +2055,9 @@ async fn physiotherapy_care_plan_create(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_exercises_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
     let db = state.db.clone();
@@ -2042,9 +2067,9 @@ async fn physiotherapy_exercises_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_exercise_create(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let doctor = match require_orthopedic_surgeon(&state).await? {
@@ -2058,9 +2083,9 @@ async fn physiotherapy_exercise_create(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_hep_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     physiotherapy_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
@@ -2071,9 +2096,9 @@ async fn physiotherapy_hep_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_hep_assign(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let doctor = match require_orthopedic_surgeon(&state).await? {
@@ -2087,9 +2112,9 @@ async fn physiotherapy_hep_assign(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_hep_logs_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     physiotherapy_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
@@ -2100,9 +2125,9 @@ async fn physiotherapy_hep_logs_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_hep_log_add(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let doctor = match require_orthopedic_surgeon(&state).await? {
@@ -2116,9 +2141,9 @@ async fn physiotherapy_hep_log_add(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_reports_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     physiotherapy_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
@@ -2129,9 +2154,9 @@ async fn physiotherapy_reports_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_report_create(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let doctor = match require_orthopedic_surgeon(&state).await? {
@@ -2147,10 +2172,10 @@ async fn physiotherapy_report_create(
 
 /// Export a clinical referral or a specific immutable report version.
 /// The receiving reader gets the actual PDF, not a rendered WebView screen.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_document_export_pdf(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     document_id: String,
     kind: String,
 ) -> Result<String, String> {
@@ -2210,9 +2235,9 @@ async fn physiotherapy_document_export_pdf(
     .map_err(err_string)?
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_documents_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     orthopedic_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
@@ -2225,10 +2250,10 @@ async fn physiotherapy_documents_list(
 
 /// Store a patient-linked clinical PDF through the native picker; never
 /// send an OS path through the webview, and validate the file on the backend.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_document_attach(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     orthopedic_episode_id: String,
     category: String,
     source_note: String,
@@ -2301,10 +2326,10 @@ async fn physiotherapy_document_attach(
 }
 
 /// Resolves only locally managed PDF IDs; validates checksum before opening.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_document_open(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     document_id: String,
 ) -> Result<String, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
@@ -2359,9 +2384,9 @@ async fn physiotherapy_document_open(
     .map_err(err_string)?
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_body_markers_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     physiotherapy_episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_surgeon(&state).await?;
@@ -2374,9 +2399,9 @@ async fn physiotherapy_body_markers_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn physiotherapy_body_marker_add(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let actor = match require_orthopedic_surgeon(&state).await? {
@@ -2390,9 +2415,9 @@ async fn physiotherapy_body_marker_add(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_rehab_plans_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2403,9 +2428,9 @@ async fn orthopedic_rehab_plans_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_rehab_phase_reviews_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     rehab_plan_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2416,9 +2441,9 @@ async fn orthopedic_rehab_phase_reviews_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_rehab_phase_review_add(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let clinician = match require_orthopedic_surgeon(&state).await? {
@@ -2434,10 +2459,10 @@ async fn orthopedic_rehab_phase_review_add(
 
 /// Native A4 PDF export of an existing, immutable clinical report version.
 /// The report/patient data come from SQLite, not from the webview DOM.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_report_export_pdf(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     report_id: String,
 ) -> Result<String, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2495,9 +2520,9 @@ async fn orthopedic_report_export_pdf(
     .map_err(err_string)?
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_reports_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2508,9 +2533,9 @@ async fn orthopedic_reports_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_report_version_create(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     // Distinguish medical report signing from surgery finalization.
@@ -2530,9 +2555,9 @@ async fn orthopedic_report_version_create(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_markers_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2542,9 +2567,9 @@ async fn orthopedic_markers_list(
         .map_err(err_string)?
         .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_marker_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2558,9 +2583,9 @@ async fn orthopedic_marker_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_assessments_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2570,9 +2595,9 @@ async fn orthopedic_assessments_list(
         .map_err(err_string)?
         .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_assessment_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2590,9 +2615,9 @@ async fn orthopedic_assessment_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_fractures_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2602,9 +2627,9 @@ async fn orthopedic_fractures_list(
         .map_err(err_string)?
         .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_fracture_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2618,9 +2643,9 @@ async fn orthopedic_fracture_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_imaging_links_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2630,9 +2655,9 @@ async fn orthopedic_imaging_links_list(
         .map_err(err_string)?
         .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_imaging_link_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2650,9 +2675,9 @@ async fn orthopedic_imaging_link_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_postop_visits_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     episode_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2662,9 +2687,9 @@ async fn orthopedic_postop_visits_list(
         .map_err(err_string)?
         .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_postop_visit_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     value: serde_json::Value,
 ) -> Result<(), String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2682,9 +2707,9 @@ async fn orthopedic_postop_visit_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn orthopedic_implants_search(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let _ = require_orthopedic_clinician(&state).await?;
@@ -2695,9 +2720,9 @@ async fn orthopedic_implants_search(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn settings_set(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     key: String,
     value: String,
 ) -> Result<(), String> {
@@ -2818,13 +2843,13 @@ async fn settings_set(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 fn lab_devices_list_profiles() -> Vec<crate::models::AnalyzerProfile> {
     lab_devices::known_profiles()
 }
 
-#[tauri::command]
-async fn lab_serial_ports_list(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn lab_serial_ports_list(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let _ = require_login(&state).await?;
     Ok(lab_devices::list_serial_ports())
 }
@@ -2835,9 +2860,9 @@ struct LabDeviceDefault {
     port_name: Option<String>,
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn lab_device_get_default(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<LabDeviceDefault, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
@@ -2854,9 +2879,9 @@ async fn lab_device_get_default(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn lab_device_set_default(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     profile_id: String,
     port_name: String,
 ) -> Result<(), String> {
@@ -2875,9 +2900,9 @@ async fn lab_device_set_default(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn lab_device_connect(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     port_name: String,
     profile_id: String,
 ) -> Result<(), String> {
@@ -2892,8 +2917,8 @@ async fn lab_device_connect(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn lab_device_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn lab_device_disconnect(state: State<'_, AppState>) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let lab_serial = state.lab_serial.clone();
     tokio::task::spawn_blocking(move || lab_serial.disconnect())
@@ -2901,17 +2926,17 @@ async fn lab_device_disconnect(state: tauri::State<'_, AppState>) -> Result<(), 
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn lab_device_status(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<crate::models::LabDeviceStatus, String> {
     let _ = require_login(&state).await?;
     Ok(state.lab_serial.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn lab_inbox_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     only_unmatched: Option<bool>,
 ) -> Result<Vec<crate::models::LabInboxItem>, String> {
     let _ = require_login(&state).await?;
@@ -2923,9 +2948,9 @@ async fn lab_inbox_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn lab_inbox_assign(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     inbox_id: String,
     visit_id: String,
 ) -> Result<(), String> {
@@ -2949,10 +2974,10 @@ fn decode_base64_data(data: &str) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn clinic_asset_set_png(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     key: String,
     base64_png: String,
 ) -> Result<(), String> {
@@ -2986,10 +3011,10 @@ async fn clinic_asset_set_png(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn clinic_asset_clear_png(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     key: String,
 ) -> Result<(), String> {
     let _ = require_owner(&state).await?;
@@ -3017,9 +3042,9 @@ async fn clinic_asset_clear_png(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn clients_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     search: Option<String>,
 ) -> Result<Vec<Client>, String> {
     let _ = require_login(&state).await?;
@@ -3030,9 +3055,9 @@ async fn clients_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn clients_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     client: ClientUpsertInput,
 ) -> Result<Client, String> {
     let _ = require_login(&state).await?;
@@ -3052,8 +3077,8 @@ async fn clients_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
-async fn clients_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn clients_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.clients_delete(&id))
@@ -3062,9 +3087,9 @@ async fn clients_delete(state: tauri::State<'_, AppState>, id: String) -> Result
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sales_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     filters: Option<SalesListFilters>,
 ) -> Result<Vec<Sale>, String> {
     let session = require_finance(&state).await?;
@@ -3080,9 +3105,9 @@ async fn sales_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sales_daily_report(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     date: String,
 ) -> Result<DailySalesReport, String> {
     let session = require_login(&state).await?;
@@ -3120,9 +3145,9 @@ async fn sales_daily_report(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sales_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale: SaleUpsertInput,
 ) -> Result<Sale, String> {
     let _ = require_finance(&state).await?;
@@ -3133,8 +3158,8 @@ async fn sales_upsert(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn sales_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sales_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.sales_delete(&id))
@@ -3143,9 +3168,9 @@ async fn sales_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sales_mark_fiscalized_manual(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale_id: String,
     reason: Option<String>,
 ) -> Result<(), String> {
@@ -3159,9 +3184,9 @@ async fn sales_mark_fiscalized_manual(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sales_mark_non_fiscal_manual(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale_id: String,
     reason: Option<String>,
 ) -> Result<(), String> {
@@ -3175,9 +3200,9 @@ async fn sales_mark_non_fiscal_manual(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn payments_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     filters: Option<PaymentsListFilters>,
 ) -> Result<Vec<Payment>, String> {
     let _ = require_finance(&state).await?;
@@ -3188,9 +3213,9 @@ async fn payments_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn payments_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     payment: PaymentUpsertInput,
 ) -> Result<Payment, String> {
     let _ = require_finance(&state).await?;
@@ -3201,9 +3226,9 @@ async fn payments_upsert(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn payments_replace_for_sale(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale_id: String,
     payments: Vec<PaymentUpsertInput>,
 ) -> Result<Vec<Payment>, String> {
@@ -3215,8 +3240,8 @@ async fn payments_replace_for_sale(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn payments_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn payments_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.payments_delete(&id))
@@ -3225,9 +3250,9 @@ async fn payments_delete(state: tauri::State<'_, AppState>, id: String) -> Resul
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn doctors_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     search: Option<String>,
 ) -> Result<Vec<Doctor>, String> {
     let session = require_login(&state).await?;
@@ -3248,9 +3273,9 @@ async fn doctors_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn doctors_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     doctor: DoctorUpsertInput,
 ) -> Result<Doctor, String> {
     let _ = require_owner(&state).await?;
@@ -3263,8 +3288,8 @@ async fn doctors_upsert(
     Ok(row)
 }
 
-#[tauri::command]
-async fn doctors_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn doctors_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_owner(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.doctors_delete(&id))
@@ -3275,9 +3300,9 @@ async fn doctors_delete(state: tauri::State<'_, AppState>, id: String) -> Result
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn services_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     search: Option<String>,
 ) -> Result<Vec<Service>, String> {
     let _ = require_login(&state).await?;
@@ -3288,14 +3313,14 @@ async fn services_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 fn atk_catalog_get() -> crate::atk_catalog::AtkCatalog {
     crate::atk_catalog::get()
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn services_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     service: ServiceUpsertInput,
 ) -> Result<Service, String> {
     let _ = require_owner(&state).await?;
@@ -3306,8 +3331,8 @@ async fn services_upsert(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn services_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn services_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_owner(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.services_delete(&id))
@@ -3316,9 +3341,9 @@ async fn services_delete(state: tauri::State<'_, AppState>, id: String) -> Resul
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn appointments_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     filters: Option<AppointmentsListFilters>,
 ) -> Result<Vec<Appointment>, String> {
     let session = require_login(&state).await?;
@@ -3339,9 +3364,9 @@ async fn appointments_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn appointments_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     appointment: AppointmentUpsertInput,
 ) -> Result<Appointment, String> {
     let session = require_login(&state).await?;
@@ -3362,8 +3387,8 @@ async fn appointments_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
-async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn appointments_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let session = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
@@ -3386,9 +3411,9 @@ async fn appointments_delete(state: tauri::State<'_, AppState>, id: String) -> R
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn dental_treatment_plans_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     patient_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let (doctor_id, is_admin) = match require_login(&state).await? {
@@ -3410,9 +3435,9 @@ async fn dental_treatment_plans_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn dental_periodontal_exams_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     patient_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let (doctor_id, is_admin) = match require_login(&state).await? {
@@ -3433,9 +3458,9 @@ async fn dental_periodontal_exams_list(
     .map_err(err_string)?
     .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn dental_periodontal_exam_create(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     exam: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let doctor_id = match require_login(&state).await? {
@@ -3449,9 +3474,9 @@ async fn dental_periodontal_exam_create(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn dental_finding_correct(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     correction: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let doctor_id = match require_login(&state).await? {
@@ -3464,9 +3489,9 @@ async fn dental_finding_correct(
         .map_err(err_string)?
         .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn dental_finding_corrections_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     patient_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let (doctor_id, is_admin) = match require_login(&state).await? {
@@ -3488,9 +3513,9 @@ async fn dental_finding_corrections_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn dental_findings_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     patient_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let session = require_login(&state).await?;
@@ -3514,9 +3539,9 @@ async fn dental_findings_list(
     .map_err(err_string)?
     .map_err(err_string)
 }
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn dental_finding_create(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     finding: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let session = require_login(&state).await?;
@@ -3531,9 +3556,9 @@ async fn dental_finding_create(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn visits_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     filters: Option<VisitsListFilters>,
 ) -> Result<Vec<Visit>, String> {
     let session = require_login(&state).await?;
@@ -3554,9 +3579,9 @@ async fn visits_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn visits_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     visit: VisitUpsertInput,
 ) -> Result<Visit, String> {
     let session = require_login(&state).await?;
@@ -3587,8 +3612,8 @@ async fn visits_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
-async fn visits_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn visits_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let session = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
@@ -3611,9 +3636,9 @@ async fn visits_delete(state: tauri::State<'_, AppState>, id: String) -> Result<
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn visit_items_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     filters: Option<VisitItemsListFilters>,
 ) -> Result<Vec<VisitItem>, String> {
     let session = require_login(&state).await?;
@@ -3650,9 +3675,9 @@ async fn visit_items_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn visit_items_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     item: VisitItemUpsertInput,
 ) -> Result<VisitItem, String> {
     let session = require_login(&state).await?;
@@ -3685,8 +3710,8 @@ async fn visit_items_upsert(
     .map_err(err_string)
 }
 
-#[tauri::command]
-async fn visit_items_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn visit_items_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let session = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
@@ -3712,9 +3737,9 @@ async fn visit_items_delete(state: tauri::State<'_, AppState>, id: String) -> Re
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn cash_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     filters: Option<CashListFilters>,
 ) -> Result<Vec<CashEntry>, String> {
     let _ = require_owner(&state).await?;
@@ -3725,9 +3750,9 @@ async fn cash_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn cash_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     entry: CashEntryUpsertInput,
 ) -> Result<CashEntry, String> {
     let _ = require_owner(&state).await?;
@@ -3738,8 +3763,8 @@ async fn cash_upsert(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn cash_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn cash_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_owner(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.cash_delete(&id))
@@ -3748,23 +3773,23 @@ async fn cash_delete(state: tauri::State<'_, AppState>, id: String) -> Result<()
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn sync_now(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sync_now(state: State<'_, AppState>) -> Result<(), String> {
     let _ = require_login(&state).await?;
     state.sync.sync_now().await.map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn updates_check_now(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
     state.updates.check_now(&app).await.map_err(err_string)
 }
 
 async fn desktop_updates_check_and_store(
-    app: &tauri::AppHandle,
+    app: &AppHandle,
     db: Arc<Db>,
     mark_manual: bool,
 ) -> Result<crate::desktop_updates::DesktopUpdateInfo, String> {
@@ -3847,43 +3872,43 @@ async fn desktop_updates_check_and_store(
     Ok(info)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn desktop_updates_check_now(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<crate::desktop_updates::DesktopUpdateInfo, String> {
     let _ = require_login(&state).await?;
     desktop_updates_check_and_store(&app, state.db.clone(), true).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn desktop_updates_open_download(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     url: String,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
     crate::desktop_updates::open_external(&url).map_err(err_string)
 }
 
-#[tauri::command]
-async fn updates_apply_downloaded(app: tauri::AppHandle) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn updates_apply_downloaded(app: AppHandle) -> Result<(), String> {
     // Switch the pointer (if a pending version exists) and reload.
     let _ = UpdatesEngine::apply_downloaded_now(&app).map_err(err_string)?;
     reload_ui(app).await
 }
 
-#[tauri::command]
-async fn reload_ui(app: tauri::AppHandle) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn reload_ui(app: AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("main") {
         win.eval("window.location.reload()").map_err(err_string)?;
     }
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn invoice_export_fiscal_inp(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     sale_id: String,
     allow_any_if_no_fiscal: Option<bool>,
     preview_only: Option<bool>,
@@ -3957,8 +3982,8 @@ async fn invoice_export_fiscal_inp(
     .map_err(err_string)
 }
 
-#[tauri::command]
-async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn fiscal_report_x_inp(state: State<'_, AppState>) -> Result<String, String> {
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
     require_pef_report_provider(&provider)?;
@@ -4016,8 +4041,8 @@ async fn fiscal_report_x_inp(state: tauri::State<'_, AppState>) -> Result<String
     .map_err(err_string)
 }
 
-#[tauri::command]
-async fn fiscal_report_z_inp(state: tauri::State<'_, AppState>) -> Result<String, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn fiscal_report_z_inp(state: State<'_, AppState>) -> Result<String, String> {
     let _ = require_finance(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
     require_pef_report_provider(&provider)?;
@@ -4075,10 +4100,10 @@ async fn fiscal_report_z_inp(state: tauri::State<'_, AppState>) -> Result<String
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn admin_reset_clinic(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
     if !state.auth.is_admin_unlocked().await {
@@ -4100,8 +4125,8 @@ async fn admin_reset_clinic(
     std::process::exit(0);
 }
 
-#[tauri::command]
-async fn history_reset_all(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn history_reset_all(state: State<'_, AppState>) -> Result<(), String> {
     let _ = require_owner(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.history_reset_all())
@@ -4113,9 +4138,14 @@ async fn history_reset_all(state: tauri::State<'_, AppState>) -> Result<(), Stri
 // Ne mobile, document_dir() shkon te nje dosje private e app-it (Android/data/<pkg>/files/Documents)
 // qe Android 11+ e fsheh nga app-i standard "Files" (scoped storage). Prandaj ketu hapim save-dialog-un
 // nativ (SAF) qe useri te zgjedhe vete vendin — skedari garantohet i dukshem pas kesaj.
-#[cfg(mobile)]
+#[cfg(all(mobile, feature = "embedded"))]
+fn save_pdf_via_dialog(app: &AppHandle, default_name: &str, pdf_bytes: &[u8]) -> Result<String, String> {
+    crate::embedded::save_export(app, default_name, pdf_bytes)
+}
+
+#[cfg(all(mobile, not(feature = "embedded")))]
 fn save_pdf_via_dialog(
-    app: &tauri::AppHandle,
+    app: &AppHandle,
     default_name: &str,
     pdf_bytes: &[u8],
 ) -> Result<String, String> {
@@ -4145,10 +4175,10 @@ fn save_pdf_via_dialog(
         .unwrap_or_else(|| default_name.to_string()))
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn invoice_export_pdf(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     sale_id: String,
 ) -> Result<String, String> {
     let session = require_finance(&state).await?;
@@ -4197,10 +4227,10 @@ async fn invoice_export_pdf(
     .map_err(err_string)?
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn visit_export_pdf(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     visit_id: String,
 ) -> Result<String, String> {
     let session = require_login(&state).await?;
@@ -4431,9 +4461,9 @@ fn fiscal_job_age_secs(created_at: &str) -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn fiscal_jobs_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     status: Option<String>,
 ) -> Result<Vec<crate::models::FiscalJob>, String> {
     let _ = require_login(&state).await?;
@@ -4444,9 +4474,9 @@ async fn fiscal_jobs_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn fiscal_job_create(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale_id: String,
 ) -> Result<crate::models::FiscalJob, String> {
     let session = require_login(&state).await?;
@@ -4480,8 +4510,8 @@ async fn fiscal_job_create(
     .map_err(err_string)
 }
 
-#[tauri::command]
-async fn fiscal_job_cancel(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn fiscal_job_cancel(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -4497,8 +4527,8 @@ async fn fiscal_job_cancel(state: tauri::State<'_, AppState>, id: String) -> Res
     .map_err(err_string)
 }
 
-#[tauri::command]
-async fn fiscal_job_process(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn fiscal_job_process(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -4677,7 +4707,7 @@ fn sef_fiscalize_blocking(
     Ok(msg)
 }
 
-async fn require_sef_provider(state: &tauri::State<'_, AppState>) -> Result<(), String> {
+async fn require_sef_provider(state: &State<'_, AppState>) -> Result<(), String> {
     let provider = get_fiscal_printer_provider(state).await?;
     if provider != crate::sef_bridge::PROVIDER_VALUE {
         return Err("Motori fiskal nuk është SEF (PROGRAMERI POS).".to_string());
@@ -4796,8 +4826,8 @@ struct SefBridgeInfo {
     capabilities: Vec<String>,
 }
 
-#[tauri::command]
-async fn sef_bridge_info(state: tauri::State<'_, AppState>) -> Result<SefBridgeInfo, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sef_bridge_info(state: State<'_, AppState>) -> Result<SefBridgeInfo, String> {
     require_login_or_pos_itadmin_settings(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
     let launch_mode = match std::env::var("PROGRAMERI_MJEKU_LAUNCH_MODE").as_deref() {
@@ -4820,8 +4850,8 @@ async fn sef_bridge_info(state: tauri::State<'_, AppState>) -> Result<SefBridgeI
 
 /// Returns the authenticated POS role from the live named-pipe session. The value
 /// is not inferred from Mjeku's Owner/Cashier account or from process environment.
-#[tauri::command]
-async fn sef_bridge_pos_session(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sef_bridge_pos_session(state: State<'_, AppState>) -> Result<bool, String> {
     let _ = require_login(&state).await?;
     if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
         return Ok(false);
@@ -4837,16 +4867,16 @@ async fn sef_bridge_pos_session(state: tauri::State<'_, AppState>) -> Result<boo
 }
 
 /// UI hint for the pre-login form only. Authorization is always enforced by the POS host.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 fn sef_bridge_pos_auth_available() -> bool {
     cfg!(target_os = "windows") && crate::sef_bridge::launched_from_programeri()
 }
 
 /// Verifies the fixed PROGRAMERI POS ITAdmin account through the authenticated local bridge.
 /// This command is intentionally callable before Mjeku login; it never accepts a role or username.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_bridge_pos_authenticate(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     password: String,
 ) -> Result<bool, String> {
     state
@@ -4884,8 +4914,8 @@ async fn sef_bridge_pos_authenticate(
     Ok(is_itadmin)
 }
 
-#[tauri::command]
-async fn auth_pos_itadmin_logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn auth_pos_itadmin_logout(state: State<'_, AppState>) -> Result<(), String> {
     state.pos_accountant_mode.store(false, Ordering::Release);
     state
         .pos_itadmin_settings_mode
@@ -4927,8 +4957,8 @@ async fn clear_pos_itadmin_claim() {
     }
 }
 
-#[tauri::command]
-async fn sef_bridge_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sef_bridge_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     require_login_or_pos_itadmin_settings(&state).await?;
     crate::sef_bridge::call(
         "status",
@@ -4947,8 +4977,8 @@ static HOST_UPDATE_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomi
 /// `poll` needs no login: the answer is only whether a verified POS version is ready. When it is,
 /// the UI shows a 30 s countdown with "Shtyje" (`postpone`). `ready` is sent only after the open work is
 /// saved; POS then applies the update and reopens Mjeku, so Mjeku exits here. POS never kills Mjeku.
-#[tauri::command]
-async fn sef_bridge_host_update(app: tauri::AppHandle, action: String) -> Result<serde_json::Value, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sef_bridge_host_update(app: AppHandle, action: String) -> Result<serde_json::Value, String> {
     use std::sync::atomic::Ordering;
     let idle = serde_json::json!({ "requested": false, "mandatory": false, "accepted": false, "version": "", "countdownSeconds": 30 });
     if !cfg!(target_os = "windows") || HOST_UPDATE_UNSUPPORTED.load(Ordering::Relaxed) {
@@ -4979,7 +5009,7 @@ async fn sef_bridge_host_update(app: tauri::AppHandle, action: String) -> Result
     if action == "ready" && result.get("accepted").and_then(serde_json::Value::as_bool) == Some(true) {
         // Let the response reach the UI, then exit; PROGRAMERI POS applies the update and reopens Mjeku.
         let handle = app.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::rt_spawn(async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
             handle.exit(0);
         });
@@ -4990,8 +5020,8 @@ async fn sef_bridge_host_update(app: tauri::AppHandle, action: String) -> Result
 /// Opens the existing PROGRAMERI POS ATK auditor. The POS host owns the password
 /// check, audit database and read-only session; no audit data or credential is
 /// copied into Mjeku.
-#[tauri::command]
-async fn sef_bridge_open_atk_access(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sef_bridge_open_atk_access(state: State<'_, AppState>) -> Result<bool, String> {
     let _ = require_owner(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
     if provider != crate::sef_bridge::PROVIDER_VALUE {
@@ -5014,15 +5044,15 @@ async fn sef_bridge_open_atk_access(state: tauri::State<'_, AppState>) -> Result
 }
 
 /// Status of the PROGRAMERI POS cloud link (all platforms).
-#[tauri::command]
-async fn pos_cloud_status(state: tauri::State<'_, AppState>) -> Result<crate::pos_cloud::PosCloudStatus, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn pos_cloud_status(state: State<'_, AppState>) -> Result<crate::pos_cloud::PosCloudStatus, String> {
     Ok(crate::pos_cloud::status(state.db.as_ref()))
 }
 
 /// Links this already configured Mjeku (Android/iOS or desktop) to the clinic in the PROGRAMERI POS
 /// project with a one-time AdminPanelTOKENS code; from then on sync and licence use only that project.
-#[tauri::command]
-async fn pos_cloud_link_device(state: tauri::State<'_, AppState>, code: String) -> Result<bool, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn pos_cloud_link_device(state: State<'_, AppState>, code: String) -> Result<bool, String> {
     let _ = require_owner(&state).await?;
     let code = normalize_provision_token(&code);
     if code.is_empty() {
@@ -5038,8 +5068,8 @@ async fn pos_cloud_link_device(state: tauri::State<'_, AppState>, code: String) 
 /// Opens the clinic's accounting in PROGRAMERI POS. The POS host asks for a POS
 /// login (role with accounting permission) and shows its own window; Mjeku
 /// receives no accounting data and never handles those credentials.
-#[tauri::command]
-async fn sef_bridge_open_accounting(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sef_bridge_open_accounting(state: State<'_, AppState>) -> Result<bool, String> {
     // Owner and the POS accountant open accounting without a second login; an admin doctor
     // still gets the PROGRAMERI POS login dialog.
     let mjeku_session = if state.pos_accountant_mode.load(Ordering::Acquire) {
@@ -5072,8 +5102,8 @@ async fn sef_bridge_open_accounting(state: tauri::State<'_, AppState>) -> Result
 
 /// A4 B2B invoices that PROGRAMERI POS generated from this clinic's SEF sales (read-only here).
 /// Returns an empty list when Mjeku was not launched from POS or POS is older (no `b2b.list`).
-#[tauri::command]
-async fn sef_bridge_b2b_list(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sef_bridge_b2b_list(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let _ = require_login(&state).await?;
     if !cfg!(target_os = "windows") || !crate::sef_bridge::launched_from_programeri() {
         return Ok(serde_json::json!([]));
@@ -5084,9 +5114,9 @@ async fn sef_bridge_b2b_list(state: tauri::State<'_, AppState>) -> Result<serde_
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_bridge_sync_clock(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     require_login_or_pos_itadmin_settings(&state).await?;
     let provider = get_fiscal_printer_provider(&state).await?;
@@ -5110,9 +5140,9 @@ async fn sef_bridge_sync_clock(
 
 /// Merr identitetin e biznesit nga profili qendror i PROGRAMERI POS dhe e ruan
 /// në Mjeku vetëm si cache lokale për paraqitje/printim.
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_bridge_sync_business_settings(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
     if !crate::sef_bridge::platform_supported() || !crate::sef_bridge::launched_from_programeri() {
@@ -5183,8 +5213,8 @@ async fn sef_bridge_sync_business_settings(
 /// Zgjedh SEF (PROGRAMERI POS) si motor fiskal: hap konfigurimin SEF të PROGRAMERI POS
 /// dhe e ruan motorin vetëm kur kthehet `ready:true`. Kur SEF është tashmë motori,
 /// vetëm rihap konfigurimin dhe kthen gjendjen `ready`.
-#[tauri::command]
-async fn sef_bridge_select_engine(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn sef_bridge_select_engine(state: State<'_, AppState>) -> Result<bool, String> {
     if !crate::sef_bridge::platform_supported() {
         return Err(crate::sef_bridge::MSG_UNSUPPORTED_PLATFORM.to_string());
     }
@@ -5239,9 +5269,9 @@ async fn sef_bridge_select_engine(state: tauri::State<'_, AppState>) -> Result<b
     Ok(true)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_coupons_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     from: Option<String>,
     to: Option<String>,
 ) -> Result<serde_json::Value, String> {
@@ -5263,9 +5293,9 @@ async fn sef_coupons_list(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_coupon_copy(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     coupon_id: String,
 ) -> Result<serde_json::Value, String> {
     let _ = require_finance(&state).await?;
@@ -5283,9 +5313,9 @@ async fn sef_coupon_copy(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_coupon_preview(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     coupon_id: String,
 ) -> Result<serde_json::Value, String> {
     let _ = require_finance(&state).await?;
@@ -5308,9 +5338,9 @@ async fn sef_coupon_preview(
     .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_coupon_email(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     coupon_id: String,
     to_address: String,
 ) -> Result<serde_json::Value, String> {
@@ -5345,9 +5375,9 @@ struct SefReturnItemInput {
     qty: f64,
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_coupon_return(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     coupon_id: String,
     items: Vec<SefReturnItemInput>,
     reason: String,
@@ -5403,9 +5433,9 @@ async fn sef_coupon_return(
     .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_coupon_cancel(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     coupon_id: String,
     reason: String,
     preview_only: Option<bool>,
@@ -5434,9 +5464,9 @@ async fn sef_coupon_cancel(
 }
 
 /// Raporti X/Z i plotë (tekst + totale) për faqen "Kuponët".
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_report(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     _kind: String,
     _date: Option<String>,
 ) -> Result<serde_json::Value, String> {
@@ -5446,9 +5476,9 @@ async fn sef_report(
 }
 
 /// Rreshtat e fiskalizuar të një shitjeje (për zgjedhjen e artikujve te "Kthe").
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_sale_items(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale_id: String,
 ) -> Result<Vec<VisitItem>, String> {
     let _ = require_finance(&state).await?;
@@ -5471,9 +5501,9 @@ async fn sef_sale_items(
 }
 
 /// Kuponi SEF i ruajtur lokalisht te shitja (nëse ka).
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sef_sale_coupon(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale_id: String,
 ) -> Result<Option<crate::db::SefCouponInfo>, String> {
     let _ = require_finance(&state).await?;
@@ -5484,9 +5514,9 @@ async fn sef_sale_coupon(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn prescriptions_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     kind: Option<String>,
     client_id: Option<String>,
 ) -> Result<Vec<crate::models::Prescription>, String> {
@@ -5498,8 +5528,8 @@ async fn prescriptions_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn prescriptions_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn prescriptions_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.prescriptions_delete(&id))
@@ -5508,10 +5538,10 @@ async fn prescriptions_delete(state: tauri::State<'_, AppState>, id: String) -> 
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn prescription_export_pdf(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     visit_id: Option<String>,
     kind: Option<String>,
     title: Option<String>,
@@ -5704,9 +5734,9 @@ async fn prescription_export_pdf(
     .map_err(err_string)?
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn error_logs_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> Result<Vec<crate::error_logs::ErrorLogEntry>, String> {
     let _ = require_logs_admin(&state).await?;
@@ -5718,8 +5748,8 @@ async fn error_logs_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn error_logs_clear(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn error_logs_clear(state: State<'_, AppState>) -> Result<(), String> {
     let _ = require_logs_admin(&state).await?;
     let path = state.error_log_path.clone();
     tokio::task::spawn_blocking(move || crate::error_logs::clear(&path))
@@ -5728,10 +5758,10 @@ async fn error_logs_clear(state: tauri::State<'_, AppState>) -> Result<(), Strin
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn regular_invoice_create(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     sale_id: String,
 ) -> Result<crate::models::RegularInvoice, String> {
     require_finance(&state).await?;
@@ -5898,9 +5928,9 @@ async fn regular_invoice_create(
     .map_err(err_string)?
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn regular_invoices_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     date_from: Option<String>,
     date_to: Option<String>,
 ) -> Result<Vec<crate::models::RegularInvoice>, String> {
@@ -5914,14 +5944,14 @@ async fn regular_invoices_list(
     .map_err(err_string)?
 }
 
-#[tauri::command]
-fn app_restart(app: tauri::AppHandle) {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+fn app_restart(app: AppHandle) {
     app.restart();
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sales_monthly_report(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     year: i32,
 ) -> Result<Vec<crate::models::MonthlyReportRow>, String> {
     let _ = require_finance(&state).await?;
@@ -5932,9 +5962,9 @@ async fn sales_monthly_report(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn stock_suppliers_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::StockSupplier>, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
@@ -5944,9 +5974,9 @@ async fn stock_suppliers_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn stock_supplier_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     supplier: crate::models::StockSupplier,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
@@ -5957,9 +5987,9 @@ async fn stock_supplier_upsert(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn stock_supplier_delete(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
@@ -5970,9 +6000,9 @@ async fn stock_supplier_delete(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn stock_items_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::StockItem>, String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
@@ -5982,9 +6012,9 @@ async fn stock_items_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn stock_item_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     item: crate::models::StockItemUpsertInput,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
@@ -5995,8 +6025,8 @@ async fn stock_item_upsert(
         .map_err(err_string)
 }
 
-#[tauri::command]
-async fn stock_item_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn stock_item_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.stock_item_delete(&id))
@@ -6005,9 +6035,9 @@ async fn stock_item_delete(state: tauri::State<'_, AppState>, id: String) -> Res
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn stock_movements_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     item_id: String,
 ) -> Result<Vec<crate::models::StockMovement>, String> {
     let _ = require_login(&state).await?;
@@ -6018,9 +6048,9 @@ async fn stock_movements_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn stock_movement_add(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     movement: crate::models::StockMovement,
 ) -> Result<(), String> {
     let _ = require_login(&state).await?;
@@ -6031,9 +6061,9 @@ async fn stock_movement_add(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sale_items_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale_id: String,
 ) -> Result<Vec<crate::models::SaleItem>, String> {
     let _ = require_finance(&state).await?;
@@ -6044,9 +6074,9 @@ async fn sale_items_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn sale_items_replace(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     sale_id: String,
     items: Vec<crate::models::SaleItemInput>,
 ) -> Result<(), String> {
@@ -6060,9 +6090,9 @@ async fn sale_items_replace(
 
 // ─── Offer commands ───────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn offers_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::Offer>, String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
@@ -6080,9 +6110,9 @@ async fn offers_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn offer_items_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     offer_id: String,
 ) -> Result<Vec<crate::models::OfferItem>, String> {
     let _ = require_finance(&state).await?;
@@ -6093,9 +6123,9 @@ async fn offer_items_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn offer_upsert(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     client_id: String,
     status: String,
     valid_until: Option<String>,
@@ -6231,8 +6261,8 @@ async fn offer_upsert(
     Ok(offer)
 }
 
-#[tauri::command]
-async fn offer_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn offer_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_finance(&state).await?;
     let db = state.db.clone();
     let now = crate::util::now_iso();
@@ -6258,9 +6288,9 @@ async fn offer_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn offer_set_status(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     id: String,
     status: String,
     invoice_id: Option<String>,
@@ -6294,10 +6324,10 @@ async fn offer_set_status(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn offer_pdf(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     offer_id: String,
 ) -> Result<String, String> {
     let _ = require_finance(&state).await?;
@@ -6427,9 +6457,9 @@ async fn offer_pdf(
     ))
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn client_photos_list(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     client_id: String,
 ) -> Result<Vec<ClientPhoto>, String> {
     let _ = require_login(&state).await?;
@@ -6440,10 +6470,10 @@ async fn client_photos_list(
         .map_err(err_string)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn client_photo_add(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    state: State<'_, AppState>,
     client_id: String,
     stage: String,
     label: Option<String>,
@@ -6504,9 +6534,9 @@ async fn client_photo_add(
     Ok(row)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
 async fn client_photo_data(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, AppState>,
     id: String,
 ) -> Result<String, String> {
     let _ = require_login(&state).await?;
@@ -6521,8 +6551,8 @@ async fn client_photo_data(
     Ok(general_purpose::STANDARD.encode(bytes))
 }
 
-#[tauri::command]
-async fn client_photo_delete(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[cfg_attr(not(feature = "embedded"), tauri::command)]
+async fn client_photo_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let _ = require_login(&state).await?;
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.client_photo_delete(&id))
@@ -6531,6 +6561,212 @@ async fn client_photo_delete(state: tauri::State<'_, AppState>, id: String) -> R
         .map_err(err_string)
 }
 
+
+/// Gjendja e app-it (DB, auth, sinkronizimi, licenca) — e përbashkët për Tauri (desktop/Android)
+/// dhe për Mjekun e mbështjellë në PROGRAMERI POS Mobile (feature `embedded`).
+pub(crate) fn init_app_state(handle: &AppHandle) -> anyhow::Result<AppState> {
+    let data_dir = handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Clinic reset is applied on startup (safe) so we can delete the SQLite file while it's closed.
+    let reset_flag = data_dir.join("reset.flag");
+    if reset_flag.exists() {
+        let _ = std::fs::remove_file(data_dir.join("mjeku.sqlite3"));
+        let _ = std::fs::remove_dir_all(data_dir.join("ui"));
+        let _ = std::fs::remove_dir_all(data_dir.join("fiscal"));
+        let _ = std::fs::remove_dir_all(data_dir.join("assets"));
+        let _ = std::fs::remove_file(&reset_flag);
+    }
+    // "Demo Mode" (mobile-only, per App Store review requirement): kur eshte
+    // futur token-i special (shih provision_apply_token) ne nje ekzekutim te
+    // meparshem, marker-i eshte shkruar ketu dhe app-i eshte rinisur - baza e
+    // te dhenave hapet ne memorie (asgje s'shkruhet ne disk, zhduket kur mbyllet
+    // procesi) dhe klinika demo konfigurohet automatikisht me login te hapur.
+    #[cfg(mobile)]
+    let is_demo_mode = data_dir.join("demo_mode.flag").exists();
+    #[cfg(not(mobile))]
+    let is_demo_mode = false;
+
+    let db = if is_demo_mode {
+        Arc::new(Db::new_in_memory()?)
+    } else {
+        Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?)
+    };
+    if is_demo_mode && !crate::auth::is_configured(&db)? {
+        crate::auth::setup_v2(
+            &db,
+            "Demo Klinika PROGRAMERI",
+            "demo123456",
+            "demo1234",
+            None,
+        )?;
+    }
+    if db
+        .setting_get(FISCAL_PRINTER_PROVIDER_KEY)?
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        db.setting_set(FISCAL_PRINTER_PROVIDER_KEY, "enternet")?;
+    }
+
+    // Auto-fix typoed URL if it was saved in DB from a previous run (startup check)
+    let current_db_url = db.setting_get(KEY_SUPABASE_URL)?.unwrap_or_default();
+    if current_db_url == "https://occzpryzxabajtmdaas.supabase.co" {
+        db.setting_set(KEY_SUPABASE_URL, DEFAULT_SUPABASE_URL)?;
+    }
+
+    // Auto-fix future timestamps (clock skew recovery)
+    // If the stored timestamp is way in the future (e.g. > 24h from now), reset it to allow re-check.
+    let now_utc = Utc::now();
+    for key in ["license_last_checked_at", "license_last_seen_device_time"] {
+        if let Ok(Some(val)) = db.setting_get(key) {
+            if let Ok(ts_utc) = crate::util::parse_rfc3339_to_utc(&val) {
+                if ts_utc > now_utc + ChronoDuration::days(1) {
+                    db.setting_set(key, "")?;
+                }
+            }
+        }
+    }
+
+    ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_URL, DEFAULT_SUPABASE_URL)?;
+    ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_API_KEY, DEFAULT_SUPABASE_API_KEY)?;
+    ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_ANON_KEY, DEFAULT_SUPABASE_API_KEY)?;
+    ensure_setting_if_empty(db.as_ref(), "update_base_url", DEFAULT_UPDATE_BASE_URL)?;
+    // Migrim: klientët ekzistues e kishin "update_base_url" të vendosur eksplicit
+    // (jo bosh) te Vercel-i i vjetër - ensure_setting_if_empty s'e prek atë. E
+    // kalojmë te Render nëse ende ka vlerën default të vjetër (jo një URL të
+    // personalizuar nga useri).
+    if let Ok(Some(cur)) = db.setting_get("update_base_url") {
+        if cur.trim().trim_end_matches('/') == OLD_DEFAULT_UPDATE_BASE_URL {
+            let _ = db.setting_set("update_base_url", DEFAULT_UPDATE_BASE_URL);
+        }
+    }
+    if let Err(e) = db.fiscal_clear_article_on_app_open() {
+        eprintln!("startup clear article failed: {e}");
+    }
+    let error_log_path = data_dir.join("logs").join("errors.log");
+    db.setting_set("error_log_path", &error_log_path.display().to_string())?;
+    let has_visit_service = db.services_list(None)?.into_iter().any(|s| {
+        let t = s.title.trim().to_ascii_lowercase().replace('ë', "e");
+        t == "vizite" || t == "vizita"
+    });
+    if !has_visit_service {
+        let vat_registered = db
+            .setting_get("clinic_vat_registered")?
+            .unwrap_or_default()
+            .trim()
+            == "1";
+        db.services_upsert(ServiceUpsertInput {
+            id: None,
+            title: "Vizitë".to_string(),
+            default_price: 0.0,
+            vat_code: Some(if vat_registered { "A" } else { "C" }.to_string()),
+            atk_category_code: Some("SM".to_string()),
+            atk_unit_code: Some("CP".to_string()),
+            sku: None,
+            barcode: None,
+            category: Some("Shërbime".to_string()),
+            subcategory: None,
+            notes: Some("Shërbim bazë i vizitës".to_string()),
+        })?;
+    }
+
+    let session = if is_demo_mode {
+        // Reviewer-i futet direkt ne app, pa pasur nevoje te shkruaje asgje.
+        SessionKind::User {
+            role: crate::auth::UserRole::Owner,
+        }
+    } else {
+        if let Ok(true) = crate::auth::ensure_owner_default_password_v1(db.as_ref()) {
+            eprintln!("[auth] owner login restored to the default admin account (one-time v1)");
+        }
+        crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None)
+    };
+    let auth = Arc::new(AuthState::new(session));
+    let sync = Arc::new(SyncEngine::new(db.clone())?);
+    let updates = Arc::new(UpdatesEngine::new(db.clone())?);
+    let license = Arc::new(LicenseEngine::new(db.clone())?);
+
+    UpdatesEngine::apply_pending_on_startup(&handle)?;
+    UpdatesEngine::ensure_seed_installed(&handle)?;
+
+    // Demo mode s'ka clinic_id/license real dhe s'duhet te kontaktoje asnje
+    // server - sync/license mbeten krejtesisht te fikur.
+    if !is_demo_mode {
+        sync.clone().spawn_background();
+    }
+
+    // Procesori i radhës fiskale: çdo 15s proceson job-et 'pending' më të reja se 2 orë.
+    // Më të vjetrat presin aprovim manual te Sporteli (mbrojtje nga printimet aksidentale).
+    #[cfg(all(desktop, target_os = "windows"))]
+    {
+        let db_fj = db.clone();
+        crate::rt_spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                let db2 = db_fj.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let jobs = match db2.fiscal_jobs_list(Some("pending".to_string())) {
+                        Ok(j) => j,
+                        Err(_) => return,
+                    };
+                    for job in jobs {
+                        if fiscal_job_age_secs(&job.created_at)
+                            > FISCAL_JOB_AUTO_MAX_AGE_SECS
+                        {
+                            continue; // kërkon aprovim manual
+                        }
+                        match fiscal_job_process_inner(&db2, &job) {
+                            Ok(()) => {
+                                let _ = fiscal_job_mark(&db2, &job, "done", None);
+                            }
+                            Err(e) => {
+                                let _ = fiscal_job_mark(&db2, &job, "failed", Some(e));
+                            }
+                        }
+                    }
+                })
+                .await;
+            }
+        });
+    }
+    updates.clone().spawn_background(handle.clone());
+    if !is_demo_mode {
+        license.clone().spawn_background();
+    }
+    {
+        let db_bg = db.clone();
+        let handle_bg = handle.clone();
+        crate::rt_spawn(async move {
+            let _ = desktop_updates_check_and_store(&handle_bg, db_bg.clone(), false).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+            loop {
+                interval.tick().await;
+                let _ =
+                    desktop_updates_check_and_store(&handle_bg, db_bg.clone(), false).await;
+            }
+        });
+    }
+
+    Ok(AppState {
+        db,
+        auth,
+        pos_itadmin_settings_mode: AtomicBool::new(false),
+        pos_accountant_mode: AtomicBool::new(false),
+        sync,
+        updates,
+        license,
+        error_log_path,
+        lab_serial: Arc::new(lab_devices::LabSerialManager::new()),
+        is_demo_mode,
+    })
+}
+
+#[cfg(not(feature = "embedded"))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -6542,205 +6778,7 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
             let handle = app.handle();
-            let data_dir = handle
-                .path()
-                .app_data_dir()
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            // Clinic reset is applied on startup (safe) so we can delete the SQLite file while it's closed.
-            let reset_flag = data_dir.join("reset.flag");
-            if reset_flag.exists() {
-                let _ = std::fs::remove_file(data_dir.join("mjeku.sqlite3"));
-                let _ = std::fs::remove_dir_all(data_dir.join("ui"));
-                let _ = std::fs::remove_dir_all(data_dir.join("fiscal"));
-                let _ = std::fs::remove_dir_all(data_dir.join("assets"));
-                let _ = std::fs::remove_file(&reset_flag);
-            }
-            // "Demo Mode" (mobile-only, per App Store review requirement): kur eshte
-            // futur token-i special (shih provision_apply_token) ne nje ekzekutim te
-            // meparshem, marker-i eshte shkruar ketu dhe app-i eshte rinisur - baza e
-            // te dhenave hapet ne memorie (asgje s'shkruhet ne disk, zhduket kur mbyllet
-            // procesi) dhe klinika demo konfigurohet automatikisht me login te hapur.
-            #[cfg(mobile)]
-            let is_demo_mode = data_dir.join("demo_mode.flag").exists();
-            #[cfg(not(mobile))]
-            let is_demo_mode = false;
-
-            let db = if is_demo_mode {
-                Arc::new(Db::new_in_memory()?)
-            } else {
-                Arc::new(Db::new(data_dir.join("mjeku.sqlite3"))?)
-            };
-            if is_demo_mode && !crate::auth::is_configured(&db)? {
-                crate::auth::setup_v2(
-                    &db,
-                    "Demo Klinika PROGRAMERI",
-                    "demo123456",
-                    "demo1234",
-                    None,
-                )?;
-            }
-            if db
-                .setting_get(FISCAL_PRINTER_PROVIDER_KEY)?
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-            {
-                db.setting_set(FISCAL_PRINTER_PROVIDER_KEY, "enternet")?;
-            }
-
-            // Auto-fix typoed URL if it was saved in DB from a previous run (startup check)
-            let current_db_url = db.setting_get(KEY_SUPABASE_URL)?.unwrap_or_default();
-            if current_db_url == "https://occzpryzxabajtmdaas.supabase.co" {
-                db.setting_set(KEY_SUPABASE_URL, DEFAULT_SUPABASE_URL)?;
-            }
-
-            // Auto-fix future timestamps (clock skew recovery)
-            // If the stored timestamp is way in the future (e.g. > 24h from now), reset it to allow re-check.
-            let now_utc = Utc::now();
-            for key in ["license_last_checked_at", "license_last_seen_device_time"] {
-                if let Ok(Some(val)) = db.setting_get(key) {
-                    if let Ok(ts_utc) = crate::util::parse_rfc3339_to_utc(&val) {
-                        if ts_utc > now_utc + ChronoDuration::days(1) {
-                            db.setting_set(key, "")?;
-                        }
-                    }
-                }
-            }
-
-            ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_URL, DEFAULT_SUPABASE_URL)?;
-            ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_API_KEY, DEFAULT_SUPABASE_API_KEY)?;
-            ensure_setting_if_empty(db.as_ref(), KEY_SUPABASE_ANON_KEY, DEFAULT_SUPABASE_API_KEY)?;
-            ensure_setting_if_empty(db.as_ref(), "update_base_url", DEFAULT_UPDATE_BASE_URL)?;
-            // Migrim: klientët ekzistues e kishin "update_base_url" të vendosur eksplicit
-            // (jo bosh) te Vercel-i i vjetër - ensure_setting_if_empty s'e prek atë. E
-            // kalojmë te Render nëse ende ka vlerën default të vjetër (jo një URL të
-            // personalizuar nga useri).
-            if let Ok(Some(cur)) = db.setting_get("update_base_url") {
-                if cur.trim().trim_end_matches('/') == OLD_DEFAULT_UPDATE_BASE_URL {
-                    let _ = db.setting_set("update_base_url", DEFAULT_UPDATE_BASE_URL);
-                }
-            }
-            if let Err(e) = db.fiscal_clear_article_on_app_open() {
-                eprintln!("startup clear article failed: {e}");
-            }
-            let error_log_path = data_dir.join("logs").join("errors.log");
-            db.setting_set("error_log_path", &error_log_path.display().to_string())?;
-            let has_visit_service = db.services_list(None)?.into_iter().any(|s| {
-                let t = s.title.trim().to_ascii_lowercase().replace('ë', "e");
-                t == "vizite" || t == "vizita"
-            });
-            if !has_visit_service {
-                let vat_registered = db
-                    .setting_get("clinic_vat_registered")?
-                    .unwrap_or_default()
-                    .trim()
-                    == "1";
-                db.services_upsert(ServiceUpsertInput {
-                    id: None,
-                    title: "Vizitë".to_string(),
-                    default_price: 0.0,
-                    vat_code: Some(if vat_registered { "A" } else { "C" }.to_string()),
-                    atk_category_code: Some("SM".to_string()),
-                    atk_unit_code: Some("CP".to_string()),
-                    sku: None,
-                    barcode: None,
-                    category: Some("Shërbime".to_string()),
-                    subcategory: None,
-                    notes: Some("Shërbim bazë i vizitës".to_string()),
-                })?;
-            }
-
-            let session = if is_demo_mode {
-                // Reviewer-i futet direkt ne app, pa pasur nevoje te shkruaje asgje.
-                SessionKind::User {
-                    role: crate::auth::UserRole::Owner,
-                }
-            } else {
-                if let Ok(true) = crate::auth::ensure_owner_default_password_v1(db.as_ref()) {
-                    eprintln!("[auth] owner login restored to the default admin account (one-time v1)");
-                }
-                crate::auth::session_get(db.as_ref()).unwrap_or(SessionKind::None)
-            };
-            let auth = Arc::new(AuthState::new(session));
-            let sync = Arc::new(SyncEngine::new(db.clone())?);
-            let updates = Arc::new(UpdatesEngine::new(db.clone())?);
-            let license = Arc::new(LicenseEngine::new(db.clone())?);
-
-            UpdatesEngine::apply_pending_on_startup(&handle)?;
-            UpdatesEngine::ensure_seed_installed(&handle)?;
-
-            // Demo mode s'ka clinic_id/license real dhe s'duhet te kontaktoje asnje
-            // server - sync/license mbeten krejtesisht te fikur.
-            if !is_demo_mode {
-                sync.clone().spawn_background();
-            }
-
-            // Procesori i radhës fiskale: çdo 15s proceson job-et 'pending' më të reja se 2 orë.
-            // Më të vjetrat presin aprovim manual te Sporteli (mbrojtje nga printimet aksidentale).
-            #[cfg(all(desktop, target_os = "windows"))]
-            {
-                let db_fj = db.clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut tick = tokio::time::interval(Duration::from_secs(15));
-                    loop {
-                        tick.tick().await;
-                        let db2 = db_fj.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let jobs = match db2.fiscal_jobs_list(Some("pending".to_string())) {
-                                Ok(j) => j,
-                                Err(_) => return,
-                            };
-                            for job in jobs {
-                                if fiscal_job_age_secs(&job.created_at)
-                                    > FISCAL_JOB_AUTO_MAX_AGE_SECS
-                                {
-                                    continue; // kërkon aprovim manual
-                                }
-                                match fiscal_job_process_inner(&db2, &job) {
-                                    Ok(()) => {
-                                        let _ = fiscal_job_mark(&db2, &job, "done", None);
-                                    }
-                                    Err(e) => {
-                                        let _ = fiscal_job_mark(&db2, &job, "failed", Some(e));
-                                    }
-                                }
-                            }
-                        })
-                        .await;
-                    }
-                });
-            }
-            updates.clone().spawn_background(handle.clone());
-            if !is_demo_mode {
-                license.clone().spawn_background();
-            }
-            {
-                let db_bg = db.clone();
-                let handle_bg = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = desktop_updates_check_and_store(&handle_bg, db_bg.clone(), false).await;
-                    let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
-                    loop {
-                        interval.tick().await;
-                        let _ =
-                            desktop_updates_check_and_store(&handle_bg, db_bg.clone(), false).await;
-                    }
-                });
-            }
-
-            app.manage(AppState {
-                db,
-                auth,
-                pos_itadmin_settings_mode: AtomicBool::new(false),
-                pos_accountant_mode: AtomicBool::new(false),
-                sync,
-                updates,
-                license,
-                error_log_path,
-                lab_serial: Arc::new(lab_devices::LabSerialManager::new()),
-                is_demo_mode,
-            });
+            app.manage(init_app_state(handle)?);
 
             // Silent background updater: check once on startup, download+install, then restart.
             // When PROGRAMERI POS launched Mjeku, POS owns the version (it ships Mjeku inside its own
@@ -6748,7 +6786,7 @@ pub fn run() {
             #[cfg(desktop)]
             if !tauri::is_dev() && !crate::sef_bridge::launched_from_programeri() {
                 let handle_upd = handle.clone();
-                tauri::async_runtime::spawn(async move {
+                crate::rt_spawn(async move {
                     // Wait 30 s so the app is fully ready before hitting the network.
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     if let Ok(updater) = handle_upd.updater() {

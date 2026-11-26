@@ -141,7 +141,7 @@ impl LicenseEngine {
     }
 
     pub fn spawn_background(self: Arc<Self>) {
-        tauri::async_runtime::spawn(async move {
+        crate::rt_spawn(async move {
             let _ = self.check_now().await;
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {

@@ -80,7 +80,7 @@ fn pick_api(setting_api: Option<&str>) -> String {
 }
 
 pub async fn check_now(
-    app: &tauri::AppHandle,
+    app: &crate::AppHandle,
     setting_api: Option<&str>,
 ) -> anyhow::Result<DesktopUpdateInfo> {
     let current_version = app.package_info().version.to_string();

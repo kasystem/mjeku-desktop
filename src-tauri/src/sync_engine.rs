@@ -99,7 +99,7 @@ impl SyncEngine {
     }
 
     pub fn spawn_background(self: Arc<Self>) {
-        tauri::async_runtime::spawn(async move {
+        crate::rt_spawn(async move {
             // Startup sync.
             let _ = self.sync_now().await;
 

@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+#[cfg(not(feature = "embedded"))]
 use tauri::Manager;
 use uuid::Uuid;
 use zip::ZipArchive;
@@ -139,8 +140,8 @@ impl UpdatesEngine {
         })
     }
 
-    pub fn spawn_background(self: std::sync::Arc<Self>, app: tauri::AppHandle) {
-        tauri::async_runtime::spawn(async move {
+    pub fn spawn_background(self: std::sync::Arc<Self>, app: crate::AppHandle) {
+        crate::rt_spawn(async move {
             // Startup check.
             let _ = self.check_now(&app).await;
 
@@ -152,7 +153,7 @@ impl UpdatesEngine {
         });
     }
 
-    pub async fn check_now(&self, app: &tauri::AppHandle) -> anyhow::Result<()> {
+    pub async fn check_now(&self, app: &crate::AppHandle) -> anyhow::Result<()> {
         // 0.6.1: the UI ships only inside the signed desktop binary (ui-seed.zip), which also
         // wins at every start (ensure_seed_installed). No UI is downloaded from Render/Vercel.
         if !REMOTE_UI_UPDATES_ENABLED {
@@ -287,7 +288,7 @@ impl UpdatesEngine {
         Ok(())
     }
 
-    pub fn apply_pending_on_startup(app: &tauri::AppHandle) -> anyhow::Result<()> {
+    pub fn apply_pending_on_startup(app: &crate::AppHandle) -> anyhow::Result<()> {
         ensure_ui_dirs(app)?;
         let pending = pending_ui_version(app)?;
         if let Some(v) = pending {
@@ -302,7 +303,7 @@ impl UpdatesEngine {
         Ok(())
     }
 
-    pub fn ensure_seed_installed(app: &tauri::AppHandle) -> anyhow::Result<()> {
+    pub fn ensure_seed_installed(app: &crate::AppHandle) -> anyhow::Result<()> {
         ensure_ui_dirs(app)?;
 
         // Read the seed version bundled in this exe's resources.
@@ -358,7 +359,7 @@ impl UpdatesEngine {
         }
     }
 
-    pub fn apply_downloaded_now(app: &tauri::AppHandle) -> anyhow::Result<bool> {
+    pub fn apply_downloaded_now(app: &crate::AppHandle) -> anyhow::Result<bool> {
         let pending = pending_ui_version(app)?;
         if let Some(v) = pending {
             if version_installed(app, &v)?
@@ -374,27 +375,27 @@ impl UpdatesEngine {
     }
 }
 
-pub fn ui_root_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+pub fn ui_root_dir(app: &crate::AppHandle) -> anyhow::Result<PathBuf> {
     Ok(app.path().app_data_dir()?.join(UI_ROOT_DIRNAME))
 }
 
-pub fn versions_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+pub fn versions_dir(app: &crate::AppHandle) -> anyhow::Result<PathBuf> {
     Ok(ui_root_dir(app)?.join(UI_VERSIONS_DIRNAME))
 }
 
-pub fn tmp_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+pub fn tmp_dir(app: &crate::AppHandle) -> anyhow::Result<PathBuf> {
     Ok(ui_root_dir(app)?.join(UI_TMP_DIRNAME))
 }
 
-pub fn current_ptr_path(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+pub fn current_ptr_path(app: &crate::AppHandle) -> anyhow::Result<PathBuf> {
     Ok(ui_root_dir(app)?.join(CURRENT_PTR_FILENAME))
 }
 
-pub fn pending_ptr_path(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+pub fn pending_ptr_path(app: &crate::AppHandle) -> anyhow::Result<PathBuf> {
     Ok(ui_root_dir(app)?.join(PENDING_PTR_FILENAME))
 }
 
-pub fn current_ui_version(app: &tauri::AppHandle) -> anyhow::Result<String> {
+pub fn current_ui_version(app: &crate::AppHandle) -> anyhow::Result<String> {
     let p = current_ptr_path(app)?;
     if !p.exists() {
         return Ok("seed".to_string());
@@ -403,7 +404,7 @@ pub fn current_ui_version(app: &tauri::AppHandle) -> anyhow::Result<String> {
     Ok(if v.is_empty() { "seed".to_string() } else { v })
 }
 
-pub fn pending_ui_version(app: &tauri::AppHandle) -> anyhow::Result<Option<String>> {
+pub fn pending_ui_version(app: &crate::AppHandle) -> anyhow::Result<Option<String>> {
     let p = pending_ptr_path(app)?;
     if !p.exists() {
         return Ok(None);
@@ -416,7 +417,7 @@ pub fn pending_ui_version(app: &tauri::AppHandle) -> anyhow::Result<Option<Strin
     }
 }
 
-pub fn clear_pending(app: &tauri::AppHandle) -> anyhow::Result<()> {
+pub fn clear_pending(app: &crate::AppHandle) -> anyhow::Result<()> {
     let p = pending_ptr_path(app)?;
     if p.exists() {
         let _ = fs::remove_file(p);
@@ -424,18 +425,18 @@ pub fn clear_pending(app: &tauri::AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn current_ui_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+pub fn current_ui_dir(app: &crate::AppHandle) -> anyhow::Result<PathBuf> {
     let v = current_ui_version(app)?;
     Ok(versions_dir(app)?.join(v))
 }
 
-pub fn ensure_ui_dirs(app: &tauri::AppHandle) -> anyhow::Result<()> {
+pub fn ensure_ui_dirs(app: &crate::AppHandle) -> anyhow::Result<()> {
     fs::create_dir_all(versions_dir(app)?)?;
     fs::create_dir_all(tmp_dir(app)?)?;
     Ok(())
 }
 
-fn version_installed(app: &tauri::AppHandle, v: &str) -> anyhow::Result<bool> {
+fn version_installed(app: &crate::AppHandle, v: &str) -> anyhow::Result<bool> {
     Ok(versions_dir(app)?.join(v).join("index.html").exists())
 }
 
@@ -449,7 +450,7 @@ fn eq_hex(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
-fn extract_seed_resource(_app: &tauri::AppHandle, dest: &Path) -> anyhow::Result<()> {
+fn extract_seed_resource(_app: &crate::AppHandle, dest: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(dest)?;
     let cursor = std::io::Cursor::new(SEED_ZIP_BYTES);
     let archive = ZipArchive::new(cursor).context("read embedded seed zip")?;
@@ -518,7 +519,7 @@ fn set_pointer_atomic(ptr: &Path, version: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn prune_versions(app: &tauri::AppHandle) -> anyhow::Result<()> {
+fn prune_versions(app: &crate::AppHandle) -> anyhow::Result<()> {
     let versions = versions_dir(app)?;
     let current = current_ui_version(app).unwrap_or_else(|_| "seed".to_string());
     let pending = pending_ui_version(app).unwrap_or(None);
