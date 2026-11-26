@@ -177,6 +177,18 @@ pub fn launched_from_programeri() -> bool {
     Session::from_env().is_ok()
 }
 
+/// Separate channel for the PROGRAMERI POS automatic update only (`host.update`), set when Mjeku is opened
+/// without the fiscal bridge (PEF edition: Mjeku fiscalizes with its own printer). It never enables SEF.
+pub const ENV_HOST_PIPE: &str = "PROGRAMERI_HOST_PIPE";
+pub const ENV_HOST_TOKEN: &str = "PROGRAMERI_HOST_TOKEN";
+
+/// The session for `host.update`: the fiscal bridge when present, otherwise the update-only channel.
+pub fn host_update_session() -> Option<Session> {
+    Session::from_env().ok().or_else(|| {
+        Session::from_values(std::env::var(ENV_HOST_PIPE).ok(), std::env::var(ENV_HOST_TOKEN).ok(), None).ok()
+    })
+}
+
 pub fn context_id() -> Option<String> {
     Session::from_env().ok().and_then(|s| s.context)
 }

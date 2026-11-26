@@ -4939,6 +4939,54 @@ async fn sef_bridge_status(state: tauri::State<'_, AppState>) -> Result<serde_js
     .map_err(err_string)
 }
 
+/// PROGRAMERI POS older than host_update_v1 rejects the operation; stop asking for the rest of the run
+/// so the POS audit log is not filled with a failing call every few seconds.
+static HOST_UPDATE_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Automatic update of the PROGRAMERI POS host (`host.update`, capability `host_update_v1`, 2026-11-14).
+/// `poll` needs no login: the answer is only whether a verified POS version is ready. When it is,
+/// the UI shows a 30 s countdown with "Shtyje" (`postpone`). `ready` is sent only after the open work is
+/// saved; POS then applies the update and reopens Mjeku, so Mjeku exits here. POS never kills Mjeku.
+#[tauri::command]
+async fn sef_bridge_host_update(app: tauri::AppHandle, action: String) -> Result<serde_json::Value, String> {
+    use std::sync::atomic::Ordering;
+    let idle = serde_json::json!({ "requested": false, "mandatory": false, "accepted": false, "version": "", "countdownSeconds": 30 });
+    if !cfg!(target_os = "windows") || HOST_UPDATE_UNSUPPORTED.load(Ordering::Relaxed) {
+        return Ok(idle);
+    }
+    // SEF: the fiscal bridge; PEF (no bridge): PROGRAMERI_HOST_PIPE/TOKEN, which accepts only host.update.
+    let Some(session) = crate::sef_bridge::host_update_session() else {
+        return Ok(idle);
+    };
+    if !matches!(action.as_str(), "poll" | "postpone" | "ready") {
+        return Err("Veprim i panjohur.".to_string());
+    }
+    let result = match crate::sef_bridge::call_with_session(
+        &session,
+        "host.update",
+        serde_json::json!({ "action": action }),
+        crate::sef_bridge::DEFAULT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) if e.code == "VALIDATION" && action == "poll" => {
+            HOST_UPDATE_UNSUPPORTED.store(true, Ordering::Relaxed);
+            return Ok(idle);
+        }
+        Err(e) => return Err(err_string(e)),
+    };
+    if action == "ready" && result.get("accepted").and_then(serde_json::Value::as_bool) == Some(true) {
+        // Let the response reach the UI, then exit; PROGRAMERI POS applies the update and reopens Mjeku.
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            handle.exit(0);
+        });
+    }
+    Ok(result)
+}
+
 /// Opens the existing PROGRAMERI POS ATK auditor. The POS host owns the password
 /// check, audit database and read-only session; no audit data or credential is
 /// copied into Mjeku.
@@ -6890,6 +6938,7 @@ pub fn run() {
             sef_bridge_pos_auth_available,
             sef_bridge_pos_authenticate,
             sef_bridge_status,
+            sef_bridge_host_update,
             sef_bridge_open_atk_access,
             sef_bridge_open_accounting,
             pos_cloud_status,
